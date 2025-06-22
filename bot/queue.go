@@ -18,6 +18,8 @@ type Queue struct {
 }
 
 func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string, userID string, video model.VideoInfo) {
+	video.RequestedBy = userID
+
 	q.Lock()
 	q.queues[channelID] = append(q.queues[channelID], video)
 
@@ -33,7 +35,6 @@ func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string
 			log.Printf("Failed to download audio for %s: %v", v.Title, err)
 			return
 		}
-		log.Printf("Downloaded audio for %s to %s", v.Title, filepath)
 
 		q.Lock()
 		q.downloadedFiles[v.Title] = filepath

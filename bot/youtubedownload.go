@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"log"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -29,9 +28,8 @@ func DownloadAudio(url string, title string) (string, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
-	output, err := cmd.CombinedOutput()
+	_, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("yt-dlp failed: %v\nOutput: %s", err, string(output))
 		return "", err
 	}
 

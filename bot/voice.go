@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 
 	"github.com/bwmarrin/discordgo"
@@ -55,7 +56,7 @@ func PlayAudio(discord *discordgo.Session, guildID string, voiceConn *discordgo.
 
 	cmd := exec.Command("ffmpeg",
 		"-i", mp3FilePath,
-		"-f", "opus",
+		"-f", "s16le",
 		"-ar", "48000",
 		"-ac", "2",
 		"pipe:1",
@@ -124,4 +125,22 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, channelID, fi
 		ErrorChan <- fmt.Errorf("failed to play audio: %w", err)
 		return
 	}
+
+	if err := os.Remove(filePath); err != nil {
+		log.Printf("⚠️ Failed to delete file %s: %v", filePath, err)
+	}
+
+	nextVideo, ok := GlobalQueue.Pop(channelID)
+	if !ok {
+		log.Printf("Queue for channel %s is now empty", channelID)
+		return
+	}
+
+	nextPath, found := GlobalQueue.GetDownloadedFile(nextVideo.Title)
+	if !found {
+		ErrorChan <- fmt.Errorf("next track '%s' not downloaded yet", nextVideo.Title)
+		return
+	}
+
+	go StartPlaybackIfNotActive(discord, guildID, channelID, nextPath, nextVideo.RequestedBy)
 }

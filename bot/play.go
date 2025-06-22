@@ -85,12 +85,6 @@ func HandlePlayComponent(discord *discordgo.Session, i *discordgo.InteractionCre
 	selected := videos[index-1]
 	GlobalQueue.Add(discord, i.GuildID, i.ChannelID, userID, selected)
 
-	currentQueue := GlobalQueue.Get(i.ChannelID)
-	fmt.Printf("Current queue for channel %s:\n", i.ChannelID)
-	for idx, video := range currentQueue {
-		fmt.Printf("%d: %s (%s)\n", idx+1, video.Title, video.WebURL)
-	}
-
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
