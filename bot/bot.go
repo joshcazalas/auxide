@@ -10,6 +10,7 @@ import (
 )
 
 var BotToken string
+var ErrorChan = make(chan error)
 
 func Run() {
 	if BotToken == "" {
@@ -20,19 +21,35 @@ func Run() {
 	discord, err := discordgo.New("Bot " + BotToken)
 	CheckNilErr(err)
 
-	discord.AddHandler(Message)
-	discord.AddHandler(Component)
-	discord.AddHandler(Interaction)
-
 	err = discord.Open()
 	CheckNilErr(err)
 
 	RegisterSlashCommands(discord)
+	discord.AddHandler(Message)
+	discord.AddHandler(HandlePlayComponent)
+	discord.AddHandler(Interaction)
 
 	defer discord.Close()
+
+	go func() {
+		for err := range ErrorChan {
+			log.Printf("Received error from bot: %v", err)
+			channelID, chErr := GetTextChannel(discord)
+			if chErr != nil {
+				log.Printf("Failed to find text channel to send error message: %v", chErr)
+				continue
+			}
+			_, sendErr := discord.ChannelMessageSend(channelID, "⚠️ Bot Error: "+err.Error())
+			if sendErr != nil {
+				log.Printf("Failed to send error message to channel %s: %v", channelID, sendErr)
+			}
+		}
+	}()
 
 	fmt.Println("Bot running...")
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
+
+	close(ErrorChan)
 }

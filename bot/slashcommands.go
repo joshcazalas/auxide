@@ -21,6 +21,7 @@ func RegisterSlashCommands(discord *discordgo.Session) {
 				},
 			},
 		},
+		{Name: "queue", Description: "Get the current queue"},
 	}
 
 	for _, cmd := range commands {

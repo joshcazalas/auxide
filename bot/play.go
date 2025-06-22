@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 
 	"github.com/bwmarrin/discordgo"
@@ -53,4 +54,53 @@ func Play(discord *discordgo.Session, i *discordgo.InteractionCreate, userID str
 			log.Println("Failed to send followup message:", err)
 		}
 	}()
+}
+
+func HandlePlayComponent(discord *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Type != discordgo.InteractionMessageComponent {
+		return
+	}
+	userID := GetUserID(i)
+
+	customID := i.MessageComponentData().CustomID
+	if !strings.HasPrefix(customID, "select_video_") {
+		return
+	}
+
+	indexStr := strings.TrimPrefix(customID, "select_video_")
+	index, _ := strconv.Atoi(indexStr)
+
+	videos, ok := GetSearchResults(userID)
+
+	if !ok || index <= 0 || index > len(videos) {
+		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Invalid selection. Please try again.",
+			},
+		})
+		return
+	}
+
+	selected := videos[index-1]
+	GlobalQueue.Add(discord, i.GuildID, i.ChannelID, userID, selected)
+
+	currentQueue := GlobalQueue.Get(i.ChannelID)
+	fmt.Printf("Current queue for channel %s:\n", i.ChannelID)
+	for idx, video := range currentQueue {
+		fmt.Printf("%d: %s (%s)\n", idx+1, video.Title, video.WebURL)
+	}
+
+	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf(
+				"🎶 **Added to queue:**\n\n**%s**\n%s\n\n_Type `/queue` to view the current queue._",
+				selected.Title,
+				selected.WebURL,
+			),
+		},
+	})
+
+	DeleteSearchResults(userID)
 }

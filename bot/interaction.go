@@ -48,6 +48,9 @@ func Interaction(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 		case "play":
 			Play(discord, i, userID)
 
+		case "queue":
+			GetQueue(discord, i)
+
 		default:
 			log.Println("Unknown command:", i.ApplicationCommandData().Name)
 		}
