@@ -1,4 +1,4 @@
-package youtube
+package bot
 
 import (
 	"bufio"
@@ -9,22 +9,11 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/joshcazalas/discord-music-bot/model"
 )
 
-type VideoInfo struct {
-	ID       string  `json:"id"`
-	Title    string  `json:"title"`
-	Uploader string  `json:"uploader"`
-	WebURL   string  `json:"webpage_url"`
-	Duration float64 `json:"duration"`
-}
-
-type SearchResult struct {
-	Message string
-	Videos  []VideoInfo
-}
-
-func Search(query string) SearchResult {
+func Search(query string) model.SearchResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -48,11 +37,11 @@ func Search(query string) SearchResult {
 		log.Fatalf("failed to start yt-dlp: %v", err)
 	}
 
-	var videos []VideoInfo
+	var videos []model.VideoInfo
 	scanner := bufio.NewScanner(stdoutPipe)
 	for scanner.Scan() {
 		line := scanner.Text()
-		var info VideoInfo
+		var info model.VideoInfo
 		if err := json.Unmarshal([]byte(line), &info); err != nil {
 			log.Printf("Skipping invalid JSON line: %v", err)
 			continue
@@ -79,7 +68,7 @@ func Search(query string) SearchResult {
 		fmt.Fprintf(&builder, "Duration: %02d:%02d\n\n", minutes, seconds)
 	}
 
-	return SearchResult{
+	return model.SearchResult{
 		Message: builder.String(),
 		Videos:  videos,
 	}

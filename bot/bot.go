@@ -7,7 +7,6 @@ import (
 	"os/signal"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/joshcazalas/discord-music-bot/core"
 )
 
 var BotToken string
@@ -19,16 +18,16 @@ func Run() {
 	}
 
 	discord, err := discordgo.New("Bot " + BotToken)
-	core.CheckNilErr(err)
+	CheckNilErr(err)
 
-	discord.AddHandler(core.Message)
-	discord.AddHandler(core.Interaction)
-	discord.AddHandler(core.Component)
+	discord.AddHandler(Message)
+	discord.AddHandler(Component)
+	discord.AddHandler(Interaction)
 
 	err = discord.Open()
-	core.CheckNilErr(err)
+	CheckNilErr(err)
 
-	core.RegisterSlashCommands(discord)
+	RegisterSlashCommands(discord)
 
 	defer discord.Close()
 
