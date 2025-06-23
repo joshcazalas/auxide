@@ -1,10 +1,12 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -20,6 +22,8 @@ type Queue struct {
 	stopChans        map[string]chan bool
 	paused           map[string]bool
 	pausedTrack      map[string]VideoInfo
+	lastActivity     map[string]time.Time
+	idleCancelFuncs  map[string]context.CancelFunc
 }
 
 func NewQueue() *Queue {
@@ -33,6 +37,8 @@ func NewQueue() *Queue {
 		stopChans:        make(map[string]chan bool),
 		paused:           make(map[string]bool),
 		pausedTrack:      make(map[string]VideoInfo),
+		lastActivity:     make(map[string]time.Time),
+		idleCancelFuncs:  make(map[string]context.CancelFunc),
 	}
 }
 
@@ -140,6 +146,18 @@ func (q *Queue) Peek(channelID string) (VideoInfo, bool) {
 		return VideoInfo{}, false
 	}
 	return videos[0], true
+}
+
+func (q *Queue) SetLastActivity(guildID string) {
+	q.Lock()
+	defer q.Unlock()
+	q.lastActivity[guildID] = time.Now()
+}
+
+func (q *Queue) GetLastActivity(guildID string) time.Time {
+	q.Lock()
+	defer q.Unlock()
+	return q.lastActivity[guildID]
 }
 
 func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {

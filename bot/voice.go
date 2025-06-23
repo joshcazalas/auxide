@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/bwmarrin/dgvoice"
 	"github.com/bwmarrin/discordgo"
@@ -63,6 +64,7 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 			ErrorChan <- fmt.Errorf("failed to join voice channel: %w", err)
 			return
 		}
+		StartIdleMonitor(guildID, textChannelID, discord)
 	} else {
 		log.Printf("Already in a voice channel for guild %s", guildID)
 	}
@@ -87,6 +89,21 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 	}
 
 	log.Printf("Starting playback of file %s in guild %s", currentPath, guildID)
+	GlobalQueue.SetLastActivity(guildID)
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				GlobalQueue.SetLastActivity(guildID)
+			case <-done:
+				return
+			}
+		}
+	}()
 
 	stop := make(chan bool)
 	GlobalQueue.Lock()
@@ -99,6 +116,7 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 	delete(GlobalQueue.stopChans, guildID)
 	GlobalQueue.Unlock()
 	close(stop)
+	close(done)
 
 	log.Printf("Finished playing file %s in guild %s", currentPath, guildID)
 

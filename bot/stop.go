@@ -56,13 +56,15 @@ func HandleStopCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 		}
 	}
 
+	CancelIdleMonitor(guildID)
+
 	GlobalQueue.SetPlaying(guildID, false)
 	GlobalQueue.SetInVoiceChannel(guildID, false)
 
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: "⏹️ Playback stopped and queue cleared.",
+			Content: "⏹️ Playback stopped, queue cleared, and bot has left the voice channel.",
 		},
 	})
 }
