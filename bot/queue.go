@@ -127,6 +127,16 @@ func (q *Queue) GetVoiceConnection(guildID string) (*discordgo.VoiceConnection, 
 	return vc, ok
 }
 
+func (q *Queue) Peek(channelID string) (model.VideoInfo, bool) {
+	q.Lock()
+	defer q.Unlock()
+	videos := q.queues[channelID]
+	if len(videos) == 0 {
+		return model.VideoInfo{}, false
+	}
+	return videos[0], true
+}
+
 func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 	channelID := i.ChannelID
 	queue := GlobalQueue.Get(channelID)
