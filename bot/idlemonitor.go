@@ -8,8 +8,6 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-var idleCancelFuncs = make(map[string]context.CancelFunc)
-
 func StartIdleMonitor(guildID, textChannelID string, discord *discordgo.Session) {
 	CancelIdleMonitor(guildID)
 
@@ -28,37 +26,6 @@ func StartIdleMonitor(guildID, textChannelID string, discord *discordgo.Session)
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if GlobalQueue.IsPlaying(guildID) {
-					continue
-				}
-
-				last := GlobalQueue.GetLastActivity(guildID)
-				if time.Since(last) > 15*time.Minute {
-					log.Printf("Idle timeout reached for guild %s", guildID)
-
-					vc, ok := GlobalQueue.GetVoiceConnection(guildID)
-					if ok && vc != nil {
-						if err := vc.Disconnect(); err != nil {
-							log.Printf("Failed to disconnect from voice in guild %s: %v", guildID, err)
-						}
-					}
-
-					GlobalQueue.SetInVoiceChannel(guildID, false)
-					GlobalQueue.SetPlaying(guildID, false)
-
-					GlobalQueue.Lock()
-					delete(GlobalQueue.stopChans, guildID)
-					GlobalQueue.Unlock()
-
-					embed := &discordgo.MessageEmbed{
-						Title:       "💤 Idle Timeout",
-						Description: "Left the voice channel after 15 minutes of inactivity.",
-						Color:       0x1DB954,
-					}
-					_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
-					return
-				}
-
 				if vc, ok := GlobalQueue.GetVoiceConnection(guildID); ok && vc != nil {
 					channelID := vc.ChannelID
 					guild, err := discord.State.Guild(guildID)
@@ -89,6 +56,7 @@ func StartIdleMonitor(guildID, textChannelID string, discord *discordgo.Session)
 
 						GlobalQueue.Lock()
 						delete(GlobalQueue.stopChans, guildID)
+						delete(GlobalQueue.idleCancelFuncs, guildID)
 						GlobalQueue.Unlock()
 
 						embed := &discordgo.MessageEmbed{
@@ -100,6 +68,38 @@ func StartIdleMonitor(guildID, textChannelID string, discord *discordgo.Session)
 						return
 					}
 				}
+
+				if GlobalQueue.IsPlaying(guildID) {
+					continue
+				}
+
+				last := GlobalQueue.GetLastActivity(guildID)
+				if time.Since(last) > 10*time.Minute {
+					log.Printf("Idle timeout reached for guild %s", guildID)
+
+					vc, ok := GlobalQueue.GetVoiceConnection(guildID)
+					if ok && vc != nil {
+						if err := vc.Disconnect(); err != nil {
+							log.Printf("Failed to disconnect from voice in guild %s: %v", guildID, err)
+						}
+					}
+
+					GlobalQueue.SetInVoiceChannel(guildID, false)
+					GlobalQueue.SetPlaying(guildID, false)
+
+					GlobalQueue.Lock()
+					delete(GlobalQueue.stopChans, guildID)
+					delete(GlobalQueue.idleCancelFuncs, guildID)
+					GlobalQueue.Unlock()
+
+					embed := &discordgo.MessageEmbed{
+						Title:       "💤 Idle Timeout",
+						Description: "Left the voice channel after 10 minutes of inactivity.",
+						Color:       0x1DB954,
+					}
+					_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
+					return
+				}
 			}
 		}
 	}()
@@ -109,8 +109,8 @@ func CancelIdleMonitor(guildID string) {
 	GlobalQueue.Lock()
 	defer GlobalQueue.Unlock()
 
-	if cancel, ok := idleCancelFuncs[guildID]; ok {
+	if cancel, ok := GlobalQueue.idleCancelFuncs[guildID]; ok {
 		cancel()
-		delete(idleCancelFuncs, guildID)
+		delete(GlobalQueue.idleCancelFuncs, guildID)
 	}
 }
