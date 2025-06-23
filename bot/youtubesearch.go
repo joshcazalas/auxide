@@ -7,13 +7,15 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/joshcazalas/discord-music-bot/model"
 )
 
-func Search(query string) model.SearchResult {
+func YoutubeSearch(query string) model.SearchResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -72,4 +74,32 @@ func Search(query string) model.SearchResult {
 		Message: builder.String(),
 		Videos:  videos,
 	}
+}
+
+func sanitizeFilename(name string) string {
+	re := regexp.MustCompile(`[^\w\-.]`)
+	return re.ReplaceAllString(name, "_")
+}
+
+func YoutubeDownloadAudio(url string, title string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	safeTitle := sanitizeFilename(title)
+	outputFile := filepath.Join("/tmp", safeTitle+".mp3")
+
+	args := []string{
+		"-x",
+		"--audio-format", "mp3",
+		"-o", outputFile,
+		url,
+	}
+
+	cmd := exec.CommandContext(ctx, "yt-dlp", args...)
+	_, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+
+	return outputFile, nil
 }

@@ -71,14 +71,14 @@ func init() {
 				Name:        "queue",
 				Description: "Get the current queue",
 			},
-			Handler: GetQueue,
+			Handler: HandleGetQueueCommand,
 		},
 		"clear": {
 			Command: &discordgo.ApplicationCommand{
 				Name:        "clear",
 				Description: "Clear the current queue",
 			},
-			Handler: ClearQueue,
+			Handler: HandleClearQueueCommand,
 		},
 	}
 }

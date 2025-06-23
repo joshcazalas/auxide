@@ -5,9 +5,35 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/joshcazalas/discord-music-bot/model"
 )
+
+var (
+	mu                  sync.Mutex
+	searchResultsByUser = make(map[string][]model.VideoInfo)
+)
+
+func GetSearchResults(userID string) ([]model.VideoInfo, bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	videos, ok := searchResultsByUser[userID]
+	return videos, ok
+}
+
+func SetSearchResults(userID string, videos []model.VideoInfo) {
+	mu.Lock()
+	defer mu.Unlock()
+	searchResultsByUser[userID] = videos
+}
+
+func DeleteSearchResults(userID string) {
+	mu.Lock()
+	defer mu.Unlock()
+	delete(searchResultsByUser, userID)
+}
 
 func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 	userID := GetUserID(i)
@@ -22,7 +48,7 @@ func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 	}
 
 	go func() {
-		searchResults := Search(query)
+		searchResults := YoutubeSearch(query)
 
 		SetSearchResults(userID, searchResults.Videos)
 
