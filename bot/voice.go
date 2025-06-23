@@ -82,6 +82,10 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 		return
 	}
 
+	GlobalQueue.SetPlaying(guildID, true)
+
+	SendNowPlayingEmbed(discord, textChannelID, current)
+
 	currentPath, found := GlobalQueue.GetDownloadedFile(current.Title)
 	if !found {
 		ErrorChan <- fmt.Errorf("next track '%s' not ready yet", current.Title)
@@ -119,6 +123,8 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 	close(done)
 
 	log.Printf("Finished playing file %s in guild %s", currentPath, guildID)
+
+	GlobalQueue.SetPlaying(guildID, false)
 
 	// if err := os.Remove(filePath); err != nil {
 	// 	log.Printf("Failed to delete temp file %s: %v", filePath, err)
