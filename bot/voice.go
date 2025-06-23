@@ -45,7 +45,6 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 		return
 	}
 
-	var userID string
 	var next VideoInfo
 	var ok bool
 
@@ -56,7 +55,6 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 			GlobalQueue.SetInVoiceChannel(guildID, false)
 			return
 		}
-		userID = next.RequestedBy
 	} else {
 		next, ok = GlobalQueue.Peek(textChannelID)
 		if !ok {
@@ -64,29 +62,6 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 			GlobalQueue.SetInVoiceChannel(guildID, false)
 			return
 		}
-		userID = next.RequestedBy
-	}
-
-	if !GlobalQueue.IsInVoiceChannel(guildID) {
-		voiceChannelID := findUserVoiceChannel(discord, guildID, userID)
-		if voiceChannelID == "" {
-			ErrorChan <- GuildError{
-				GuildID: guildID,
-				Err:     fmt.Errorf("unable to start playback: no users in voice channels"),
-			}
-			return
-		}
-
-		if err := JoinVoiceChannel(discord, guildID, voiceChannelID); err != nil {
-			ErrorChan <- GuildError{
-				GuildID: guildID,
-				Err:     fmt.Errorf("failed to join voice channel: %w", err),
-			}
-			return
-		}
-		StartIdleMonitor(guildID, textChannelID, discord)
-	} else {
-		log.Printf("Already in a voice channel for guild %s", guildID)
 	}
 
 	vc, ok := GlobalQueue.GetVoiceConnection(guildID)

@@ -49,7 +49,7 @@ func NewQueue() *Queue {
 
 var GlobalQueue = NewQueue()
 
-func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string, userID string, video VideoInfo) {
+func (q *Queue) Add(discord *discordgo.Session, guildID, channelID, userID string, video VideoInfo) {
 	video.RequestedBy = userID
 
 	q.Lock()
@@ -59,6 +59,20 @@ func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string
 	}
 	q.requestedBy[channelID][userID] = struct{}{}
 	q.Unlock()
+
+	if !q.IsInVoiceChannel(guildID) {
+		voiceChannelID := findUserVoiceChannel(discord, guildID, userID)
+		if voiceChannelID != "" {
+			err := JoinVoiceChannel(discord, guildID, voiceChannelID)
+			if err != nil {
+				log.Printf("Failed to join voice channel immediately: %v", err)
+			} else {
+				StartIdleMonitor(guildID, channelID, discord)
+			}
+		} else {
+			log.Printf("User %s is not in a voice channel, cannot join immediately", userID)
+		}
+	}
 
 	go func(v VideoInfo) {
 		filepath, err := YoutubeDownloadAudio(v.WebURL, v.Title)
