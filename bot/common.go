@@ -3,6 +3,9 @@ package bot
 import (
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -103,4 +106,41 @@ func GetOrCreateBotChannel(discord *discordgo.Session, guildID string) (string, 
 
 	botTextChannels[guildID] = channel.ID
 	return channel.ID, nil
+}
+
+func StartCleanupRoutine(dir string, interval time.Duration, maxFileAge time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			<-ticker.C
+
+			files, err := os.ReadDir(dir)
+			if err != nil {
+				log.Printf("Cleanup: failed to read dir %s: %v", dir, err)
+				continue
+			}
+
+			now := time.Now()
+			for _, file := range files {
+				path := filepath.Join(dir, file.Name())
+				info, err := file.Info()
+				if err != nil {
+					log.Printf("Cleanup: failed to get info for %s: %v", path, err)
+					continue
+				}
+
+				// Remove files older than maxFileAge
+				if now.Sub(info.ModTime()) > maxFileAge {
+					err := os.Remove(path)
+					if err != nil {
+						log.Printf("Cleanup: failed to remove file %s: %v", path, err)
+					} else {
+						log.Printf("Cleanup: removed old file %s", path)
+					}
+				}
+			}
+		}
+	}()
 }

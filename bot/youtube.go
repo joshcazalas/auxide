@@ -109,7 +109,7 @@ func YoutubeDownloadAudio(url string, title string) (string, error) {
 	defer cancel()
 
 	safeTitle := sanitizeFilename(title)
-	AudioPath := filepath.Join("/tmp", safeTitle+".mp3")
+	AudioPath := filepath.Join(CacheDir, safeTitle+".mp3")
 
 	cmd := exec.CommandContext(ctx, "yt-dlp", "-f", "bestaudio", "-x", "--audio-format", "mp3", "-o", AudioPath, url)
 	if output, err := cmd.CombinedOutput(); err != nil {

@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/bwmarrin/dgvoice"
@@ -156,9 +157,9 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 
 	GlobalQueue.SetPlaying(guildID, false)
 
-	// if err := os.Remove(filePath); err != nil {
-	// 	log.Printf("Failed to delete temp file %s: %v", filePath, err)
-	// }
+	if err := os.Remove(currentPath); err != nil {
+		log.Printf("Failed to delete file %s: %v", currentPath, err)
+	}
 
 	next, ok = GlobalQueue.Peek(textChannelID)
 	if !ok {

@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -13,6 +14,9 @@ var BotToken string
 var ErrorChan = make(chan GuildError)
 
 const BotTextChannelName = "music-bot-channel"
+const CacheDir = "/tmp/discordmusicbot"
+const cleanupFrequency = 1 * time.Hour
+const maxFileAge = 6 * time.Hour
 
 var botTextChannels = make(map[string]string)
 
@@ -42,6 +46,8 @@ func Run() {
 	defer discord.Close()
 
 	log.Println("Bot running...")
+
+	StartCleanupRoutine(CacheDir, cleanupFrequency, maxFileAge)
 
 	go func() {
 		for guildErr := range ErrorChan {
