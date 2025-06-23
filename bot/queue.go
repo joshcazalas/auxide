@@ -192,6 +192,20 @@ func (q *Queue) PopRandom(channelID string) (VideoInfo, bool) {
 	return selected, true
 }
 
+func (q *Queue) RemoveByTitle(channelID, title string) {
+	q.Lock()
+	defer q.Unlock()
+
+	queue := q.queues[channelID]
+	newQueue := make([]VideoInfo, 0, len(queue))
+	for _, item := range queue {
+		if item.Title != title {
+			newQueue = append(newQueue, item)
+		}
+	}
+	q.queues[channelID] = newQueue
+}
+
 func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 	channelID := i.ChannelID
 	queue := GlobalQueue.Get(channelID)

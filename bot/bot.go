@@ -34,7 +34,11 @@ func Run() {
 	discord, err := discordgo.New("Bot " + BotToken)
 	CheckNilErr(err)
 
-	RegisterSlashCommands(discord)
+	ready := make(chan struct{})
+	discord.AddHandlerOnce(func(s *discordgo.Session, r *discordgo.Ready) {
+		close(ready)
+	})
+
 	RegisterComponentHandlers()
 	RegisterAutocompleteHandlers()
 
@@ -45,7 +49,27 @@ func Run() {
 	CheckNilErr(err)
 	defer discord.Close()
 
-	log.Println("Bot running...")
+	<-ready
+
+	botID := discord.State.User.ID
+	for _, guild := range discord.State.Guilds {
+		existingCmds, err := discord.ApplicationCommands(botID, guild.ID)
+		CheckNilErr(err)
+
+		existingNames := make(map[string]bool)
+		for _, cmd := range existingCmds {
+			existingNames[cmd.Name] = true
+		}
+
+		for _, cmd := range SlashCommands {
+			if existingNames[cmd.Command.Name] {
+				continue
+			}
+			_, err := discord.ApplicationCommandCreate(botID, guild.ID, cmd.Command)
+			CheckNilErr(err)
+			log.Printf("Registered /%s for guild %s", cmd.Command.Name, guild.ID)
+		}
+	}
 
 	StartCleanupRoutine(CacheDir, cleanupFrequency, maxFileAge)
 
@@ -80,6 +104,8 @@ func Run() {
 			Err:     fmt.Errorf("failed to initialize bot channels: %v", err),
 		}
 	}
+
+	log.Println("Bot running...")
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)

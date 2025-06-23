@@ -116,10 +116,13 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 
 	currentPath, found := GlobalQueue.GetDownloadedFile(current.Title)
 	if !found {
+		log.Printf("File for '%s' not found — skipping and removing from queue", current.Title)
+		GlobalQueue.RemoveByTitle(textChannelID, current.Title)
 		ErrorChan <- GuildError{
 			GuildID: guildID,
-			Err:     fmt.Errorf("next track '%s' not ready yet", current.Title),
+			Err:     fmt.Errorf("next track '%s' not ready yet. File not found. Skipping to the next song in the queue... ", current.Title),
 		}
+		StartPlaybackIfNotActive(discord, guildID, textChannelID)
 		return
 	}
 

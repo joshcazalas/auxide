@@ -61,7 +61,7 @@ func YoutubeSearch(query string) SearchResult {
 		"--dump-json",
 		"--no-download",
 		"--flat-playlist",
-		"--default-search", "ytsearch5",
+		"--default-search", "ytsearch15",
 		query,
 	}
 
@@ -78,13 +78,28 @@ func YoutubeSearch(query string) SearchResult {
 	}
 
 	scanner := bufio.NewScanner(stdoutPipe)
-	videos, err := parseYTDLPJSONLines(scanner)
+	rawVideos, err := parseYTDLPJSONLines(scanner)
 	if err != nil {
 		log.Fatalf("error reading yt-dlp output: %v", err)
 	}
 
 	if err := cmd.Wait(); err != nil {
 		log.Fatalf("yt-dlp command failed: %v", err)
+	}
+
+	var videos []VideoInfo
+	for _, video := range rawVideos {
+		url := video.WebURL
+		if strings.Contains(url, "playlist?list=") ||
+			strings.Contains(url, "/channel/") ||
+			strings.Contains(url, "/user/") ||
+			strings.Contains(url, "/c/") {
+			continue
+		}
+		videos = append(videos, video)
+		if len(videos) >= 5 {
+			break // discord only allows 5 components (in this case buttons) in a message
+		}
 	}
 
 	var builder strings.Builder
