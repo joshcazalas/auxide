@@ -19,6 +19,8 @@ type Queue struct {
 	playing          map[string]bool
 	voiceConnections map[string]*discordgo.VoiceConnection
 	stopChans        map[string]chan bool
+	paused           map[string]bool
+	pausedTrack      map[string]model.VideoInfo
 }
 
 func NewQueue() *Queue {
@@ -30,6 +32,8 @@ func NewQueue() *Queue {
 		playing:          make(map[string]bool),
 		voiceConnections: make(map[string]*discordgo.VoiceConnection),
 		stopChans:        make(map[string]chan bool),
+		paused:           make(map[string]bool),
+		pausedTrack:      make(map[string]model.VideoInfo),
 	}
 }
 
