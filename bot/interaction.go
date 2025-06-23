@@ -32,5 +32,13 @@ func Interaction(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 			}
 		}
 		log.Println("Unknown component interaction:", customID)
+
+	case discordgo.InteractionApplicationCommandAutocomplete:
+		name := i.ApplicationCommandData().Name
+		if handler, ok := AutocompleteHandlers[name]; ok {
+			handler(discord, i)
+		} else {
+			log.Println("Unknown autocomplete interaction for command:", name)
+		}
 	}
 }

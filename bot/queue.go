@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,7 @@ type Queue struct {
 	pausedTrack      map[string]VideoInfo
 	lastActivity     map[string]time.Time
 	idleCancelFuncs  map[string]context.CancelFunc
+	shuffleMode      map[string]bool
 }
 
 func NewQueue() *Queue {
@@ -39,6 +41,7 @@ func NewQueue() *Queue {
 		pausedTrack:      make(map[string]VideoInfo),
 		lastActivity:     make(map[string]time.Time),
 		idleCancelFuncs:  make(map[string]context.CancelFunc),
+		shuffleMode:      make(map[string]bool),
 	}
 }
 
@@ -158,6 +161,35 @@ func (q *Queue) GetLastActivity(guildID string) time.Time {
 	q.Lock()
 	defer q.Unlock()
 	return q.lastActivity[guildID]
+}
+
+func (q *Queue) IsShuffleEnabled(channelID string) bool {
+	q.Lock()
+	defer q.Unlock()
+	return q.shuffleMode[channelID]
+}
+
+func (q *Queue) SetShuffle(channelID string, enabled bool) {
+	q.Lock()
+	defer q.Unlock()
+	q.shuffleMode[channelID] = enabled
+}
+
+func (q *Queue) PopRandom(channelID string) (VideoInfo, bool) {
+	q.Lock()
+	defer q.Unlock()
+
+	queue := q.queues[channelID]
+	if len(queue) == 0 {
+		return VideoInfo{}, false
+	}
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	idx := rng.Intn(len(queue))
+	selected := queue[idx]
+
+	q.queues[channelID] = append(queue[:idx], queue[idx+1:]...)
+	return selected, true
 }
 
 func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {

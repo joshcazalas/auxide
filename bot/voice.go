@@ -45,13 +45,27 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 		return
 	}
 
-	peeked, ok := GlobalQueue.Peek(textChannelID)
-	if !ok {
-		log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
-		GlobalQueue.SetInVoiceChannel(guildID, false)
-		return
+	var userID string
+	var next VideoInfo
+	var ok bool
+
+	if GlobalQueue.IsShuffleEnabled(textChannelID) {
+		next, ok = GlobalQueue.PopRandom(textChannelID)
+		if !ok {
+			log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
+			GlobalQueue.SetInVoiceChannel(guildID, false)
+			return
+		}
+		userID = next.RequestedBy
+	} else {
+		next, ok = GlobalQueue.Peek(textChannelID)
+		if !ok {
+			log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
+			GlobalQueue.SetInVoiceChannel(guildID, false)
+			return
+		}
+		userID = next.RequestedBy
 	}
-	userID := peeked.RequestedBy
 
 	if !GlobalQueue.IsInVoiceChannel(guildID) {
 		voiceChannelID := findUserVoiceChannel(discord, guildID, userID)
@@ -75,11 +89,16 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 		return
 	}
 
-	current, ok := GlobalQueue.Pop(textChannelID)
-	if !ok {
-		log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
-		GlobalQueue.SetInVoiceChannel(guildID, false)
-		return
+	var current VideoInfo
+	if GlobalQueue.IsShuffleEnabled(textChannelID) {
+		current = next
+	} else {
+		current, ok = GlobalQueue.Pop(textChannelID)
+		if !ok {
+			log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
+			GlobalQueue.SetInVoiceChannel(guildID, false)
+			return
+		}
 	}
 
 	GlobalQueue.SetPlaying(guildID, true)
@@ -130,7 +149,7 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 	// 	log.Printf("Failed to delete temp file %s: %v", filePath, err)
 	// }
 
-	next, ok := GlobalQueue.Peek(textChannelID)
+	next, ok = GlobalQueue.Peek(textChannelID)
 	if !ok {
 		log.Printf("No next track in queue for channel %s", textChannelID)
 		return

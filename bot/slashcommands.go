@@ -111,9 +111,18 @@ func init() {
 		"shuffle": {
 			Command: &discordgo.ApplicationCommand{
 				Name:        "shuffle",
-				Description: "Shuffle the current queue",
+				Description: "Enable or disable shuffle mode",
+				Options: []*discordgo.ApplicationCommandOption{
+					{
+						Type:         discordgo.ApplicationCommandOptionString,
+						Name:         "mode",
+						Description:  "Shuffle mode (enabled or disabled)",
+						Required:     true,
+						Autocomplete: true,
+					},
+				},
 			},
-			Handler: HandleResumeCommand,
+			Handler: HandleShuffleCommand,
 		},
 	}
 }

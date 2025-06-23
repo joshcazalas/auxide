@@ -1,59 +1,70 @@
 package bot
 
 import (
-	"math/rand"
-	"time"
+	"fmt"
+	"strings"
 
 	"github.com/bwmarrin/discordgo"
 )
 
-func HandleShuffleCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
+func HandleShuffleCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	channelID := i.ChannelID
 
-	GlobalQueue.Lock()
-	queue := GlobalQueue.queues[channelID]
-	if len(queue) <= 1 {
-		GlobalQueue.Unlock()
-
-		embed := &discordgo.MessageEmbed{
-			Title:       "🔀 Not Enough Songs",
-			Description: "There must be at least two songs in the queue to shuffle.",
-			Color:       0x1DB954,
+	var mode string
+	for _, option := range i.ApplicationCommandData().Options {
+		if option.Name == "mode" {
+			mode = option.StringValue()
+			break
 		}
+	}
 
-		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	var enable bool
+	switch strings.ToLower(mode) {
+	case "enabled":
+		enable = true
+	case "disabled":
+		enable = false
+	default:
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Embeds: []*discordgo.MessageEmbed{embed},
+				Content: "❌ Invalid shuffle mode. Choose `enabled` or `disabled`.",
 			},
 		})
 		return
 	}
 
-	current := queue[0]
-	rest := queue[1:]
+	GlobalQueue.SetShuffle(channelID, enable)
 
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	rng.Shuffle(len(rest), func(i, j int) {
-		rest[i], rest[j] = rest[j], rest[i]
-	})
-
-	GlobalQueue.queues[channelID] = append([]VideoInfo{current}, rest...)
-	GlobalQueue.Unlock()
-
-	embed := &discordgo.MessageEmbed{
-		Title:       "🔀 Queue Shuffled",
-		Description: "The queue has been shuffled. The currently playing song was not affected.",
-		Color:       0x1DB954,
-		Footer: &discordgo.MessageEmbedFooter{
-			Text: "Use /queue to view the updated order.",
-		},
+	status := "disabled"
+	if enable {
+		status = "enabled"
 	}
 
-	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	embed := &discordgo.MessageEmbed{
+		Title:       "🔀 Shuffle Mode Updated",
+		Description: fmt.Sprintf("Shuffle mode is now **%s**.", status),
+		Color:       0x1DB954,
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
+}
+
+func HandleShuffleAutocomplete(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	choices := []*discordgo.ApplicationCommandOptionChoice{
+		{Name: "enabled", Value: "enabled"},
+		{Name: "disabled", Value: "disabled"},
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionApplicationCommandAutocompleteResult,
+		Data: &discordgo.InteractionResponseData{
+			Choices: choices,
 		},
 	})
 }

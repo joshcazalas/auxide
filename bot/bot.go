@@ -22,6 +22,7 @@ func Run() {
 
 	RegisterSlashCommands(discord)
 	RegisterComponentHandlers()
+	RegisterAutocompleteHandlers()
 
 	discord.AddHandler(Message)
 	discord.AddHandler(Interaction)
