@@ -20,18 +20,17 @@ func Run() {
 	discord, err := discordgo.New("Bot " + BotToken)
 	CheckNilErr(err)
 
-	discord.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
-		RegisterSlashCommands(s)
-		RegisterComponentHandlers()
-	})
+	RegisterSlashCommands(discord)
+	RegisterComponentHandlers()
 
 	discord.AddHandler(Message)
 	discord.AddHandler(Interaction)
 
 	err = discord.Open()
 	CheckNilErr(err)
-
 	defer discord.Close()
+
+	log.Println("Bot running...")
 
 	go func() {
 		for err := range ErrorChan {
@@ -47,8 +46,6 @@ func Run() {
 			}
 		}
 	}()
-
-	log.Println("Bot running...")
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)

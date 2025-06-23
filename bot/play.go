@@ -9,7 +9,8 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreate, userID string) {
+func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
+	userID := GetUserID(i)
 	query := i.ApplicationCommandData().Options[0].StringValue()
 
 	err := discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{

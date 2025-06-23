@@ -64,7 +64,7 @@ func init() {
 					},
 				},
 			},
-			Handler: HandlePlaySelection,
+			Handler: HandlePlayCommand,
 		},
 		"queue": {
 			Command: &discordgo.ApplicationCommand{
