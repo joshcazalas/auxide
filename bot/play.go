@@ -56,7 +56,7 @@ func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 				return
 			}
 
-			GlobalQueue.Add(discord, i.GuildID, i.ChannelID, userID, video)
+			GlobalQueue.Add(discord, i.Interaction, i.GuildID, i.ChannelID, userID, video)
 
 			duration := time.Duration(video.Duration) * time.Second
 			embed := &discordgo.MessageEmbed{
@@ -152,7 +152,7 @@ func HandlePlaySelection(discord *discordgo.Session, i *discordgo.InteractionCre
 	}
 
 	selected := videos[index-1]
-	GlobalQueue.Add(discord, i.GuildID, i.ChannelID, userID, selected)
+	GlobalQueue.Add(discord, i.Interaction, i.GuildID, i.ChannelID, userID, selected)
 
 	duration := time.Duration(selected.Duration) * time.Second
 	embed := &discordgo.MessageEmbed{

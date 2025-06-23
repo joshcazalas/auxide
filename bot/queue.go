@@ -49,16 +49,18 @@ func NewQueue() *Queue {
 
 var GlobalQueue = NewQueue()
 
-func (q *Queue) Add(discord *discordgo.Session, guildID, channelID, userID string, video VideoInfo) {
+func (q *Queue) Add(discord *discordgo.Session, interaction *discordgo.Interaction, guildID, channelID, userID string, video VideoInfo) {
 	video.RequestedBy = userID
 
-	q.Lock()
-	q.queues[channelID] = append(q.queues[channelID], video)
-	if q.requestedBy[channelID] == nil {
-		q.requestedBy[channelID] = make(map[string]struct{})
+	err := discord.InteractionRespond(interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: fmt.Sprintf("🎵 **%s** requested by <@%s>. Downloading now...", video.Title, userID),
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to send interaction response: %v", err)
 	}
-	q.requestedBy[channelID][userID] = struct{}{}
-	q.Unlock()
 
 	if !q.IsInVoiceChannel(guildID) {
 		voiceChannelID := findUserVoiceChannel(discord, guildID, userID)
@@ -78,12 +80,31 @@ func (q *Queue) Add(discord *discordgo.Session, guildID, channelID, userID strin
 		filepath, err := YoutubeDownloadAudio(v.WebURL, v.Title)
 		if err != nil {
 			log.Printf("Failed to download audio for %s: %v", v.Title, err)
+
+			_, err2 := discord.FollowupMessageCreate(interaction, false, &discordgo.WebhookParams{
+				Content: fmt.Sprintf("⚠️ Failed to download **%s**.", v.Title),
+			})
+			if err2 != nil {
+				log.Printf("Failed to send follow-up message: %v", err2)
+			}
 			return
 		}
 
 		q.Lock()
+		q.queues[channelID] = append(q.queues[channelID], v)
+		if q.requestedBy[channelID] == nil {
+			q.requestedBy[channelID] = make(map[string]struct{})
+		}
+		q.requestedBy[channelID][userID] = struct{}{}
 		q.downloadedFiles[v.Title] = filepath
 		q.Unlock()
+
+		_, err2 := discord.FollowupMessageCreate(interaction, false, &discordgo.WebhookParams{
+			Content: fmt.Sprintf("✅ **%s** has been added to the queue and is ready to play!", v.Title),
+		})
+		if err2 != nil {
+			log.Printf("Failed to send follow-up message: %v", err2)
+		}
 
 		StartPlaybackIfNotActive(discord, guildID, channelID)
 	}(video)
