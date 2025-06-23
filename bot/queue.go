@@ -26,6 +26,7 @@ type Queue struct {
 	lastActivity     map[string]time.Time
 	idleCancelFuncs  map[string]context.CancelFunc
 	shuffleMode      map[string]bool
+	currentlyPlaying map[string]VideoInfo
 }
 
 func NewQueue() *Queue {
@@ -42,6 +43,7 @@ func NewQueue() *Queue {
 		lastActivity:     make(map[string]time.Time),
 		idleCancelFuncs:  make(map[string]context.CancelFunc),
 		shuffleMode:      make(map[string]bool),
+		currentlyPlaying: make(map[string]VideoInfo),
 	}
 }
 
@@ -204,6 +206,19 @@ func (q *Queue) RemoveByTitle(channelID, title string) {
 		}
 	}
 	q.queues[channelID] = newQueue
+}
+
+func (q *Queue) GetCurrentlyPlaying(guildID string) (VideoInfo, bool) {
+	q.Lock()
+	defer q.Unlock()
+	video, ok := q.currentlyPlaying[guildID]
+	return video, ok
+}
+
+func (q *Queue) SetCurrentlyPlaying(guildID string, video VideoInfo) {
+	q.Lock()
+	defer q.Unlock()
+	q.currentlyPlaying[guildID] = video
 }
 
 func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {

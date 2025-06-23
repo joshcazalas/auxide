@@ -110,6 +110,7 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 		}
 	}
 
+	GlobalQueue.SetCurrentlyPlaying(guildID, current)
 	GlobalQueue.SetPlaying(guildID, true)
 
 	SendNowPlayingEmbed(discord, textChannelID, current)
@@ -159,6 +160,7 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 	log.Printf("Finished playing file %s in guild %s", currentPath, guildID)
 
 	GlobalQueue.SetPlaying(guildID, false)
+	GlobalQueue.SetCurrentlyPlaying(guildID, VideoInfo{})
 
 	if err := os.Remove(currentPath); err != nil {
 		log.Printf("Failed to delete file %s: %v", currentPath, err)
