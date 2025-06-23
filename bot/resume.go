@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/joshcazalas/discord-music-bot/model"
 )
 
 func HandleResumeCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -32,7 +31,7 @@ func HandleResumeCommand(discord *discordgo.Session, i *discordgo.InteractionCre
 	GlobalQueue.Unlock()
 
 	GlobalQueue.Lock()
-	GlobalQueue.queues[channelID] = append([]model.VideoInfo{track}, GlobalQueue.queues[channelID]...)
+	GlobalQueue.queues[channelID] = append([]VideoInfo{track}, GlobalQueue.queues[channelID]...)
 	GlobalQueue.Unlock()
 
 	go StartPlaybackIfNotActive(discord, guildID, channelID)

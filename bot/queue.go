@@ -7,12 +7,11 @@ import (
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/joshcazalas/discord-music-bot/model"
 )
 
 type Queue struct {
 	sync.Mutex
-	queues           map[string][]model.VideoInfo
+	queues           map[string][]VideoInfo
 	requestedBy      map[string]map[string]struct{}
 	downloadedFiles  map[string]string
 	inVoiceChannel   map[string]bool
@@ -20,12 +19,12 @@ type Queue struct {
 	voiceConnections map[string]*discordgo.VoiceConnection
 	stopChans        map[string]chan bool
 	paused           map[string]bool
-	pausedTrack      map[string]model.VideoInfo
+	pausedTrack      map[string]VideoInfo
 }
 
 func NewQueue() *Queue {
 	return &Queue{
-		queues:           make(map[string][]model.VideoInfo),
+		queues:           make(map[string][]VideoInfo),
 		requestedBy:      make(map[string]map[string]struct{}),
 		downloadedFiles:  make(map[string]string),
 		inVoiceChannel:   make(map[string]bool),
@@ -33,13 +32,13 @@ func NewQueue() *Queue {
 		voiceConnections: make(map[string]*discordgo.VoiceConnection),
 		stopChans:        make(map[string]chan bool),
 		paused:           make(map[string]bool),
-		pausedTrack:      make(map[string]model.VideoInfo),
+		pausedTrack:      make(map[string]VideoInfo),
 	}
 }
 
 var GlobalQueue = NewQueue()
 
-func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string, userID string, video model.VideoInfo) {
+func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string, userID string, video VideoInfo) {
 	video.RequestedBy = userID
 
 	q.Lock()
@@ -50,7 +49,7 @@ func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string
 	q.requestedBy[channelID][userID] = struct{}{}
 	q.Unlock()
 
-	go func(v model.VideoInfo) {
+	go func(v VideoInfo) {
 		filepath, err := YoutubeDownloadAudio(v.WebURL, v.Title)
 		if err != nil {
 			log.Printf("Failed to download audio for %s: %v", v.Title, err)
@@ -65,18 +64,18 @@ func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string
 	}(video)
 }
 
-func (q *Queue) Get(channelID string) []model.VideoInfo {
+func (q *Queue) Get(channelID string) []VideoInfo {
 	q.Lock()
 	defer q.Unlock()
-	return append([]model.VideoInfo(nil), q.queues[channelID]...)
+	return append([]VideoInfo(nil), q.queues[channelID]...)
 }
 
-func (q *Queue) Pop(channelID string) (model.VideoInfo, bool) {
+func (q *Queue) Pop(channelID string) (VideoInfo, bool) {
 	q.Lock()
 	defer q.Unlock()
 	videos := q.queues[channelID]
 	if len(videos) == 0 {
-		return model.VideoInfo{}, false
+		return VideoInfo{}, false
 	}
 	video := videos[0]
 	q.queues[channelID] = videos[1:]
@@ -133,12 +132,12 @@ func (q *Queue) GetVoiceConnection(guildID string) (*discordgo.VoiceConnection, 
 	return vc, ok
 }
 
-func (q *Queue) Peek(channelID string) (model.VideoInfo, bool) {
+func (q *Queue) Peek(channelID string) (VideoInfo, bool) {
 	q.Lock()
 	defer q.Unlock()
 	videos := q.queues[channelID]
 	if len(videos) == 0 {
-		return model.VideoInfo{}, false
+		return VideoInfo{}, false
 	}
 	return videos[0], true
 }

@@ -8,22 +8,21 @@ import (
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/joshcazalas/discord-music-bot/model"
 )
 
 var (
 	mu                  sync.Mutex
-	searchResultsByUser = make(map[string][]model.VideoInfo)
+	searchResultsByUser = make(map[string][]VideoInfo)
 )
 
-func GetSearchResults(userID string) ([]model.VideoInfo, bool) {
+func GetSearchResults(userID string) ([]VideoInfo, bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	videos, ok := searchResultsByUser[userID]
 	return videos, ok
 }
 
-func SetSearchResults(userID string, videos []model.VideoInfo) {
+func SetSearchResults(userID string, videos []VideoInfo) {
 	mu.Lock()
 	defer mu.Unlock()
 	searchResultsByUser[userID] = videos

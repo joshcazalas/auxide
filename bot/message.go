@@ -15,7 +15,6 @@ func Message(s *discordgo.Session, m *discordgo.MessageCreate) {
 	case m.Author.ID == "about78kids":
 		s.ChannelMessageSend(m.ChannelID, "love you sexy")
 	default:
-		// Check if bot is mentioned in the message
 		botID := s.State.User.ID
 		isMentioned := false
 		for _, user := range m.Mentions {

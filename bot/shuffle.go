@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/joshcazalas/discord-music-bot/model"
 )
 
 func HandleShuffleCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -32,7 +31,7 @@ func HandleShuffleCommand(discord *discordgo.Session, i *discordgo.InteractionCr
 		rest[i], rest[j] = rest[j], rest[i]
 	})
 
-	GlobalQueue.queues[channelID] = append([]model.VideoInfo{current}, rest...)
+	GlobalQueue.queues[channelID] = append([]VideoInfo{current}, rest...)
 	GlobalQueue.Unlock()
 
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
