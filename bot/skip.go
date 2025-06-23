@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -12,20 +13,30 @@ func HandleSkipCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 	channelID := i.ChannelID
 
 	if !GlobalQueue.IsInVoiceChannel(guildID) {
+		embed := &discordgo.MessageEmbed{
+			Title:       "🔇 Not in Voice Channel",
+			Description: "I'm not currently in a voice channel.",
+			Color:       0x1DB954,
+		}
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "🔇 I'm not in a voice channel right now.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
 	}
 
 	if !GlobalQueue.IsPlaying(guildID) {
+		embed := &discordgo.MessageEmbed{
+			Title:       "⏹️ Nothing Playing",
+			Description: "There's no track currently playing to skip.",
+			Color:       0x1DB954,
+		}
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "⏹️ There's nothing currently playing to skip.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
@@ -33,10 +44,15 @@ func HandleSkipCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 
 	next, ok := GlobalQueue.Peek(channelID)
 	if !ok {
+		embed := &discordgo.MessageEmbed{
+			Title:       "📭 Queue Empty",
+			Description: "No more songs left in the queue to skip to.",
+			Color:       0x1DB954,
+		}
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "📭 No more songs in the queue to skip to.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
@@ -64,10 +80,32 @@ func HandleSkipCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 
 	GlobalQueue.SetPlaying(guildID, false)
 
+	duration := time.Duration(next.Duration) * time.Second
+	embed := &discordgo.MessageEmbed{
+		Title:       "⏭️ Skipping to Next Track",
+		Description: fmt.Sprintf("[%s](%s)", next.Title, next.WebURL),
+		Color:       0x1DB954,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "Requested By",
+				Value:  fmt.Sprintf("<@%s>", next.RequestedBy),
+				Inline: true,
+			},
+			{
+				Name:   "Duration",
+				Value:  fmtDuration(duration),
+				Inline: true,
+			},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Try /play to add new songs, or /help for all commands",
+		},
+	}
+
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("⏭️ Skipping to next track: **%s**", next.Title),
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 

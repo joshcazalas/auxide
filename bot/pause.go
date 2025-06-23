@@ -11,10 +11,15 @@ func HandlePauseCommand(discord *discordgo.Session, i *discordgo.InteractionCrea
 	channelID := i.ChannelID
 
 	if !GlobalQueue.IsInVoiceChannel(guildID) || !GlobalQueue.IsPlaying(guildID) {
+		embed := &discordgo.MessageEmbed{
+			Title:       "⏸️ Nothing to Pause",
+			Description: "There's nothing currently playing that can be paused.",
+			Color:       0x1DB954,
+		}
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "⏸️ Nothing is playing to pause.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
@@ -33,10 +38,15 @@ func HandlePauseCommand(discord *discordgo.Session, i *discordgo.InteractionCrea
 		}
 	} else {
 		log.Printf("No active stop channel for guild %s", guildID)
+		embed := &discordgo.MessageEmbed{
+			Title:       "⚠️ Unable to Pause",
+			Description: "Something went wrong trying to pause playback.",
+			Color:       0x1DB954,
+		}
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "⚠️ Unable to pause playback.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
@@ -44,10 +54,15 @@ func HandlePauseCommand(discord *discordgo.Session, i *discordgo.InteractionCrea
 
 	current, ok := GlobalQueue.Peek(channelID)
 	if !ok {
+		embed := &discordgo.MessageEmbed{
+			Title:       "⚠️ No Current Track",
+			Description: "Couldn't find a track to pause.",
+			Color:       0x1DB954,
+		}
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "⚠️ No current track found to pause.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
@@ -59,10 +74,19 @@ func HandlePauseCommand(discord *discordgo.Session, i *discordgo.InteractionCrea
 	GlobalQueue.SetPlaying(guildID, false)
 	GlobalQueue.Unlock()
 
+	embed := &discordgo.MessageEmbed{
+		Title:       "⏸️ Playback Paused",
+		Description: "The current track has been paused.\n\nUse `/resume` to continue playback.",
+		Color:       0x1DB954,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Use /queue to see what's next.",
+		},
+	}
+
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: "⏸️ Playback paused.",
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 }

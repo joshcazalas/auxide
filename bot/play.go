@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -65,15 +66,23 @@ func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 		}
 
 		var builder strings.Builder
-		builder.WriteString("Please select a result from the list below:\n\n")
 		for i, v := range searchResults.Videos {
 			mins := int(v.Duration) / 60
 			secs := int(v.Duration) % 60
 			fmt.Fprintf(&builder, "**%d.** %s (%02d:%02d)\n", i+1, v.Title, mins, secs)
 		}
 
+		embed := &discordgo.MessageEmbed{
+			Title:       "🔍 Search Results",
+			Description: builder.String(),
+			Color:       0x1DB954,
+			Footer: &discordgo.MessageEmbedFooter{
+				Text: "Click a number below to choose a song",
+			},
+		}
+
 		_, err := discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Content:    builder.String(),
+			Embeds:     []*discordgo.MessageEmbed{embed},
 			Components: components,
 		})
 		if err != nil {
@@ -102,7 +111,7 @@ func HandlePlaySelection(discord *discordgo.Session, i *discordgo.InteractionCre
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "Invalid selection. Please try again.",
+				Content: "❌ Invalid selection. Please try again.",
 			},
 		})
 		return
@@ -111,14 +120,32 @@ func HandlePlaySelection(discord *discordgo.Session, i *discordgo.InteractionCre
 	selected := videos[index-1]
 	GlobalQueue.Add(discord, i.GuildID, i.ChannelID, userID, selected)
 
+	duration := time.Duration(selected.Duration) * time.Second
+	embed := &discordgo.MessageEmbed{
+		Title:       "✅ Added to Queue",
+		Description: fmt.Sprintf("[%s](%s)", selected.Title, selected.WebURL),
+		Color:       0x1DB954,
+		Fields: []*discordgo.MessageEmbedField{
+			{
+				Name:   "Requested By",
+				Value:  fmt.Sprintf("<@%s>", userID),
+				Inline: true,
+			},
+			{
+				Name:   "Duration",
+				Value:  fmtDuration(duration),
+				Inline: true,
+			},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Use /queue to view the current queue.",
+		},
+	}
+
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf(
-				"🎶 **Added to queue:**\n\n**%s**\n%s\n\n_Type `/queue` to view the current queue._",
-				selected.Title,
-				selected.WebURL,
-			),
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 

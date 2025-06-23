@@ -14,10 +14,17 @@ func HandleShuffleCommand(discord *discordgo.Session, i *discordgo.InteractionCr
 	queue := GlobalQueue.queues[channelID]
 	if len(queue) <= 1 {
 		GlobalQueue.Unlock()
+
+		embed := &discordgo.MessageEmbed{
+			Title:       "🔀 Not Enough Songs",
+			Description: "There must be at least two songs in the queue to shuffle.",
+			Color:       0x1DB954,
+		}
+
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "🔀 Not enough songs in the queue to shuffle.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
@@ -34,10 +41,19 @@ func HandleShuffleCommand(discord *discordgo.Session, i *discordgo.InteractionCr
 	GlobalQueue.queues[channelID] = append([]VideoInfo{current}, rest...)
 	GlobalQueue.Unlock()
 
+	embed := &discordgo.MessageEmbed{
+		Title:       "🔀 Queue Shuffled",
+		Description: "The queue has been shuffled. The currently playing song was not affected.",
+		Color:       0x1DB954,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Use /queue to view the updated order.",
+		},
+	}
+
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: "🔀 Queue shuffled",
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 }

@@ -168,22 +168,42 @@ func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionC
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "The queue is currently empty.",
+				Embeds: []*discordgo.MessageEmbed{
+					{
+						Title:       "🎵 Current Queue",
+						Description: "The queue is currently empty.",
+						Color:       0x1DB954,
+						Footer: &discordgo.MessageEmbedFooter{
+							Text: "Try /shuffle, /skip, /pause & more. Use /help to see all commands",
+						},
+					},
+				},
 			},
 		})
 		return
 	}
 
 	var builder strings.Builder
-	builder.WriteString("🎵 **Current Queue:**\n\n")
 	for idx, video := range queue {
-		builder.WriteString(fmt.Sprintf("**%d.** %s\n", idx+1, video.Title))
+		builder.WriteString(fmt.Sprintf(
+			"**%d.** [%s](%s)\nRequested By: <@%s>\n\n",
+			idx+1, video.Title, video.WebURL, video.RequestedBy,
+		))
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "🎵 Current Queue",
+		Description: builder.String(),
+		Color:       0x1DB954,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Try /shuffle, /skip, /pause & more. Use /help to see all commands",
+		},
 	}
 
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: builder.String(),
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 }
@@ -191,10 +211,20 @@ func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionC
 func HandleClearQueueCommand(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 	channelID := i.ChannelID
 	GlobalQueue.Clear(channelID)
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "🗑️ Queue Cleared",
+		Description: "The queue has been successfully cleared.",
+		Color:       0x1DB954,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Try /play to add new songs, or /help for all commands",
+		},
+	}
+
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: "🗑️ The queue has been cleared.",
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 }

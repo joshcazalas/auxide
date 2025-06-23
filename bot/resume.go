@@ -16,10 +16,15 @@ func HandleResumeCommand(discord *discordgo.Session, i *discordgo.InteractionCre
 	GlobalQueue.Unlock()
 
 	if !paused || !hasTrack {
+		embed := &discordgo.MessageEmbed{
+			Title:       "▶️ Nothing to Resume",
+			Description: "There is no paused track to resume.",
+			Color:       0x1DB954,
+		}
 		discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseChannelMessageWithSource,
 			Data: &discordgo.InteractionResponseData{
-				Content: "▶️ Nothing to resume.",
+				Embeds: []*discordgo.MessageEmbed{embed},
 			},
 		})
 		return
@@ -28,18 +33,24 @@ func HandleResumeCommand(discord *discordgo.Session, i *discordgo.InteractionCre
 	GlobalQueue.Lock()
 	GlobalQueue.paused[guildID] = false
 	delete(GlobalQueue.pausedTrack, guildID)
-	GlobalQueue.Unlock()
-
-	GlobalQueue.Lock()
 	GlobalQueue.queues[channelID] = append([]VideoInfo{track}, GlobalQueue.queues[channelID]...)
 	GlobalQueue.Unlock()
 
 	go StartPlaybackIfNotActive(discord, guildID, channelID)
 
+	embed := &discordgo.MessageEmbed{
+		Title:       "▶️ Resuming Playback",
+		Description: fmt.Sprintf("Resuming: **%s**", track.Title),
+		Color:       0x1DB954,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Use /pause if you want to stop playback again.",
+		},
+	}
+
 	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("▶️ Resuming: **%s**", track.Title),
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 }

@@ -40,7 +40,14 @@ func Run() {
 				log.Printf("Failed to find text channel to send error message: %v", chErr)
 				continue
 			}
-			_, sendErr := discord.ChannelMessageSend(channelID, "⚠️ Bot Error: "+err.Error())
+
+			embed := &discordgo.MessageEmbed{
+				Title:       "⚠️ Bot Error",
+				Description: err.Error(),
+				Color:       0xE03C3C,
+			}
+
+			_, sendErr := discord.ChannelMessageSendEmbed(channelID, embed)
 			if sendErr != nil {
 				log.Printf("Failed to send error message to channel %s: %v", channelID, sendErr)
 			}

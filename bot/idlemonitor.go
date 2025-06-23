@@ -50,41 +50,54 @@ func StartIdleMonitor(guildID, textChannelID string, discord *discordgo.Session)
 					delete(GlobalQueue.stopChans, guildID)
 					GlobalQueue.Unlock()
 
-					_, _ = discord.ChannelMessageSend(textChannelID, "💤 Left the voice channel after 15 minutes of inactivity.")
+					embed := &discordgo.MessageEmbed{
+						Title:       "💤 Idle Timeout",
+						Description: "Left the voice channel after 15 minutes of inactivity.",
+						Color:       0x1DB954,
+					}
+					_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
 					return
 				}
 
 				if vc, ok := GlobalQueue.GetVoiceConnection(guildID); ok && vc != nil {
-					channel, err := discord.State.Channel(vc.ChannelID)
-					if err == nil {
-						guild, _ := discord.State.Guild(guildID)
-						nonBotCount := 0
-						for _, vs := range guild.VoiceStates {
-							if vs.ChannelID == channel.ID && vs.UserID != discord.State.User.ID {
-								member, err := discord.State.Member(guildID, vs.UserID)
-								if err == nil && !member.User.Bot {
-									nonBotCount++
-								}
+					channelID := vc.ChannelID
+					guild, err := discord.State.Guild(guildID)
+					if err != nil {
+						log.Printf("Failed to get guild state for %s: %v", guildID, err)
+						continue
+					}
+
+					nonBotCount := 0
+					for _, vs := range guild.VoiceStates {
+						if vs.ChannelID == channelID && vs.UserID != discord.State.User.ID {
+							member, err := discord.State.Member(guildID, vs.UserID)
+							if err == nil && !member.User.Bot {
+								nonBotCount++
 							}
 						}
+					}
 
-						if nonBotCount == 0 {
-							log.Printf("No users in VC in guild %s, leaving.", guildID)
+					if nonBotCount == 0 {
+						log.Printf("No users in VC in guild %s, leaving.", guildID)
 
-							if err := vc.Disconnect(); err != nil {
-								log.Printf("Error disconnecting: %v", err)
-							}
-
-							GlobalQueue.SetInVoiceChannel(guildID, false)
-							GlobalQueue.SetPlaying(guildID, false)
-
-							GlobalQueue.Lock()
-							delete(GlobalQueue.stopChans, guildID)
-							GlobalQueue.Unlock()
-
-							_, _ = discord.ChannelMessageSend(textChannelID, "👋 Left the voice channel because no users were present.")
-							return
+						if err := vc.Disconnect(); err != nil {
+							log.Printf("Error disconnecting: %v", err)
 						}
+
+						GlobalQueue.SetInVoiceChannel(guildID, false)
+						GlobalQueue.SetPlaying(guildID, false)
+
+						GlobalQueue.Lock()
+						delete(GlobalQueue.stopChans, guildID)
+						GlobalQueue.Unlock()
+
+						embed := &discordgo.MessageEmbed{
+							Title:       "👋 Voice Channel Empty",
+							Description: "Left the voice channel because no users were present.",
+							Color:       0x1DB954,
+						}
+						_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
+						return
 					}
 				}
 			}

@@ -131,13 +131,22 @@ func dynamicHelpHandler(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	var builder strings.Builder
 	builder.WriteString("📖 **Available Commands:**\n\n")
 	for _, cmd := range SlashCommands {
-		builder.WriteString(fmt.Sprintf("`/%s` - %s\n", cmd.Command.Name, cmd.Command.Description))
+		builder.WriteString(fmt.Sprintf("`/%s` — %s\n", cmd.Command.Name, cmd.Command.Description))
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "🛠️ Help Menu",
+		Description: builder.String(),
+		Color:       0x1DB954,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: "Need suggestions? Try /play followed by a song name",
+		},
 	}
 
 	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: builder.String(),
+			Embeds: []*discordgo.MessageEmbed{embed},
 		},
 	})
 }
