@@ -108,6 +108,13 @@ func init() {
 			},
 			Handler: HandleResumeCommand,
 		},
+		"shuffle": {
+			Command: &discordgo.ApplicationCommand{
+				Name:        "shuffle",
+				Description: "Shuffle the current queue",
+			},
+			Handler: HandleResumeCommand,
+		},
 	}
 }
 
