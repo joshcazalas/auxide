@@ -15,6 +15,17 @@ func Message(s *discordgo.Session, m *discordgo.MessageCreate) {
 	case m.Author.ID == "about78kids":
 		s.ChannelMessageSend(m.ChannelID, "love you sexy")
 	default:
-		s.ChannelMessageSend(m.ChannelID, "Use slash commands to trigger actions. Try `/help` to see available commands.")
+		// Check if bot is mentioned in the message
+		botID := s.State.User.ID
+		isMentioned := false
+		for _, user := range m.Mentions {
+			if user.ID == botID {
+				isMentioned = true
+				break
+			}
+		}
+		if isMentioned {
+			s.ChannelMessageSend(m.ChannelID, "Use slash commands to trigger actions. Try `/help` to see available commands.")
+		}
 	}
 }

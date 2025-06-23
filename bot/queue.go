@@ -18,6 +18,7 @@ type Queue struct {
 	inVoiceChannel   map[string]bool
 	playing          map[string]bool
 	voiceConnections map[string]*discordgo.VoiceConnection
+	stopChans        map[string]chan bool
 }
 
 func NewQueue() *Queue {
@@ -28,6 +29,7 @@ func NewQueue() *Queue {
 		inVoiceChannel:   make(map[string]bool),
 		playing:          make(map[string]bool),
 		voiceConnections: make(map[string]*discordgo.VoiceConnection),
+		stopChans:        make(map[string]chan bool),
 	}
 }
 

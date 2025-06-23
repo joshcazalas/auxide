@@ -89,7 +89,15 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 	log.Printf("Starting playback of file %s in guild %s", currentPath, guildID)
 
 	stop := make(chan bool)
+	GlobalQueue.Lock()
+	GlobalQueue.stopChans[guildID] = stop
+	GlobalQueue.Unlock()
+
 	dgvoice.PlayAudioFile(vc, currentPath, stop)
+
+	GlobalQueue.Lock()
+	delete(GlobalQueue.stopChans, guildID)
+	GlobalQueue.Unlock()
 	close(stop)
 
 	log.Printf("Finished playing file %s in guild %s", currentPath, guildID)
