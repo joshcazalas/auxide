@@ -55,7 +55,7 @@ func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string
 		q.downloadedFiles[v.Title] = filepath
 		q.Unlock()
 
-		StartPlaybackIfNotActive(discord, guildID, channelID, filepath, userID)
+		StartPlaybackIfNotActive(discord, guildID, channelID)
 	}(video)
 }
 

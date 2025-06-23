@@ -38,16 +38,24 @@ func JoinVoiceChannel(discord *discordgo.Session, guildID, channelID string) err
 	return nil
 }
 
-func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID, filePath, userID string) {
+func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID string) {
 	if GlobalQueue.IsPlaying(guildID) {
-		log.Printf("⏩ Already playing in guild %s, skipping duplicate call", guildID)
+		log.Printf("Already playing in guild %s, skipping duplicate call", guildID)
 		return
 	}
+
+	peeked, ok := GlobalQueue.Peek(textChannelID)
+	if !ok {
+		log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
+		GlobalQueue.SetInVoiceChannel(guildID, false)
+		return
+	}
+	userID := peeked.RequestedBy
 
 	if !GlobalQueue.IsInVoiceChannel(guildID) {
 		voiceChannelID := findUserVoiceChannel(discord, guildID, userID)
 		if voiceChannelID == "" {
-			ErrorChan <- errors.New("❌ Unable to start playback: no users in voice channels")
+			ErrorChan <- errors.New("unable to start playback: no users in voice channels")
 			return
 		}
 
@@ -56,7 +64,7 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 			return
 		}
 	} else {
-		log.Printf("📡 Already in a voice channel for guild %s", guildID)
+		log.Printf("Already in a voice channel for guild %s", guildID)
 	}
 
 	vc, ok := GlobalQueue.GetVoiceConnection(guildID)
@@ -65,33 +73,37 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 		return
 	}
 
-	next, ok := GlobalQueue.Peek(textChannelID)
+	current, ok := GlobalQueue.Pop(textChannelID)
 	if !ok {
-		log.Printf("📭 Queue for channel %s is empty, nothing to play", textChannelID)
+		log.Printf("Queue for channel %s is empty, nothing to play", textChannelID)
 		GlobalQueue.SetInVoiceChannel(guildID, false)
 		return
 	}
 
-	GlobalQueue.Pop(textChannelID)
-
-	log.Printf("▶️ Starting playback of file %s in guild %s", filePath, guildID)
-
-	stop := make(chan bool)
-	dgvoice.PlayAudioFile(vc, filePath, stop)
-	close(stop)
-
-	log.Printf("✅ Finished playing file %s in guild %s", filePath, guildID)
-
-	// if err := os.Remove(filePath); err != nil {
-	// 	log.Printf("⚠️ Failed to delete temp file %s: %v", filePath, err)
-	// }
-
-	nextPath, found := GlobalQueue.GetDownloadedFile(next.Title)
+	currentPath, found := GlobalQueue.GetDownloadedFile(current.Title)
 	if !found {
-		ErrorChan <- fmt.Errorf("next track '%s' not ready yet", next.Title)
+		ErrorChan <- fmt.Errorf("next track '%s' not ready yet", current.Title)
 		return
 	}
 
-	log.Printf("🔜 Queuing next track: %s", next.Title)
-	StartPlaybackIfNotActive(discord, guildID, textChannelID, nextPath, next.RequestedBy)
+	log.Printf("Starting playback of file %s in guild %s", currentPath, guildID)
+
+	stop := make(chan bool)
+	dgvoice.PlayAudioFile(vc, currentPath, stop)
+	close(stop)
+
+	log.Printf("Finished playing file %s in guild %s", currentPath, guildID)
+
+	// if err := os.Remove(filePath); err != nil {
+	// 	log.Printf("Failed to delete temp file %s: %v", filePath, err)
+	// }
+
+	next, ok := GlobalQueue.Peek(textChannelID)
+	if !ok {
+		log.Printf("No next track in queue for channel %s", textChannelID)
+		return
+	}
+
+	log.Printf("Queuing next track: %s", next.Title)
+	StartPlaybackIfNotActive(discord, guildID, textChannelID)
 }
