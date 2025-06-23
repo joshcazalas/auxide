@@ -27,6 +27,11 @@ type SearchResult struct {
 	Videos  []VideoInfo
 }
 
+func sanitizeFilename(name string) string {
+	re := regexp.MustCompile(`[^\w\-.]`)
+	return re.ReplaceAllString(name, "_")
+}
+
 func YoutubeSearch(query string) SearchResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -51,19 +56,9 @@ func YoutubeSearch(query string) SearchResult {
 		log.Fatalf("failed to start yt-dlp: %v", err)
 	}
 
-	var videos []VideoInfo
 	scanner := bufio.NewScanner(stdoutPipe)
-	for scanner.Scan() {
-		line := scanner.Text()
-		var info VideoInfo
-		if err := json.Unmarshal([]byte(line), &info); err != nil {
-			log.Printf("Skipping invalid JSON line: %v", err)
-			continue
-		}
-		videos = append(videos, info)
-	}
-
-	if err := scanner.Err(); err != nil {
+	videos, err := parseYTDLPJSONLines(scanner)
+	if err != nil {
 		log.Fatalf("error reading yt-dlp output: %v", err)
 	}
 
@@ -88,11 +83,6 @@ func YoutubeSearch(query string) SearchResult {
 	}
 }
 
-func sanitizeFilename(name string) string {
-	re := regexp.MustCompile(`[^\w\-.]`)
-	return re.ReplaceAllString(name, "_")
-}
-
 func YoutubeDownloadAudio(url string, title string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -106,4 +96,54 @@ func YoutubeDownloadAudio(url string, title string) (string, error) {
 	}
 
 	return AudioPath, nil
+}
+
+func YoutubeGetInfo(url string) (VideoInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "yt-dlp", "--dump-json", "--no-playlist", url)
+	cmd.Env = append(cmd.Env, "PYTHONIOENCODING=utf-8")
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return VideoInfo{}, fmt.Errorf("failed to get stdout pipe: %w", err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		return VideoInfo{}, fmt.Errorf("failed to start yt-dlp: %w", err)
+	}
+
+	scanner := bufio.NewScanner(stdoutPipe)
+	videos, err := parseYTDLPJSONLines(scanner)
+	if err != nil {
+		return VideoInfo{}, fmt.Errorf("error reading yt-dlp output: %w", err)
+	}
+
+	if err := cmd.Wait(); err != nil {
+		return VideoInfo{}, fmt.Errorf("yt-dlp command failed: %w", err)
+	}
+
+	if len(videos) == 0 {
+		return VideoInfo{}, fmt.Errorf("no video info returned for URL")
+	}
+
+	return videos[0], nil
+}
+
+func parseYTDLPJSONLines(scanner *bufio.Scanner) ([]VideoInfo, error) {
+	var videos []VideoInfo
+	for scanner.Scan() {
+		line := scanner.Text()
+		var info VideoInfo
+		if err := json.Unmarshal([]byte(line), &info); err != nil {
+			log.Printf("Skipping invalid JSON line: %v", err)
+			continue
+		}
+		videos = append(videos, info)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return videos, nil
 }

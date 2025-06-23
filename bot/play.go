@@ -3,6 +3,7 @@ package bot
 import (
 	"fmt"
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,12 @@ var (
 	mu                  sync.Mutex
 	searchResultsByUser = make(map[string][]VideoInfo)
 )
+
+var youtubeRegex = regexp.MustCompile(`^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+$`)
+
+func isYouTubeLink(input string) bool {
+	return youtubeRegex.MatchString(input)
+}
 
 func GetSearchResults(userID string) ([]VideoInfo, bool) {
 	mu.Lock()
@@ -48,6 +55,46 @@ func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 	}
 
 	go func() {
+		if isYouTubeLink(query) {
+			video, err := YoutubeGetInfo(query)
+			if err != nil {
+				log.Printf("Failed to fetch info for YouTube link %s: %v", query, err)
+				discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+					Content: "❌ Failed to get video info. Please make sure the link is valid.",
+				})
+				return
+			}
+
+			GlobalQueue.Add(discord, i.GuildID, i.ChannelID, userID, video)
+
+			duration := time.Duration(video.Duration) * time.Second
+			embed := &discordgo.MessageEmbed{
+				Title:       "✅ Added to Queue",
+				Description: fmt.Sprintf("[%s](%s)", video.Title, video.WebURL),
+				Color:       0x1DB954,
+				Fields: []*discordgo.MessageEmbedField{
+					{
+						Name:   "Requested By",
+						Value:  fmt.Sprintf("<@%s>", userID),
+						Inline: true,
+					},
+					{
+						Name:   "Duration",
+						Value:  fmtDuration(duration),
+						Inline: true,
+					},
+				},
+				Footer: &discordgo.MessageEmbedFooter{
+					Text: "Use /queue to view the current queue.",
+				},
+			}
+
+			discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+				Embeds: []*discordgo.MessageEmbed{embed},
+			})
+			return
+		}
+
 		searchResults := YoutubeSearch(query)
 
 		SetSearchResults(userID, searchResults.Videos)
