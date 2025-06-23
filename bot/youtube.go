@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/url"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -25,6 +27,25 @@ type VideoInfo struct {
 type SearchResult struct {
 	Message string
 	Videos  []VideoInfo
+}
+
+var youtubeRegex = regexp.MustCompile(`^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+$`)
+
+func isYouTubeLink(input string) bool {
+	return youtubeRegex.MatchString(input)
+}
+
+func sanitizeYouTubeURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	q := parsed.Query()
+	videoID := q.Get("v")
+	if videoID == "" {
+		return raw
+	}
+	return "https://www.youtube.com/watch?v=" + videoID
 }
 
 func sanitizeFilename(name string) string {
@@ -110,14 +131,27 @@ func YoutubeGetInfo(url string) (VideoInfo, error) {
 		return VideoInfo{}, fmt.Errorf("failed to get stdout pipe: %w", err)
 	}
 
+	_, err = cmd.StderrPipe()
+	if err != nil {
+		return VideoInfo{}, fmt.Errorf("failed to get stderr pipe: %w", err)
+	}
+
 	if err := cmd.Start(); err != nil {
 		return VideoInfo{}, fmt.Errorf("failed to start yt-dlp: %w", err)
 	}
 
-	scanner := bufio.NewScanner(stdoutPipe)
-	videos, err := parseYTDLPJSONLines(scanner)
-	if err != nil {
-		return VideoInfo{}, fmt.Errorf("error reading yt-dlp output: %w", err)
+	decoder := json.NewDecoder(stdoutPipe)
+
+	var videos []VideoInfo
+	for {
+		var video VideoInfo
+		if err := decoder.Decode(&video); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return VideoInfo{}, fmt.Errorf("error decoding JSON from yt-dlp: %w", err)
+		}
+		videos = append(videos, video)
 	}
 
 	if err := cmd.Wait(); err != nil {
@@ -127,6 +161,8 @@ func YoutubeGetInfo(url string) (VideoInfo, error) {
 	if len(videos) == 0 {
 		return VideoInfo{}, fmt.Errorf("no video info returned for URL")
 	}
+
+	log.Printf("yt-dlp parsed video info: %+v", videos[0])
 
 	return videos[0], nil
 }

@@ -3,7 +3,6 @@ package bot
 import (
 	"fmt"
 	"log"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,12 +15,6 @@ var (
 	mu                  sync.Mutex
 	searchResultsByUser = make(map[string][]VideoInfo)
 )
-
-var youtubeRegex = regexp.MustCompile(`^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+$`)
-
-func isYouTubeLink(input string) bool {
-	return youtubeRegex.MatchString(input)
-}
 
 func GetSearchResults(userID string) ([]VideoInfo, bool) {
 	mu.Lock()
@@ -46,22 +39,20 @@ func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 	userID := GetUserID(i)
 	query := i.ApplicationCommandData().Options[0].StringValue()
 
-	err := discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+	if err := discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
-	})
-	if err != nil {
-		log.Println("Failed to defer interaction:", err)
+	}); err != nil {
+		log.Printf("Failed to defer interaction: %v", err)
 		return
 	}
 
 	go func() {
 		if isYouTubeLink(query) {
-			video, err := YoutubeGetInfo(query)
+			sanitizedURL := sanitizeYouTubeURL(query)
+			video, err := YoutubeGetInfo(sanitizedURL)
 			if err != nil {
-				log.Printf("Failed to fetch info for YouTube link %s: %v", query, err)
-				discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-					Content: "❌ Failed to get video info. Please make sure the link is valid.",
-				})
+				log.Printf("Failed to get video info for %s: %v", sanitizedURL, err)
+				sendErrorFollowup(discord, i, "Failed to get video info. Please make sure the link is valid.")
 				return
 			}
 
@@ -73,38 +64,27 @@ func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 				Description: fmt.Sprintf("[%s](%s)", video.Title, video.WebURL),
 				Color:       0x1DB954,
 				Fields: []*discordgo.MessageEmbedField{
-					{
-						Name:   "Requested By",
-						Value:  fmt.Sprintf("<@%s>", userID),
-						Inline: true,
-					},
-					{
-						Name:   "Duration",
-						Value:  fmtDuration(duration),
-						Inline: true,
-					},
+					{Name: "Requested By", Value: fmt.Sprintf("<@%s>", userID), Inline: true},
+					{Name: "Duration", Value: fmtDuration(duration), Inline: true},
 				},
 				Footer: &discordgo.MessageEmbedFooter{
 					Text: "Use /queue to view the current queue.",
 				},
 			}
 
-			discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-				Embeds: []*discordgo.MessageEmbed{embed},
-			})
+			sendEmbedFollowup(discord, i, embed)
 			return
 		}
 
 		searchResults := YoutubeSearch(query)
-
 		SetSearchResults(userID, searchResults.Videos)
 
 		var buttons []discordgo.MessageComponent
-		for i := range searchResults.Videos {
+		for idx := range searchResults.Videos {
 			buttons = append(buttons, discordgo.Button{
-				Label:    fmt.Sprintf("%d", i+1),
+				Label:    fmt.Sprintf("%d", idx+1),
 				Style:    discordgo.PrimaryButton,
-				CustomID: fmt.Sprintf("select_video_%d", i+1),
+				CustomID: fmt.Sprintf("select_video_%d", idx+1),
 			})
 		}
 
@@ -123,19 +103,26 @@ func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 			Title:       "🔍 Search Results",
 			Description: builder.String(),
 			Color:       0x1DB954,
-			Footer: &discordgo.MessageEmbedFooter{
-				Text: "Click a number below to choose a song",
-			},
+			Footer:      &discordgo.MessageEmbedFooter{Text: "Click a number below to choose a song"},
 		}
 
-		_, err := discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
-			Embeds:     []*discordgo.MessageEmbed{embed},
-			Components: components,
-		})
-		if err != nil {
-			log.Println("Failed to send followup message:", err)
-		}
+		sendEmbedFollowupWithComponents(discord, i, embed, components)
 	}()
+}
+
+func sendErrorFollowup(discord *discordgo.Session, i *discordgo.InteractionCreate, message string) {
+	_, err := discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Embeds: []*discordgo.MessageEmbed{
+			{
+				Title:       "❌ Error",
+				Description: message,
+				Color:       0xE03C3C,
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to send error followup: %v", err)
+	}
 }
 
 func HandlePlaySelection(discord *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -197,4 +184,23 @@ func HandlePlaySelection(discord *discordgo.Session, i *discordgo.InteractionCre
 	})
 
 	DeleteSearchResults(userID)
+}
+
+func sendEmbedFollowup(discord *discordgo.Session, i *discordgo.InteractionCreate, embed *discordgo.MessageEmbed) {
+	_, err := discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Embeds: []*discordgo.MessageEmbed{embed},
+	})
+	if err != nil {
+		log.Printf("Failed to send followup embed: %v", err)
+	}
+}
+
+func sendEmbedFollowupWithComponents(discord *discordgo.Session, i *discordgo.InteractionCreate, embed *discordgo.MessageEmbed, components []discordgo.MessageComponent) {
+	_, err := discord.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+		Embeds:     []*discordgo.MessageEmbed{embed},
+		Components: components,
+	})
+	if err != nil {
+		log.Printf("Failed to send followup embed with components: %v", err)
+	}
 }

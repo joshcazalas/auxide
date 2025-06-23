@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -9,7 +10,16 @@ import (
 )
 
 var BotToken string
-var ErrorChan = make(chan error)
+var ErrorChan = make(chan GuildError)
+
+const BotTextChannelName = "music-bot-channel"
+
+var botTextChannels = make(map[string]string)
+
+type GuildError struct {
+	GuildID string
+	Err     error
+}
 
 func Run() {
 	if BotToken == "" {
@@ -34,26 +44,36 @@ func Run() {
 	log.Println("Bot running...")
 
 	go func() {
-		for err := range ErrorChan {
-			log.Printf("Received error from bot: %v", err)
-			channelID, chErr := GetTextChannel(discord)
-			if chErr != nil {
-				log.Printf("Failed to find text channel to send error message: %v", chErr)
+		for guildErr := range ErrorChan {
+			log.Printf("Bot error in guild %s: %v", guildErr.GuildID, guildErr.Err)
+
+			channelID, ok := botTextChannels[guildErr.GuildID]
+			if !ok {
+				log.Printf("No bot text channel recorded for guild %s to send error message", guildErr.GuildID)
 				continue
 			}
 
 			embed := &discordgo.MessageEmbed{
 				Title:       "⚠️ Bot Error",
-				Description: err.Error(),
+				Description: guildErr.Err.Error(),
 				Color:       0xE03C3C,
 			}
 
 			_, sendErr := discord.ChannelMessageSendEmbed(channelID, embed)
 			if sendErr != nil {
-				log.Printf("Failed to send error message to channel %s: %v", channelID, sendErr)
+				log.Printf("Failed to send error message to channel %s in guild %s: %v", channelID, guildErr.GuildID, sendErr)
 			}
 		}
 	}()
+
+	err = InitializeBotChannels(discord)
+	if err != nil {
+		log.Printf("Failed to initialize bot channels: %v", err)
+		ErrorChan <- GuildError{
+			GuildID: discord.State.Application.GuildID,
+			Err:     fmt.Errorf("failed to initialize bot channels: %v", err),
+		}
+	}
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)

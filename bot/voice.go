@@ -1,7 +1,6 @@
 package bot
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -70,12 +69,18 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 	if !GlobalQueue.IsInVoiceChannel(guildID) {
 		voiceChannelID := findUserVoiceChannel(discord, guildID, userID)
 		if voiceChannelID == "" {
-			ErrorChan <- errors.New("unable to start playback: no users in voice channels")
+			ErrorChan <- GuildError{
+				GuildID: guildID,
+				Err:     fmt.Errorf("unable to start playback: no users in voice channels"),
+			}
 			return
 		}
 
 		if err := JoinVoiceChannel(discord, guildID, voiceChannelID); err != nil {
-			ErrorChan <- fmt.Errorf("failed to join voice channel: %w", err)
+			ErrorChan <- GuildError{
+				GuildID: guildID,
+				Err:     fmt.Errorf("failed to join voice channel: %w", err),
+			}
 			return
 		}
 		StartIdleMonitor(guildID, textChannelID, discord)
@@ -85,7 +90,10 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 
 	vc, ok := GlobalQueue.GetVoiceConnection(guildID)
 	if !ok || vc == nil {
-		ErrorChan <- fmt.Errorf("no voice connection found for guild %s", guildID)
+		ErrorChan <- GuildError{
+			GuildID: guildID,
+			Err:     fmt.Errorf("no voice connection found for guild %s", guildID),
+		}
 		return
 	}
 
@@ -107,7 +115,10 @@ func StartPlaybackIfNotActive(discord *discordgo.Session, guildID, textChannelID
 
 	currentPath, found := GlobalQueue.GetDownloadedFile(current.Title)
 	if !found {
-		ErrorChan <- fmt.Errorf("next track '%s' not ready yet", current.Title)
+		ErrorChan <- GuildError{
+			GuildID: guildID,
+			Err:     fmt.Errorf("next track '%s' not ready yet", current.Title),
+		}
 		return
 	}
 
