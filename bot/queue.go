@@ -47,7 +47,7 @@ func (q *Queue) Add(discord *discordgo.Session, guildID string, channelID string
 func (q *Queue) Get(channelID string) []model.VideoInfo {
 	q.Lock()
 	defer q.Unlock()
-	return append([]model.VideoInfo(nil), q.queues[channelID]...) // returns a copy
+	return append([]model.VideoInfo(nil), q.queues[channelID]...)
 }
 
 func (q *Queue) Pop(channelID string) (model.VideoInfo, bool) {
@@ -100,6 +100,19 @@ func GetQueue(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: builder.String(),
+		},
+	})
+}
+
+func ClearQueue(discord *discordgo.Session, i *discordgo.InteractionCreate) {
+	channelID := i.ChannelID
+
+	GlobalQueue.Clear(channelID)
+
+	discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: "🗑️ The queue has been cleared.",
 		},
 	})
 }

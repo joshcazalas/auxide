@@ -9,7 +9,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
-func Play(discord *discordgo.Session, i *discordgo.InteractionCreate, userID string) {
+func HandlePlayCommand(discord *discordgo.Session, i *discordgo.InteractionCreate, userID string) {
 	query := i.ApplicationCommandData().Options[0].StringValue()
 
 	err := discord.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -56,7 +56,7 @@ func Play(discord *discordgo.Session, i *discordgo.InteractionCreate, userID str
 	}()
 }
 
-func HandlePlayComponent(discord *discordgo.Session, i *discordgo.InteractionCreate) {
+func HandlePlaySelection(discord *discordgo.Session, i *discordgo.InteractionCreate) {
 	if i.Type != discordgo.InteractionMessageComponent {
 		return
 	}

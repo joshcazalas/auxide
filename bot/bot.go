@@ -1,7 +1,6 @@
 package bot
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -21,13 +20,16 @@ func Run() {
 	discord, err := discordgo.New("Bot " + BotToken)
 	CheckNilErr(err)
 
+	discord.AddHandler(func(s *discordgo.Session, r *discordgo.Ready) {
+		RegisterSlashCommands(s)
+		RegisterComponentHandlers()
+	})
+
+	discord.AddHandler(Message)
+	discord.AddHandler(Interaction)
+
 	err = discord.Open()
 	CheckNilErr(err)
-
-	RegisterSlashCommands(discord)
-	discord.AddHandler(Message)
-	discord.AddHandler(HandlePlayComponent)
-	discord.AddHandler(Interaction)
 
 	defer discord.Close()
 
@@ -46,7 +48,8 @@ func Run() {
 		}
 	}()
 
-	fmt.Println("Bot running...")
+	log.Println("Bot running...")
+
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c

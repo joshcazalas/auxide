@@ -1,8 +1,6 @@
 package bot
 
 import (
-	"strings"
-
 	"github.com/bwmarrin/discordgo"
 )
 
@@ -16,9 +14,7 @@ func Message(s *discordgo.Session, m *discordgo.MessageCreate) {
 		s.ChannelMessageSend(m.ChannelID, "fuck you")
 	case m.Author.ID == "about78kids":
 		s.ChannelMessageSend(m.ChannelID, "love you sexy")
-	case strings.Contains(m.Content, "!help"):
-		s.ChannelMessageSend(m.ChannelID, "")
-	case strings.Contains(m.Content, "!bye"):
-		s.ChannelMessageSend(m.ChannelID, "Goodbye")
+	default:
+		s.ChannelMessageSend(m.ChannelID, "Use slash commands to trigger actions. Try `/help` to see available commands.")
 	}
 }
