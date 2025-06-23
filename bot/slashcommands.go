@@ -94,20 +94,6 @@ func init() {
 			},
 			Handler: HandleStopCommand,
 		},
-		"pause": {
-			Command: &discordgo.ApplicationCommand{
-				Name:        "pause",
-				Description: "Pause the current playback",
-			},
-			Handler: HandlePauseCommand,
-		},
-		"resume": {
-			Command: &discordgo.ApplicationCommand{
-				Name:        "resume",
-				Description: "Resume the current playback",
-			},
-			Handler: HandleResumeCommand,
-		},
 		"shuffle": {
 			Command: &discordgo.ApplicationCommand{
 				Name:        "shuffle",

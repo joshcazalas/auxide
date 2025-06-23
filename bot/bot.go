@@ -56,18 +56,37 @@ func Run() {
 		existingCmds, err := discord.ApplicationCommands(botID, guild.ID)
 		CheckNilErr(err)
 
-		existingNames := make(map[string]bool)
+		existingNames := make(map[string]*discordgo.ApplicationCommand)
 		for _, cmd := range existingCmds {
-			existingNames[cmd.Name] = true
+			existingNames[cmd.Name] = cmd
+		}
+
+		configNames := make(map[string]bool)
+		for _, cmd := range SlashCommands {
+			configNames[cmd.Command.Name] = true
+		}
+
+		for name, cmd := range existingNames {
+			if !configNames[name] {
+				err := discord.ApplicationCommandDelete(botID, guild.ID, cmd.ID)
+				if err != nil {
+					log.Printf("Failed to delete stale command /%s for guild %s: %v", name, guild.ID, err)
+				} else {
+					log.Printf("Deleted stale command /%s for guild %s", name, guild.ID)
+				}
+			}
 		}
 
 		for _, cmd := range SlashCommands {
-			if existingNames[cmd.Command.Name] {
+			if _, exists := existingNames[cmd.Command.Name]; exists {
 				continue
 			}
 			_, err := discord.ApplicationCommandCreate(botID, guild.ID, cmd.Command)
-			CheckNilErr(err)
-			log.Printf("Registered /%s for guild %s", cmd.Command.Name, guild.ID)
+			if err != nil {
+				log.Printf("Failed to create command /%s for guild %s: %v", cmd.Command.Name, guild.ID, err)
+			} else {
+				log.Printf("Registered /%s for guild %s", cmd.Command.Name, guild.ID)
+			}
 		}
 	}
 
