@@ -27,7 +27,7 @@ func SendNowPlayingEmbed(s *discordgo.Session, channelID string, video VideoInfo
 			},
 		},
 		Footer: &discordgo.MessageEmbedFooter{
-			Text: "Try /shuffle, /skip, /pause & more. Use /help to see all commands",
+			Text: "Try /shuffle, /skip, /stop & more. Use /help to see all commands",
 		},
 	}
 

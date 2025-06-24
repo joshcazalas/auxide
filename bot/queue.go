@@ -55,7 +55,7 @@ func (q *Queue) Add(discord *discordgo.Session, interaction *discordgo.Interacti
 	err := discord.InteractionRespond(interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
-			Content: fmt.Sprintf("🎵 **%s** requested by <@%s>. Downloading now...", video.Title, userID),
+			Content: fmt.Sprintf("🎵 **%s** requested by <@%s>. Fetching...", video.Title, userID),
 		},
 	})
 	if err != nil {
@@ -100,7 +100,7 @@ func (q *Queue) Add(discord *discordgo.Session, interaction *discordgo.Interacti
 		q.Unlock()
 
 		_, err2 := discord.FollowupMessageCreate(interaction, false, &discordgo.WebhookParams{
-			Content: fmt.Sprintf("✅ **%s** has been added to the queue and is ready to play!", v.Title),
+			Content: fmt.Sprintf("✅ **%s** ready!", v.Title),
 		})
 		if err2 != nil {
 			log.Printf("Failed to send follow-up message: %v", err2)
@@ -270,7 +270,7 @@ func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionC
 						Description: "The queue is currently empty.",
 						Color:       0x1DB954,
 						Footer: &discordgo.MessageEmbedFooter{
-							Text: "Try /shuffle, /skip, /pause & more. Use /help to see all commands",
+							Text: "Try /shuffle, /skip, /stop & more. Use /help to see all commands",
 						},
 					},
 				},
@@ -292,7 +292,7 @@ func HandleGetQueueCommand(discord *discordgo.Session, i *discordgo.InteractionC
 		Description: builder.String(),
 		Color:       0x1DB954,
 		Footer: &discordgo.MessageEmbedFooter{
-			Text: "Try /shuffle, /skip, /pause & more. Use /help to see all commands",
+			Text: "Try /shuffle, /skip, /stop & more. Use /help to see all commands",
 		},
 	}
 
