@@ -80,13 +80,13 @@ func init() {
 			},
 			Handler: HandleClearQueueCommand,
 		},
-		"skip": {
-			Command: &discordgo.ApplicationCommand{
-				Name:        "skip",
-				Description: "Skip the current song",
-			},
-			Handler: HandleSkipCommand,
-		},
+		// "skip": {
+		// 	Command: &discordgo.ApplicationCommand{
+		// 		Name:        "skip",
+		// 		Description: "Skip the current song",
+		// 	},
+		// 	Handler: HandleSkipCommand,
+		// },
 		"stop": {
 			Command: &discordgo.ApplicationCommand{
 				Name:        "stop",
