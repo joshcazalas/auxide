@@ -66,7 +66,7 @@ func HandleStopCommand(discord *discordgo.Session, i *discordgo.InteractionCreat
 		}
 	}
 
-	CancelIdleMonitor(guildID)
+	// CancelIdleMonitor(guildID)
 
 	GlobalQueue.SetPlaying(guildID, false)
 	GlobalQueue.SetInVoiceChannel(guildID, false)

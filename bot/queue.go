@@ -69,7 +69,7 @@ func (q *Queue) Add(discord *discordgo.Session, interaction *discordgo.Interacti
 			if err != nil {
 				log.Printf("Failed to join voice channel immediately: %v", err)
 			} else {
-				StartIdleMonitor(guildID, channelID, discord)
+				// StartIdleMonitor(guildID, channelID, discord)
 			}
 		} else {
 			log.Printf("User %s is not in a voice channel, cannot join immediately", userID)

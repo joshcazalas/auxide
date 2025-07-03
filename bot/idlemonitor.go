@@ -1,116 +1,108 @@
 package bot
 
-import (
-	"context"
-	"log"
-	"time"
+// func StartIdleMonitor(guildID, textChannelID string, discord *discordgo.Session) {
+// 	CancelIdleMonitor(guildID)
 
-	"github.com/bwmarrin/discordgo"
-)
+// 	ctx, cancel := context.WithCancel(context.Background())
 
-func StartIdleMonitor(guildID, textChannelID string, discord *discordgo.Session) {
-	CancelIdleMonitor(guildID)
+// 	GlobalQueue.Lock()
+// 	GlobalQueue.idleCancelFuncs[guildID] = cancel
+// 	GlobalQueue.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background())
+// 	go func() {
+// 		ticker := time.NewTicker(1 * time.Minute)
+// 		defer ticker.Stop()
 
-	GlobalQueue.Lock()
-	GlobalQueue.idleCancelFuncs[guildID] = cancel
-	GlobalQueue.Unlock()
+// 		for {
+// 			select {
+// 			case <-ctx.Done():
+// 				return
+// 			case <-ticker.C:
+// 				if vc, ok := GlobalQueue.GetVoiceConnection(guildID); ok && vc != nil {
+// 					channelID := vc.ChannelID
+// 					guild, err := discord.State.Guild(guildID)
+// 					if err != nil {
+// 						log.Printf("Failed to get guild state for %s: %v", guildID, err)
+// 						continue
+// 					}
 
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
+// 					nonBotCount := 0
+// 					for _, vs := range guild.VoiceStates {
+// 						if vs.ChannelID == channelID && vs.UserID != discord.State.User.ID {
+// 							member, err := discord.State.Member(guildID, vs.UserID)
+// 							if err == nil && !member.User.Bot {
+// 								nonBotCount++
+// 							}
+// 						}
+// 					}
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if vc, ok := GlobalQueue.GetVoiceConnection(guildID); ok && vc != nil {
-					channelID := vc.ChannelID
-					guild, err := discord.State.Guild(guildID)
-					if err != nil {
-						log.Printf("Failed to get guild state for %s: %v", guildID, err)
-						continue
-					}
+// 					if nonBotCount == 0 {
+// 						log.Printf("No users in VC in guild %s, leaving.", guildID)
 
-					nonBotCount := 0
-					for _, vs := range guild.VoiceStates {
-						if vs.ChannelID == channelID && vs.UserID != discord.State.User.ID {
-							member, err := discord.State.Member(guildID, vs.UserID)
-							if err == nil && !member.User.Bot {
-								nonBotCount++
-							}
-						}
-					}
+// 						if err := vc.Disconnect(); err != nil {
+// 							log.Printf("Error disconnecting: %v", err)
+// 						}
 
-					if nonBotCount == 0 {
-						log.Printf("No users in VC in guild %s, leaving.", guildID)
+// 						GlobalQueue.SetInVoiceChannel(guildID, false)
+// 						GlobalQueue.SetPlaying(guildID, false)
 
-						if err := vc.Disconnect(); err != nil {
-							log.Printf("Error disconnecting: %v", err)
-						}
+// 						GlobalQueue.Lock()
+// 						delete(GlobalQueue.stopChans, guildID)
+// 						delete(GlobalQueue.idleCancelFuncs, guildID)
+// 						GlobalQueue.Unlock()
 
-						GlobalQueue.SetInVoiceChannel(guildID, false)
-						GlobalQueue.SetPlaying(guildID, false)
+// 						embed := &discordgo.MessageEmbed{
+// 							Title:       "👋 Voice Channel Empty",
+// 							Description: "Left the voice channel because no users were present.",
+// 							Color:       0x1DB954,
+// 						}
+// 						_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
+// 						return
+// 					}
+// 				}
 
-						GlobalQueue.Lock()
-						delete(GlobalQueue.stopChans, guildID)
-						delete(GlobalQueue.idleCancelFuncs, guildID)
-						GlobalQueue.Unlock()
+// 				if GlobalQueue.IsPlaying(guildID) {
+// 					continue
+// 				}
 
-						embed := &discordgo.MessageEmbed{
-							Title:       "👋 Voice Channel Empty",
-							Description: "Left the voice channel because no users were present.",
-							Color:       0x1DB954,
-						}
-						_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
-						return
-					}
-				}
+// 				last := GlobalQueue.GetLastActivity(guildID)
+// 				if time.Since(last) > 10*time.Minute {
+// 					log.Printf("Idle timeout reached for guild %s", guildID)
 
-				if GlobalQueue.IsPlaying(guildID) {
-					continue
-				}
+// 					vc, ok := GlobalQueue.GetVoiceConnection(guildID)
+// 					if ok && vc != nil {
+// 						if err := vc.Disconnect(); err != nil {
+// 							log.Printf("Failed to disconnect from voice in guild %s: %v", guildID, err)
+// 						}
+// 					}
 
-				last := GlobalQueue.GetLastActivity(guildID)
-				if time.Since(last) > 10*time.Minute {
-					log.Printf("Idle timeout reached for guild %s", guildID)
+// 					GlobalQueue.SetInVoiceChannel(guildID, false)
+// 					GlobalQueue.SetPlaying(guildID, false)
 
-					vc, ok := GlobalQueue.GetVoiceConnection(guildID)
-					if ok && vc != nil {
-						if err := vc.Disconnect(); err != nil {
-							log.Printf("Failed to disconnect from voice in guild %s: %v", guildID, err)
-						}
-					}
+// 					GlobalQueue.Lock()
+// 					delete(GlobalQueue.stopChans, guildID)
+// 					delete(GlobalQueue.idleCancelFuncs, guildID)
+// 					GlobalQueue.Unlock()
 
-					GlobalQueue.SetInVoiceChannel(guildID, false)
-					GlobalQueue.SetPlaying(guildID, false)
+// 					embed := &discordgo.MessageEmbed{
+// 						Title:       "💤 Idle Timeout",
+// 						Description: "Left the voice channel after 10 minutes of inactivity.",
+// 						Color:       0x1DB954,
+// 					}
+// 					_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
+// 					return
+// 				}
+// 			}
+// 		}
+// 	}()
+// }
 
-					GlobalQueue.Lock()
-					delete(GlobalQueue.stopChans, guildID)
-					delete(GlobalQueue.idleCancelFuncs, guildID)
-					GlobalQueue.Unlock()
+// func CancelIdleMonitor(guildID string) {
+// 	GlobalQueue.Lock()
+// 	defer GlobalQueue.Unlock()
 
-					embed := &discordgo.MessageEmbed{
-						Title:       "💤 Idle Timeout",
-						Description: "Left the voice channel after 10 minutes of inactivity.",
-						Color:       0x1DB954,
-					}
-					_, _ = discord.ChannelMessageSendEmbed(textChannelID, embed)
-					return
-				}
-			}
-		}
-	}()
-}
-
-func CancelIdleMonitor(guildID string) {
-	GlobalQueue.Lock()
-	defer GlobalQueue.Unlock()
-
-	if cancel, ok := GlobalQueue.idleCancelFuncs[guildID]; ok {
-		cancel()
-		delete(GlobalQueue.idleCancelFuncs, guildID)
-	}
-}
+// 	if cancel, ok := GlobalQueue.idleCancelFuncs[guildID]; ok {
+// 		cancel()
+// 		delete(GlobalQueue.idleCancelFuncs, guildID)
+// 	}
+// }
