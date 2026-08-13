@@ -1,3 +1,6 @@
 *.env
 
 .direnv/*
+target/
+config.toml
+*.token

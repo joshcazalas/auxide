@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Rust and Nix gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install upstream Nix
+        uses: DeterminateSystems/determinate-nix-action@61cbfe2efc2d4e7a8a6d56967c3c1058e846c858 # v3.21.9
+        with:
+          determinate: false
+
+      - name: Check formatting
+        run: nix develop --command cargo fmt --check
+
+      - name: Run tests
+        run: nix develop --command cargo test --all-targets
+
+      - name: Run strict lints
+        run: nix develop --command cargo clippy --all-targets -- -D warnings
+
+      - name: Build the pinned package
+        run: nix flake check --print-build-logs
