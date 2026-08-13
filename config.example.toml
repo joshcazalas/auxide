@@ -1,0 +1,31 @@
+[discord]
+token_file = "/run/secrets/discord-token"
+
+[[discord.guilds]]
+guild_id = 123456789012345678
+# An empty list permits commands in every text channel in this allowlisted guild.
+command_channel_ids = [234567890123456789]
+# When both lists are empty, any member in the requester's voice channel is authorized.
+authorized_role_ids = []
+authorized_user_ids = []
+
+[playback]
+idle_timeout_seconds = 600
+max_track_duration_seconds = 14400
+max_queue_length = 100
+actor_mailbox_capacity = 128
+max_concurrent_resolutions = 2
+
+[youtube]
+enabled = true
+yt_dlp_path = "yt-dlp"
+deno_path = "deno"
+search_results = 5
+resolution_timeout_seconds = 20
+max_output_bytes = 1048576
+
+[observability]
+# Publish this port only to a private container network, never to the public Internet.
+listen_address = "0.0.0.0:9090"
+json_logs = true
+log_filter = "discord_music_bot=info,serenity=info,songbird=info"
