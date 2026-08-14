@@ -38,6 +38,8 @@ jobs:
         uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
         with:
           hatchet-protocol: holster
+          # Cargo needs about 5 GB; the default leaves only 1 GB outside /nix.
+          mnt-safe-haven: "12288"
 
       - name: Install Nix
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
