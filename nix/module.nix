@@ -8,6 +8,7 @@ self:
 let
   cfg = config.services.auxide;
   credentialsDirectory = "/run/credentials/auxide.service";
+  system = pkgs.stdenv.hostPlatform.system;
 in
 {
   options.services.auxide = {
@@ -15,8 +16,8 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = self.packages.${pkgs.system}.auxide;
-      defaultText = lib.literalExpression "auxide.packages.${pkgs.system}.auxide";
+      default = self.packages.${system}.auxide;
+      defaultText = lib.literalExpression "auxide.packages.${system}.auxide";
       description = "Auxide package to run.";
     };
 
@@ -83,7 +84,7 @@ in
       createHome = false;
     };
 
-    environment.systemPackages = [ self.packages.${pkgs.system}.credential-helper ];
+    environment.systemPackages = [ self.packages.${system}.credential-helper ];
 
     systemd.tmpfiles.rules = [
       "d /var/lib/auxide 0700 root root -"

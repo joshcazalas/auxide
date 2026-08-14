@@ -42,7 +42,32 @@
               wrapProgram "$out/bin/auxide" \
                 --prefix PATH : ${runtimePath}
             '';
+
+            meta = {
+              description = "Self-hosted Discord music bot with encrypted voice";
+              homepage = "https://github.com/joshcazalas/auxide";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "auxide";
+              platforms = [ "x86_64-linux" ];
+            };
           };
+
+          enabledModule = inputs.nixpkgs.lib.nixosSystem {
+            system = pkgs.stdenv.hostPlatform.system;
+            modules = [
+              self.nixosModules.default
+              {
+                services.auxide.enable = true;
+                system.stateVersion = "26.05";
+              }
+            ];
+          };
+
+          module-evaluation = pkgs.runCommand "auxide-nixos-module-evaluation" { } ''
+            test ${pkgs.lib.escapeShellArg enabledModule.config.systemd.services.auxide.serviceConfig.User} = auxide
+            test ${pkgs.lib.escapeShellArg enabledModule.config.systemd.services.auxide.serviceConfig.Group} = auxide
+            touch "$out"
+          '';
 
           credential-helper = pkgs.writeShellApplication {
             name = "auxide-credential";
@@ -85,7 +110,12 @@
           };
 
           checks = {
-            inherit credential-helper auxide oci-image;
+            inherit
+              credential-helper
+              auxide
+              module-evaluation
+              oci-image
+              ;
           };
 
           devShells.default = pkgs.mkShell {

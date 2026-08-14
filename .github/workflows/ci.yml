@@ -16,6 +16,8 @@ jobs:
     name: Validate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
     permissions:
       contents: read
       id-token: write
@@ -39,7 +41,13 @@ jobs:
             build-dir = /nix/build
 
       - name: Check source, formatting, and workflows
-        run: nix develop --command ./scripts/check.sh
+        run: |
+          cargo_target_dir="${TMPDIR}/auxide-cargo-target"
+          echo "CARGO_TARGET_DIR=${cargo_target_dir}" >> "${GITHUB_ENV}"
+          CARGO_TARGET_DIR="${cargo_target_dir}" nix develop --command ./scripts/check.sh
+
+      - name: Reclaim Cargo build space
+        run: nix develop --command cargo clean --target-dir "${CARGO_TARGET_DIR}"
 
       - name: Scan the worktree and complete Git history for secrets
         run: nix develop --command ./scripts/secret-scan.sh
