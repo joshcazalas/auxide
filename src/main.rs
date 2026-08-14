@@ -1,19 +1,20 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use discord_music_bot::{
+use auxide::{
     config::{Config, ObservabilityConfig},
+    discord::{register_commands, run},
     source::{SourceResolver, YouTubeResolver},
     spike::{VoiceSpikeSource, run_voice_spike},
 };
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 struct Cli {
-    #[arg(long, env = "DISCORD_MUSIC_BOT_CONFIG", default_value = "config.toml")]
+    #[arg(long, env = "AUXIDE_CONFIG", default_value = "config.toml")]
     config: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -22,6 +23,14 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::doc_markdown)] // These comments are rendered verbatim as CLI help.
 enum Command {
+    /// Run the long-lived Discord bot and private observability server.
+    Run,
+    /// Replace this application's slash commands in configured guilds.
+    RegisterCommands {
+        /// Limit registration to one configured guild.
+        #[arg(long)]
+        guild_id: Option<u64>,
+    },
     /// Parse and validate configuration without loading the Discord token.
     CheckConfig,
     /// Exercise public YouTube metadata resolution without joining Discord.
@@ -69,6 +78,8 @@ async fn main() -> Result<()> {
     init_logging(&config.observability)?;
 
     match cli.command {
+        Command::Run => run(config).await?,
+        Command::RegisterCommands { guild_id } => register_commands(&config, guild_id).await?,
         Command::CheckConfig => {
             tracing::info!(path = %cli.config.display(), "configuration is valid");
         }

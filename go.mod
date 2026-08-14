@@ -1,4 +1,4 @@
-module github.com/joshcazalas/discord-music-bot
+module github.com/joshcazalas/auxide
 
 go 1.24.4
 

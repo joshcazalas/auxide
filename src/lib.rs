@@ -1,4 +1,6 @@
+pub mod audio;
 pub mod config;
+pub mod discord;
 pub mod observability;
 pub mod player;
 pub mod process;

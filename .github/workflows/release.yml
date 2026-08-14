@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+      packages: write
+
+    steps:
+      - name: Check out the complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Reserve runner space for the Nix store
+        uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
+        with:
+          hatchet-protocol: holster
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            build-dir = /nix/build
+
+      - name: Check source, formatting, and workflows
+        run: nix develop --command ./scripts/check.sh
+
+      - name: Scan the worktree and complete Git history for secrets
+        run: nix develop --command ./scripts/secret-scan.sh
+
+      - name: Evaluate and build every declared check
+        run: nix flake check --print-build-logs
+
+      - name: Choose the immutable release identity
+        id: release
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          short_sha="${COMMIT_SHA:0:12}"
+          tag="auxide-$(date -u +%Y.%m.%d)-g${short_sha}"
+          directory=".release/${tag}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "directory=${directory}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build OCI image, SBOMs, and traceability artifacts
+        env:
+          RELEASE_DIRECTORY: ${{ steps.release.outputs.directory }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: >-
+          nix develop .#release --command ./scripts/build-release-artifacts.sh
+          "${RELEASE_TAG}" "${RELEASE_DIRECTORY}"
+
+      - name: Push the immutable OCI image
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          oci_store_path="$(nix build --no-link --print-out-paths .#oci-image)"
+          printf '%s' "${GH_TOKEN}" | nix develop .#release --command \
+            skopeo login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          nix develop .#release --command skopeo copy \
+            "docker-archive:${oci_store_path}" "docker://${IMAGE_NAME}:${RELEASE_TAG}"
+          digest="$(nix develop .#release --command skopeo inspect \
+            --format '{{.Digest}}' "docker://${IMAGE_NAME}:${RELEASE_TAG}")"
+          echo "name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      # Artifact attestations are included with GitHub Free only for public repositories.
+      - name: Attest downloadable release artifacts
+        if: github.event.repository.private == false
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.release.outputs.directory }}/*
+
+      - name: Attest the published OCI image
+        if: github.event.repository.private == false
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIRECTORY: ${{ steps.release.outputs.directory }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: ./scripts/publish-release.sh "${RELEASE_TAG}" "${RELEASE_DIRECTORY}"

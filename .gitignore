@@ -4,3 +4,6 @@
 target/
 config.toml
 *.token
+.release/
+result
+result-*

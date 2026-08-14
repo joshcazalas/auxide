@@ -1,10 +1,6 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use reqwest::{
-    Client as HttpClient,
-    header::{HeaderMap, HeaderName, HeaderValue},
-};
 use secrecy::ExposeSecret;
 use serenity::{
     Client,
@@ -14,13 +10,14 @@ use serenity::{
 };
 use songbird::{
     Event, EventContext, EventHandler as VoiceEventHandler, SerenityInit, Songbird, TrackEvent,
-    input::{File, HlsRequest, HttpRequest, Input},
+    input::{File, Input},
     tracks::PlayMode,
 };
 use tokio::{sync::oneshot, task::JoinHandle, time};
 use url::Url;
 
 use crate::{
+    audio::AudioPipeline,
     config::Config,
     source::{SourceResolver, YouTubeResolver},
 };
@@ -243,7 +240,10 @@ async fn prepare_input(config: &Config, source: VoiceSpikeSource) -> Result<Inpu
             Ok(File::new(path).into())
         }
         VoiceSpikeSource::YouTube(url) => {
-            let resolver = YouTubeResolver::new(config.youtube.clone(), &config.playback);
+            let resolver = Arc::new(YouTubeResolver::new(
+                config.youtube.clone(),
+                &config.playback,
+            ));
             let metadata = resolver.inspect(&url).await?;
             tracing::info!(
                 source_id = %metadata.source_id,
@@ -251,56 +251,9 @@ async fn prepare_input(config: &Config, source: VoiceSpikeSource) -> Result<Inpu
                 title = %metadata.title,
                 "YouTube source inspected"
             );
-            let audio = resolver.resolve(&metadata).await?;
-            let headers = convert_headers(&audio.headers)?;
-            let client = HttpClient::builder()
-                .connect_timeout(Duration::from_secs(10))
-                .read_timeout(Duration::from_secs(30))
-                .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                    let target = attempt.url();
-                    if attempt.previous().len() >= 5 {
-                        attempt.error("media redirect limit exceeded")
-                    } else if target.scheme() != "https"
-                        || !target.username().is_empty()
-                        || target.password().is_some()
-                    {
-                        attempt.error("media redirect was not credential-free HTTPS")
-                    } else {
-                        attempt.follow()
-                    }
-                }))
-                .user_agent("discord-music-bot/0.1")
-                .build()
-                .context("failed to build the media HTTP client")?;
-            match audio.protocol.as_deref() {
-                None | Some("https") => Ok(HttpRequest::new_with_headers(
-                    client,
-                    audio.stream_url.to_string(),
-                    headers,
-                )
-                .into()),
-                Some("m3u8" | "m3u8_native") => {
-                    Ok(
-                        HlsRequest::new_with_headers(client, audio.stream_url.to_string(), headers)
-                            .into(),
-                    )
-                }
-                Some(protocol) => bail!("yt-dlp selected unsupported media protocol {protocol:?}"),
-            }
+            AudioPipeline::new(resolver)?.prepare(&metadata).await
         }
     }
-}
-
-fn convert_headers(headers: &std::collections::BTreeMap<String, String>) -> Result<HeaderMap> {
-    let mut converted = HeaderMap::with_capacity(headers.len());
-    for (name, value) in headers {
-        let name = HeaderName::from_bytes(name.as_bytes())
-            .with_context(|| format!("yt-dlp returned an invalid HTTP header name: {name:?}"))?;
-        let value = HeaderValue::from_str(value)
-            .with_context(|| format!("yt-dlp returned an invalid value for header {name}"))?;
-        converted.insert(name, value);
-    }
-    Ok(converted)
 }
 
 #[cfg(unix)]
@@ -323,27 +276,4 @@ async fn shutdown_signal() -> &'static str {
         .await
         .expect("interrupt handler is available");
     "interrupt"
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-
-    #[test]
-    fn converts_valid_resolver_headers() {
-        let headers = BTreeMap::from([
-            ("User-Agent".to_owned(), "test-agent".to_owned()),
-            ("Referer".to_owned(), "https://www.youtube.com/".to_owned()),
-        ]);
-        let converted = convert_headers(&headers).unwrap();
-        assert_eq!(converted["user-agent"], "test-agent");
-    }
-
-    #[test]
-    fn rejects_header_injection() {
-        let headers = BTreeMap::from([("X-Test".to_owned(), "ok\r\nevil: true".to_owned())]);
-        assert!(convert_headers(&headers).is_err());
-    }
 }

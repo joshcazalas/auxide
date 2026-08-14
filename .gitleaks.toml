@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The Songbird dependency graph contains the published crate name libcrux-secrets"
+condition = "AND"
+regexTarget = "match"
+regexes = ['''libcrux-secrets''']
+paths = ['''Cargo\.lock''']

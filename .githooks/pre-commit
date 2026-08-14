@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+nix develop --command ./scripts/check.sh
+nix develop --command gitleaks protect --staged --no-banner --redact=100

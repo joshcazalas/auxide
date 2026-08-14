@@ -5,7 +5,7 @@ import (
 	"os"
 
 	"github.com/joho/godotenv"
-	"github.com/joshcazalas/discord-music-bot/bot"
+	"github.com/joshcazalas/auxide/bot"
 )
 
 func main() {

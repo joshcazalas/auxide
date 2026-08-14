@@ -79,27 +79,27 @@ impl ObservabilityState {
     fn metrics(&self) -> String {
         format!(
             concat!(
-                "# HELP discord_music_bot_ready Whether the bot can accept commands.\n",
-                "# TYPE discord_music_bot_ready gauge\n",
-                "discord_music_bot_ready {}\n",
-                "# HELP discord_music_bot_discord_connected Whether the Discord gateway is connected.\n",
-                "# TYPE discord_music_bot_discord_connected gauge\n",
-                "discord_music_bot_discord_connected {}\n",
-                "# HELP discord_music_bot_guild_players Active per-guild player actors.\n",
-                "# TYPE discord_music_bot_guild_players gauge\n",
-                "discord_music_bot_guild_players {}\n",
-                "# HELP discord_music_bot_interactions_total Discord interactions received.\n",
-                "# TYPE discord_music_bot_interactions_total counter\n",
-                "discord_music_bot_interactions_total {}\n",
-                "# HELP discord_music_bot_interaction_errors_total Discord interactions that failed.\n",
-                "# TYPE discord_music_bot_interaction_errors_total counter\n",
-                "discord_music_bot_interaction_errors_total {}\n",
-                "# HELP discord_music_bot_source_resolutions_total Source resolutions attempted.\n",
-                "# TYPE discord_music_bot_source_resolutions_total counter\n",
-                "discord_music_bot_source_resolutions_total {}\n",
-                "# HELP discord_music_bot_source_resolution_errors_total Source resolutions that failed.\n",
-                "# TYPE discord_music_bot_source_resolution_errors_total counter\n",
-                "discord_music_bot_source_resolution_errors_total {}\n",
+                "# HELP auxide_ready Whether the bot can accept commands.\n",
+                "# TYPE auxide_ready gauge\n",
+                "auxide_ready {}\n",
+                "# HELP auxide_discord_connected Whether the Discord gateway is connected.\n",
+                "# TYPE auxide_discord_connected gauge\n",
+                "auxide_discord_connected {}\n",
+                "# HELP auxide_guild_players Configured per-guild player actors.\n",
+                "# TYPE auxide_guild_players gauge\n",
+                "auxide_guild_players {}\n",
+                "# HELP auxide_interactions_total Discord interactions received.\n",
+                "# TYPE auxide_interactions_total counter\n",
+                "auxide_interactions_total {}\n",
+                "# HELP auxide_interaction_errors_total Discord interactions that failed.\n",
+                "# TYPE auxide_interaction_errors_total counter\n",
+                "auxide_interaction_errors_total {}\n",
+                "# HELP auxide_source_resolutions_total Source resolutions attempted.\n",
+                "# TYPE auxide_source_resolutions_total counter\n",
+                "auxide_source_resolutions_total {}\n",
+                "# HELP auxide_source_resolution_errors_total Source resolutions that failed.\n",
+                "# TYPE auxide_source_resolution_errors_total counter\n",
+                "auxide_source_resolution_errors_total {}\n",
             ),
             u8::from(self.inner.ready.load(Ordering::Relaxed)),
             u8::from(self.inner.discord_connected.load(Ordering::Relaxed)),
@@ -322,9 +322,9 @@ mod tests {
         let ready = request(server.local_address, "/health/ready").await;
         assert!(ready.starts_with("HTTP/1.1 200"));
         let metrics = request(server.local_address, "/metrics").await;
-        assert!(metrics.contains("discord_music_bot_ready 1"));
-        assert!(metrics.contains("discord_music_bot_interaction_errors_total 1"));
-        assert!(metrics.contains("discord_music_bot_source_resolutions_total 1"));
+        assert!(metrics.contains("auxide_ready 1"));
+        assert!(metrics.contains("auxide_interaction_errors_total 1"));
+        assert!(metrics.contains("auxide_source_resolutions_total 1"));
 
         cancellation.cancel();
         server.wait().await.unwrap();

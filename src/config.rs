@@ -107,9 +107,9 @@ pub struct ObservabilityConfig {
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
-            listen_address: "0.0.0.0:9090".parse().expect("valid default address"),
+            listen_address: "127.0.0.1:9090".parse().expect("valid default address"),
             json_logs: true,
-            log_filter: "discord_music_bot=info,serenity=info,songbird=info".to_owned(),
+            log_filter: "auxide=info,serenity=info,songbird=info".to_owned(),
         }
     }
 }
@@ -178,6 +178,28 @@ impl Config {
                 "all playback bounds and timeouts must be greater than zero".to_owned(),
             ));
         }
+        if self.playback.max_queue_length > 1_000 {
+            return Err(ConfigError::Validation(
+                "playback.max_queue_length must not exceed 1000".to_owned(),
+            ));
+        }
+        if self.playback.actor_mailbox_capacity > 4_096 {
+            return Err(ConfigError::Validation(
+                "playback.actor_mailbox_capacity must not exceed 4096".to_owned(),
+            ));
+        }
+        if self.playback.max_concurrent_resolutions > 16 {
+            return Err(ConfigError::Validation(
+                "playback.max_concurrent_resolutions must not exceed 16".to_owned(),
+            ));
+        }
+        if self.playback.max_track_duration_seconds > 24 * 60 * 60
+            || self.playback.idle_timeout_seconds > 24 * 60 * 60
+        {
+            return Err(ConfigError::Validation(
+                "playback durations and timeouts must not exceed 24 hours".to_owned(),
+            ));
+        }
 
         if self.youtube.enabled {
             if !(1..=10).contains(&self.youtube.search_results) {
@@ -195,6 +217,17 @@ impl Config {
                     "youtube.max_output_bytes must be at least 16384".to_owned(),
                 ));
             }
+            if self.youtube.max_output_bytes > 16 * 1024 * 1024 {
+                return Err(ConfigError::Validation(
+                    "youtube.max_output_bytes must not exceed 16777216".to_owned(),
+                ));
+            }
+        }
+
+        if self.observability.log_filter.trim().is_empty() {
+            return Err(ConfigError::Validation(
+                "observability.log_filter must not be empty".to_owned(),
+            ));
         }
 
         Ok(())
@@ -334,5 +367,21 @@ surprise = true
 guild_id = 123
 "#;
         assert!(toml::from_str::<Config>(source).is_err());
+    }
+
+    #[test]
+    fn rejects_unbounded_resource_configuration() {
+        let source = r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+
+[[discord.guilds]]
+guild_id = 123
+
+[playback]
+max_queue_length = 1001
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        assert!(config.validate().is_err());
     }
 }

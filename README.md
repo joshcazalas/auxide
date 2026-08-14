@@ -1,101 +1,82 @@
-# discord-music-bot
+# Auxide
 
-A self-hosted Discord music bot being rebuilt in Rust for one or more explicitly allowlisted
-guilds. Serenity handles the Discord gateway and interactions; Songbird handles current Discord
-voice, DAVE, and Opus transport. See [ADR 0001](docs/adr/0001-rust-serenity-songbird.md).
+Auxide is a self-hosted Discord music bot for explicitly allowlisted servers. It is being
+rebuilt in Rust with Serenity for Discord interactions and Songbird for current encrypted voice.
+Its first real source is public, unauthenticated YouTube audio resolved just in time with yt-dlp;
+Spotify is deliberately out of scope.
 
-This is an active migration. The old Go prototype remains in the repository as behavioral history
-until live Rust voice and YouTube playback pass in a private test guild. The production slash-command
-bot is not implemented yet.
+The production path now includes:
 
-## Implemented foundation
+- `/play`, `/queue`, `/skip`, `/stop`, `/shuffle`, and `/now-playing` guild commands;
+- ephemeral, single-ack interaction responses and user-bound search-result buttons;
+- one bounded actor/state machine per guild with stale-completion protection;
+- requester, role, guild, command-channel, and voice-channel authorization;
+- bounded yt-dlp/Deno subprocesses and fresh audio URL resolution before playback;
+- Songbird voice joining, playback, reconnect/session handling, and DAVE support;
+- idle disconnect plus coordinated SIGINT/SIGTERM shutdown;
+- structured logs and loopback-only liveness, readiness, and Prometheus endpoints;
+- a pinned `x86_64-linux` Nix build, hardened NixOS service, and unprivileged OCI image.
 
-- Fail-closed guild configuration and token-file loading with bounded secret size.
-- Public YouTube search/inspection through a time-, concurrency-, and output-bounded yt-dlp child.
-- Fresh audio-only YouTube URL resolution immediately before playback; no durable media download.
-- A one-track Serenity/Songbird voice spike for an existing voice channel. It creates no Discord
-  resources and registers no application commands.
-- A bounded actor/state machine per guild with deterministic queue transitions and stale-callback
-  protection.
-- Structured logs and a cancellable, bounded HTTP listener for liveness, readiness, and Prometheus
-  text metrics.
-- A pinned `x86_64-linux` Nix development and package environment containing Rust, libopus, yt-dlp,
-  Deno, and FFmpeg.
+The obsolete Go prototype remains as behavioral history until the Rust voice stack passes in a
+private test guild. See [ADR 0001](docs/adr/0001-rust-serenity-songbird.md) for the decision and
+[the operator guide](docs/operator-guide.md) for setup and deployment.
 
-Spotify is intentionally out of scope. YouTube support is limited to public, unauthenticated,
-non-live videos. It does not use cookies, accounts, DRM workarounds, ad bypass instructions, or
-cached media files. Set `youtube.enabled = false` to disable the adapter.
+## Source policy
+
+YouTube support is limited to public, unauthenticated, non-live videos. Auxide does not accept
+cookies, log into Google accounts, bypass DRM or access controls, or keep complete media files.
+The adapter can be disabled independently with `youtube.enabled = false`. You are responsible for
+using sources and content you are permitted to play; this repository does not claim that technical
+extractability grants permission.
 
 ## Development
 
-Enter the pinned environment and run the local gates:
+Enter the pinned environment and run all local gates:
 
 ```console
 nix develop
-cargo fmt --check
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+./scripts/check.sh
+./scripts/secret-scan.sh
+nix flake check --print-build-logs
 ```
 
-Copy `config.example.toml` to the ignored `config.toml` and replace its example snowflakes. Store
-the Discord token in the configured runtime secret file with permissions limited to the service
-account. Do not put the token in TOML, an environment variable, a command argument, or Git.
+`config.example.toml` documents every MVP setting. A local `config.toml`, tokens, build outputs,
+and release bundles are ignored by Git. These checks do not need a Discord token; only command
+registration, the long-running bot, and the explicit voice spike contact Discord.
 
-These commands do not read the Discord token or contact Discord:
+Useful offline commands:
 
 ```console
 cargo run -- --config config.toml check-config
 cargo run -- --config config.toml youtube-search "artist and track"
-cargo run -- --config config.toml youtube-inspect 'https://www.youtube.com/watch?v=VIDEO_ID'
-```
-
-## Private-guild voice gate
-
-The bot application must already be installed in the configured guild and have View Channel,
-Connect, and Speak permissions in an existing voice channel. The spike accepts explicit IDs so it
-cannot accidentally join another configured guild.
-
-First prove Discord voice with a short local audio file:
-
-```console
-cargo run --release -- --config config.toml voice-spike \
-  --guild-id GUILD_ID --channel-id VOICE_CHANNEL_ID file ./short-test-audio.opus
-```
-
-Then prove the complete YouTube-to-Discord path:
-
-```console
-cargo run --release -- --config config.toml voice-spike \
-  --guild-id GUILD_ID --channel-id VOICE_CHANNEL_ID youtube \
+cargo run -- --config config.toml youtube-inspect \
   'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
 
-Acceptance criteria:
+## Runtime model
 
-1. The gateway reports ready and the bot joins only the requested existing channel.
-2. A listener hears clean, continuous audio. The YouTube case resolves an audio-only stream and
-   does not create a complete media file in the repository.
-3. The bot leaves after natural completion and the process exits successfully.
-4. Repeating the test while sending SIGINT and SIGTERM stops playback, leaves voice, and exits
-   without a lingering process.
-5. An unallowlisted guild ID, invalid channel ID, disabled YouTube adapter, over-duration video,
-   live stream, and resolver timeout all fail closed with no secret in logs.
+The queue is intentionally ephemeral. Each configured guild has an independent serialized actor,
+so concurrent interactions cannot mutate a queue out of order. The actor emits playback directives
+to a supervised voice worker; source resolution lives behind an interface and never owns Discord
+state. There is no database and no durable YouTube cache in the MVP.
 
-Passing this gate is the prerequisite for wiring the player actors to slash commands. It is also
-the point after which the obsolete Go implementation can be removed in a separate review.
+At runtime the NixOS service reads two server-local systemd credentials:
 
-## Planned MVP
+- `/var/lib/auxide/config.toml`, a root-owned non-secret configuration that releases never
+  overwrite; and
+- `/var/lib/auxide/discord-token`, a host-encrypted credential created or rotated only by the
+  `auxide-credential` administrator command.
 
-The next implementation stages are:
+The bot makes outbound Discord, YouTube, and media-CDN connections. It requires no public inbound
+port. Observability defaults to `127.0.0.1:9090`.
 
-1. A Discord adapter that registers guild commands only through an explicit admin command and
-   acknowledges every interaction exactly once.
-2. Authorization against configured guild, command channel, requester, role, and requester voice
-   channel.
-3. Player coordination for `/play`, `/queue`, `/skip`, `/stop`, `/shuffle`, and `/now-playing`,
-   including just-in-time source resolution and idle disconnect.
-4. Full graceful shutdown and health-state integration.
-5. An unprivileged OCI image, NixOS service module, SBOM, provenance, and release attestations.
+## Current validation boundary
 
-Queue state is ephemeral in the MVP. Complete media is not cached; only canonical source identity
-and public metadata live in memory.
+Unit tests and Nix/OCI builds can be completed without the application token. The remaining
+environment-dependent acceptance gate is a private-guild test proving real Discord voice and real
+YouTube playback. That test should happen before deleting the Go implementation or treating the
+first release as production-ready. The exact procedure is in the operator guide.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
