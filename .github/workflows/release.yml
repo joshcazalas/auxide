@@ -88,12 +88,29 @@ jobs:
           IMAGE_NAME: ghcr.io/${{ github.repository }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
+          # The attestation step below resolves registry credentials the Docker
+          # way, reading only ${HOME}/.docker/config.json. Skopeo would
+          # otherwise authenticate into ${XDG_RUNTIME_DIR}/containers/auth.json,
+          # which that step cannot see. Both formats are identical, so point
+          # every registry call at the one file both tools agree on.
+          registry_auth="${HOME}/.docker/config.json"
+          mkdir -p "$(dirname "${registry_auth}")"
+
           oci_store_path="$(nix build --no-link --print-out-paths .#oci-image)"
           printf '%s' "${GH_TOKEN}" | nix develop .#release --command \
-            skopeo login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+            skopeo login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin \
+            --authfile "${registry_auth}"
+
+          # Fail here in seconds rather than after the image upload if the
+          # credential ever lands somewhere the attestation step cannot read.
+          nix develop .#release --command \
+            jq -e '.auths | has("ghcr.io")' "${registry_auth}" > /dev/null
+
           nix develop .#release --command skopeo copy \
+            --authfile "${registry_auth}" \
             "docker-archive:${oci_store_path}" "docker://${IMAGE_NAME}:${RELEASE_TAG}"
           digest="$(nix develop .#release --command skopeo inspect \
+            --authfile "${registry_auth}" \
             --format '{{.Digest}}' "docker://${IMAGE_NAME}:${RELEASE_TAG}")"
           echo "name=${IMAGE_NAME}" >> "${GITHUB_OUTPUT}"
           echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
