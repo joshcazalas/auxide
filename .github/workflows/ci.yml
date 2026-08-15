@@ -12,21 +12,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate:
-    name: Validate
+  lint:
+    name: Lint and scan
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    env:
-      CARGO_INCREMENTAL: "0"
+    timeout-minutes: 20
     permissions:
       contents: read
-      id-token: write
 
     steps:
+      # Gitleaks walks every reachable commit, so this job needs the history
+      # the other two do not.
       - name: Check out the complete history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+
+      - name: Check formatting, Nix, shell scripts, and workflows
+        run: nix develop --command ./scripts/check.sh lint
+
+      - name: Scan the worktree and complete Git history for secrets
+        run: nix develop --command ./scripts/secret-scan.sh
+
+  rust:
+    name: Test and lint Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
           persist-credentials: false
 
       - name: Reserve runner space for the Nix store
@@ -38,21 +61,67 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+
+      - name: Run the test suite and Clippy
+        run: |
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/auxide-cargo-target"
+          nix develop --command ./scripts/check.sh rust
+
+  nix:
+    name: Build every declared check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reserve runner space for the Nix store
+        uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
+        with:
+          hatchet-protocol: holster
+          # This job builds the release binary and a layered OCI image, so keep
+          # the same scratch reservation the combined job used.
+          mnt-safe-haven: "12288"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
         with:
           extra_nix_config: |
             build-dir = /nix/build
 
-      - name: Check source, formatting, and workflows
-        run: |
-          cargo_target_dir="${TMPDIR}/auxide-cargo-target"
-          echo "CARGO_TARGET_DIR=${cargo_target_dir}" >> "${GITHUB_ENV}"
-          CARGO_TARGET_DIR="${cargo_target_dir}" nix develop --command ./scripts/check.sh
-
-      - name: Reclaim Cargo build space
-        run: nix develop --command cargo clean --target-dir "${CARGO_TARGET_DIR}"
-
-      - name: Scan the worktree and complete Git history for secrets
-        run: nix develop --command ./scripts/secret-scan.sh
-
       - name: Evaluate and build every declared check
         run: nix flake check --print-build-logs
+
+  validate:
+    # Branch protection requires a check named "Validate". Keeping that name on
+    # a job that only aggregates the three real ones lets them run in parallel
+    # without repointing the protection rule, and keeps that rule correct if the
+    # set of jobs changes again.
+    name: Validate
+    needs:
+      - lint
+      - rust
+      - nix
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+
+    steps:
+      - name: Require every job to have succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          read -ra results <<< "${RESULTS}"
+          for result in "${results[@]}"; do
+            if [[ "${result}" != success ]]; then
+              echo "A required job did not succeed: ${RESULTS}" >&2
+              exit 1
+            fi
+          done
