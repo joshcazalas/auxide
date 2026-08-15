@@ -81,6 +81,17 @@ pub async fn register_commands(config: &Config, selected_guild: Option<u64>) -> 
             .collect()
     };
 
+    // Every command route is built from the application id, and `Http::new`
+    // leaves it unset. A normal run receives it on the gateway's Ready event,
+    // but registration deliberately never opens a gateway, so resolve the
+    // identity behind this token directly. Doing it after the guild check keeps
+    // a configuration mistake from costing an API call.
+    let application = http
+        .get_current_application_info()
+        .await
+        .context("failed to identify the Discord application behind this token")?;
+    http.set_application_id(application.id);
+
     for guild_id in guilds {
         let registered = GuildId::new(guild_id)
             .set_commands(&http, command_definitions())
