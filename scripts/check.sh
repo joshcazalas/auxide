@@ -5,29 +5,68 @@ set -Eeuo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
-echo "==> Checking Rust formatting"
-cargo fmt --check
+usage() {
+  cat >&2 <<'EOF'
+usage: check.sh [all|lint|rust]
 
-echo "==> Running Rust tests"
-cargo test --all-targets
+  all   every check (default)
+  lint  Rust and Nix formatting, Nix, shell, and workflow linters
+  rust  Rust tests and Clippy
 
-echo "==> Running strict Rust lints"
-cargo clippy --all-targets -- -D warnings
+CI runs lint and rust as separate jobs so a four-second linter failure does not
+wait behind a four-minute Rust build. Run it with no argument locally.
+EOF
+}
 
-echo "==> Checking Nix formatting"
-nix fmt -- --ci .
+check_lint() {
+  echo "==> Checking Rust formatting"
+  cargo fmt --check
 
-echo "==> Checking Nix for dead code"
-deadnix --fail .
+  echo "==> Checking Nix formatting"
+  nix fmt -- --ci .
 
-echo "==> Linting Nix"
-statix check .
+  echo "==> Checking Nix for dead code"
+  deadnix --fail .
 
-echo "==> Linting shell scripts"
-mapfile -d '' shell_files < <(
-  find scripts nix .githooks -type f \( -name '*.sh' -o -perm -u+x \) -print0
-)
-shellcheck "${shell_files[@]}"
+  echo "==> Linting Nix"
+  statix check .
 
-echo "==> Linting GitHub Actions workflows"
-actionlint
+  echo "==> Linting shell scripts"
+  mapfile -d '' shell_files < <(
+    find scripts nix .githooks -type f \( -name '*.sh' -o -perm -u+x \) -print0
+  )
+  shellcheck "${shell_files[@]}"
+
+  echo "==> Linting GitHub Actions workflows"
+  actionlint
+}
+
+check_rust() {
+  echo "==> Running Rust tests"
+  cargo test --all-targets
+
+  echo "==> Running strict Rust lints"
+  cargo clippy --all-targets -- -D warnings
+}
+
+if (($# > 1)); then
+  usage
+  exit 2
+fi
+
+case "${1:-all}" in
+all)
+  check_lint
+  check_rust
+  ;;
+lint)
+  check_lint
+  ;;
+rust)
+  check_rust
+  ;;
+*)
+  usage
+  exit 2
+  ;;
+esac
