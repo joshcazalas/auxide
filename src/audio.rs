@@ -59,6 +59,13 @@ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// stale URL rather than as an unplayable track.
 const MAX_URL_REFRESHES: u32 = 3;
 
+/// Bytes a stream must deliver before a later failure stops counting against
+/// [`MAX_URL_REFRESHES`].
+///
+/// Roughly half a minute of audio, which is enough to distinguish a URL that
+/// never worked from one that carried the track for a while.
+const PROGRESS_RESETS_REFRESHES: u64 = 512 * 1024;
+
 /// Converts stable source metadata into a fresh, streaming Songbird input.
 ///
 /// The resolver is called immediately before playback so temporary media URLs are never queued or
@@ -87,7 +94,11 @@ impl AudioPipeline {
     pub fn new(resolver: Arc<dyn SourceResolver>, output_volume: f32) -> Result<Self> {
         let http = HttpClient::builder()
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
+            // Deliberately no read timeout. Songbird consumes this body at
+            // playback rate, and reqwest resets that timer only when a frame
+            // arrives, so a gap caused by our own pacing counts against it and
+            // kills a healthy chunk roughly every thirty seconds of audio. The
+            // wait for headers is bounded below instead.
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 let target = attempt.url();
                 if attempt.previous().len() >= 5 {
@@ -179,13 +190,12 @@ impl ChunkedHttpRequest {
     /// than from the caller, so it is whatever the origin actually serves. A
     /// server that ignores the range header and answers 200 is handled by
     /// taking its single response as the complete body.
-    fn body(&self, start: u64) -> impl Stream<Item = IoResult<Bytes>> + Send + Sync + use<> {
+    fn body(
+        &self,
+        start: u64,
+        delivered: Arc<AtomicU64>,
+    ) -> impl Stream<Item = IoResult<Bytes>> + Send + Sync + use<> {
         let request = self.clone();
-        // Where the next request resumes is decided by the bytes that actually
-        // arrived, never by the length a response advertised. A body cut short
-        // mid-chunk would otherwise leave a gap the container never recovers
-        // from, which reads as audio that simply stops.
-        let delivered = Arc::new(AtomicU64::new(0));
 
         stream::try_unfold(Some((None::<u64>, None::<u64>)), move |state| {
             let request = request.clone();
@@ -274,7 +284,10 @@ impl ChunkedHttpRequest {
                         counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
                         chunk
                     })
-                    .map_err(IoError::other);
+                    .map_err(move |error| {
+                        tracing::warn!(%error, position, "media body read failed");
+                        IoError::other(error)
+                    });
                 Ok(Some((body, next)))
             }
         })
@@ -288,9 +301,15 @@ impl ChunkedHttpRequest {
     /// refuses every real chunk, so it reported success and left the failure to
     /// surface later as a container that would not parse.
     fn open(&self, offset: u64) -> ChunkedHttpStream {
+        // Where the next request resumes is decided by the bytes that actually
+        // arrived, never by the length a response advertised. A body cut short
+        // mid-chunk would otherwise leave a gap the container never recovers
+        // from, which reads as audio that simply stops.
+        let delivered = Arc::new(AtomicU64::new(0));
         ChunkedHttpStream {
-            stream: Box::pin(StreamReader::new(self.body(offset))),
+            stream: Box::pin(StreamReader::new(self.body(offset, Arc::clone(&delivered)))),
             request: self.clone(),
+            delivered,
             refreshes: 0,
         }
     }
@@ -309,6 +328,8 @@ fn content_range_total(headers: &HeaderMap) -> Option<u64> {
 struct ChunkedHttpStream {
     stream: Pin<Box<dyn AsyncRead + Send + Sync>>,
     request: ChunkedHttpRequest,
+    /// Bytes this stream has delivered since it was opened.
+    delivered: Arc<AtomicU64>,
     refreshes: u32,
 }
 
@@ -353,14 +374,20 @@ impl AsyncMediaSource for ChunkedHttpStream {
         &mut self,
         offset: u64,
     ) -> Result<Box<dyn AsyncMediaSource>, AudioStreamError> {
-        if self.refreshes >= MAX_URL_REFRESHES {
+        // A stream that played for a while before faltering is not a bad URL,
+        // so it does not spend the budget meant for one. Without this a long
+        // track exhausts its refreshes on unrelated hiccups and stops early.
+        let delivered = self.delivered.load(Ordering::Relaxed);
+        let progressed = delivered >= PROGRESS_RESETS_REFRESHES;
+        if !progressed && self.refreshes >= MAX_URL_REFRESHES {
             tracing::warn!(
                 offset,
+                delivered,
                 "giving up after refreshing the media URL repeatedly"
             );
             return Err(AudioStreamError::Unsupported);
         }
-        let refreshes = self.refreshes + 1;
+        let refreshes = if progressed { 1 } else { self.refreshes + 1 };
         tracing::warn!(offset, refreshes, "resolving a fresh media URL mid-track");
 
         let audio = self
