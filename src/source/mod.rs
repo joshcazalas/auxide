@@ -25,6 +25,15 @@ pub struct ResolvedAudio {
     pub stream_url: Url,
     pub headers: BTreeMap<String, String>,
     pub protocol: Option<String>,
+
+    /// Total size of the media, when the source reports one.
+    ///
+    /// `YouTube` answers a request carrying no range, or an open-ended
+    /// `bytes=N-`, with 403 Forbidden; only a bounded `bytes=N-M` is served.
+    /// Songbird can only build a bounded range if it knows where the media
+    /// ends, so this is what makes playback possible rather than a
+    /// nicety for seeking.
+    pub content_length: Option<u64>,
 }
 
 #[async_trait]

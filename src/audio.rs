@@ -66,12 +66,19 @@ impl AudioPipeline {
         let audio = self.resolver.resolve(track).await?;
         let headers = convert_headers(&audio.headers)?;
         match audio.protocol.as_deref() {
-            None | Some("https") => Ok(HttpRequest::new_with_headers(
-                self.http.clone(),
-                audio.stream_url.to_string(),
-                headers,
-            )
-            .into()),
+            None | Some("https") => {
+                let mut request = HttpRequest::new_with_headers(
+                    self.http.clone(),
+                    audio.stream_url.to_string(),
+                    headers,
+                );
+                // Without this Songbird sends either no range or an open-ended
+                // `bytes=N-`, and YouTube answers both with 403 Forbidden. Only
+                // a bounded `bytes=N-M` is served, and Songbird can only build
+                // one if it knows where the media ends.
+                request.content_length = audio.content_length;
+                Ok(request.into())
+            }
             Some("m3u8" | "m3u8_native") => Ok(HlsRequest::new_with_headers(
                 self.http.clone(),
                 audio.stream_url.to_string(),
