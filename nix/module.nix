@@ -84,7 +84,14 @@ in
       createHome = false;
     };
 
-    environment.systemPackages = [ self.packages.${system}.credential-helper ];
+    # The administrative subcommands in docs/operator-guide.md are run by hand
+    # against the same binary the service uses, so it has to be reachable by
+    # name. Only the unit's ExecStart resolved it before, leaving `auxide` off
+    # the operator's PATH entirely.
+    environment.systemPackages = [
+      cfg.package
+      self.packages.${system}.credential-helper
+    ];
 
     systemd.tmpfiles.rules = [
       "d /var/lib/auxide 0700 root root -"

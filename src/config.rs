@@ -28,7 +28,45 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct DiscordConfig {
     pub token_file: PathBuf,
+
+    /// Serve every server this application is installed in.
+    ///
+    /// Installation is then the authorization boundary: with **Public Bot**
+    /// disabled in the Discord Developer Portal, only the application's owner
+    /// can add it anywhere, so the question of which servers are permitted is
+    /// already answered before Auxide connects. That pairing is enforced rather
+    /// than assumed — Auxide refuses to start while this is enabled and the
+    /// application is still publicly installable.
+    ///
+    /// Set it to `false` to return to an explicit `guilds` allowlist.
+    #[serde(default = "default_allow_all_guilds")]
+    pub allow_all_guilds: bool,
+
+    /// Per-server overrides, and the complete allowlist when
+    /// [`DiscordConfig::allow_all_guilds`] is `false`.
+    ///
+    /// A server listed here is narrowed by its entry whether or not every
+    /// server is otherwise permitted, so restricting one server does not mean
+    /// enumerating the rest.
+    #[serde(default)]
     pub guilds: Vec<GuildConfig>,
+
+    /// Upper bound on servers held in memory at once.
+    ///
+    /// Each one owns a player actor, a playback worker, and a queue, so this
+    /// bounds the process instead of leaving it to the systemd memory limit.
+    /// Reaching it refuses the request that would have exceeded it and leaves
+    /// every existing server working.
+    #[serde(default = "default_max_guilds")]
+    pub max_guilds: usize,
+}
+
+fn default_allow_all_guilds() -> bool {
+    true
+}
+
+fn default_max_guilds() -> usize {
+    50
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -138,9 +176,16 @@ impl Config {
     /// Returns a validation error for duplicate or invalid Discord IDs and for zero or
     /// out-of-range resource limits.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.discord.guilds.is_empty() {
+        if !self.discord.allow_all_guilds && self.discord.guilds.is_empty() {
             return Err(ConfigError::Validation(
-                "discord.guilds must contain at least one allowlisted guild".to_owned(),
+                "discord.guilds must list at least one server when discord.allow_all_guilds is false, \
+                 or Auxide would refuse every request"
+                    .to_owned(),
+            ));
+        }
+        if self.discord.max_guilds == 0 || self.discord.max_guilds > 1_000 {
+            return Err(ConfigError::Validation(
+                "discord.max_guilds must be between 1 and 1000".to_owned(),
             ));
         }
 
@@ -248,6 +293,16 @@ impl Config {
             .guilds
             .iter()
             .find(|guild| guild.guild_id == guild_id)
+    }
+
+    /// Reports whether Auxide answers requests from a server at all.
+    ///
+    /// A server with its own entry is always permitted. Otherwise this is the
+    /// [`DiscordConfig::allow_all_guilds`] decision, which is what makes an
+    /// unlisted server usable without editing configuration.
+    #[must_use]
+    pub fn allows_guild(&self, guild_id: u64) -> bool {
+        self.discord.allow_all_guilds || self.guild(guild_id).is_some()
     }
 }
 
@@ -383,5 +438,81 @@ max_queue_length = 1001
 "#;
         let config: Config = toml::from_str(source).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn serves_every_guild_without_a_configured_list() {
+        let source = r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        config.validate().unwrap();
+        assert!(config.discord.allow_all_guilds);
+        assert!(config.discord.guilds.is_empty());
+        assert!(config.allows_guild(730_675_093_197_422_623));
+        assert!(config.guild(730_675_093_197_422_623).is_none());
+    }
+
+    #[test]
+    fn an_explicit_allowlist_still_refuses_unlisted_guilds() {
+        let source = r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+allow_all_guilds = false
+
+[[discord.guilds]]
+guild_id = 123
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        config.validate().unwrap();
+        assert!(config.allows_guild(123));
+        assert!(!config.allows_guild(456));
+    }
+
+    #[test]
+    fn an_empty_allowlist_that_permits_nothing_is_a_configuration_error() {
+        let source = r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+allow_all_guilds = false
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn a_listed_guild_keeps_its_restrictions_while_serving_every_guild() {
+        let source = r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+
+[[discord.guilds]]
+guild_id = 123
+authorized_user_ids = [7]
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        config.validate().unwrap();
+        assert!(config.allows_guild(456));
+        let guild = config.guild(123).unwrap();
+        assert!(guild.authorized_user_ids.contains(&7));
+    }
+
+    #[test]
+    fn rejects_an_unusable_guild_ceiling() {
+        for ceiling in ["0", "1001"] {
+            let source = format!(
+                r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+max_guilds = {ceiling}
+"#
+            );
+            let config: Config = toml::from_str(&source).unwrap();
+            assert!(
+                config.validate().is_err(),
+                "accepted max_guilds = {ceiling}"
+            );
+        }
     }
 }

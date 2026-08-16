@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     fmt::Write as _,
     sync::Arc,
     time::{Duration, Instant},
@@ -19,8 +19,8 @@ use serenity::{
     gateway::{ConnectionStage, ShardStageUpdateEvent},
     http::Http,
     model::application::{
-        CommandDataOptionValue, CommandInteraction, CommandOptionType, ComponentInteraction,
-        Interaction,
+        Command, CommandDataOptionValue, CommandInteraction, CommandOptionType,
+        ComponentInteraction, Interaction,
     },
     model::gateway::Ready,
     model::id::{ChannelId, GuildId, UserId},
@@ -53,54 +53,82 @@ const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
 const MAX_PENDING_SEARCHES: usize = 128;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Registers the complete Auxide command set in configured guilds.
+/// Registers the complete Auxide command set for this application.
 ///
-/// Registration is deliberately separate from normal startup. It overwrites only this
-/// application's commands in each selected guild and never creates channels or roles.
+/// Registration is deliberately separate from normal startup. It replaces only this
+/// application's own commands and never creates channels or roles.
+///
+/// Commands are registered globally, so a server added later needs no further
+/// action here. Discord can take up to an hour to propagate a *change* to the
+/// global set, though a newly installed server receives the current set at once.
+///
+/// `clear_guild` additionally removes leftover per-server commands from one
+/// server, for a server no longer named in configuration.
 ///
 /// # Errors
 ///
-/// Returns an error when the token cannot be loaded, a requested guild is not allowlisted, or
-/// Discord rejects a command definition.
-pub async fn register_commands(config: &Config, selected_guild: Option<u64>) -> Result<()> {
+/// Returns an error when the token cannot be loaded, the application is publicly
+/// installable while every server is served, or Discord rejects a command
+/// definition.
+pub async fn register_commands(config: &Config, clear_guild: Option<u64>) -> Result<()> {
     let token = config
         .load_discord_token()
         .context("failed to load the Discord token")?;
     let http = Http::new(token.expose_secret());
-    let guilds = if let Some(guild_id) = selected_guild {
-        if config.guild(guild_id).is_none() {
-            bail!("guild {guild_id} is not in the configuration allowlist");
-        }
-        vec![guild_id]
-    } else {
-        config
-            .discord
-            .guilds
-            .iter()
-            .map(|guild| guild.guild_id)
-            .collect()
-    };
 
     // Every command route is built from the application id, and `Http::new`
     // leaves it unset. A normal run receives it on the gateway's Ready event,
     // but registration deliberately never opens a gateway, so resolve the
-    // identity behind this token directly. Doing it after the guild check keeps
-    // a configuration mistake from costing an API call.
+    // identity behind this token directly.
     let application = http
         .get_current_application_info()
         .await
         .context("failed to identify the Discord application behind this token")?;
     http.set_application_id(application.id);
+    ensure_installation_is_a_boundary(config, application.bot_public)?;
 
-    for guild_id in guilds {
-        let registered = GuildId::new(guild_id)
-            .set_commands(&http, command_definitions())
+    // Registering globally is what lets a newly installed server work without
+    // anyone editing configuration: Discord offers an application's global
+    // commands everywhere it is installed, including servers added later.
+    let registered = Command::set_global_commands(&http, command_definitions())
+        .await
+        .context("failed to register global commands")?;
+    tracing::info!(commands = registered.len(), "registered global commands");
+
+    // Earlier versions registered per server. Those survive independently of
+    // the global set and would show up beside it as duplicates, so clear the
+    // ones we still know to look for.
+    let stale: BTreeSet<u64> = config
+        .discord
+        .guilds
+        .iter()
+        .map(|guild| guild.guild_id)
+        .chain(clear_guild)
+        .collect();
+    for guild_id in stale {
+        GuildId::new(guild_id)
+            .set_commands(&http, Vec::new())
             .await
-            .with_context(|| format!("failed to register commands in guild {guild_id}"))?;
-        tracing::info!(
-            guild_id,
-            commands = registered.len(),
-            "registered guild commands"
+            .with_context(|| format!("failed to clear guild commands in {guild_id}"))?;
+        tracing::info!(guild_id, "cleared guild-scoped commands");
+    }
+    Ok(())
+}
+
+/// Refuses the combination that would let anyone use this bot.
+///
+/// Serving every installed server is safe precisely because only the owner can
+/// install it. If the application is also publicly installable, that reasoning
+/// collapses: anyone could add it and drive it. Rather than trust the two
+/// settings to be kept in agreement by hand, treat disagreement as a
+/// configuration error.
+fn ensure_installation_is_a_boundary(config: &Config, bot_public: bool) -> Result<()> {
+    if config.discord.allow_all_guilds && bot_public {
+        bail!(
+            "this application is publicly installable while discord.allow_all_guilds serves every \
+             server, so anyone could add Auxide and control it. Disable Public Bot on the Bot page \
+             of the Discord Developer Portal, or set discord.allow_all_guilds = false and list the \
+             permitted servers in discord.guilds."
         );
     }
     Ok(())
@@ -116,6 +144,22 @@ pub async fn run(config: Config) -> Result<()> {
     let token = config
         .load_discord_token()
         .context("failed to load the Discord token")?;
+
+    // Check before opening a listener or a gateway, so an application that
+    // anyone could add never reaches the point of accepting commands.
+    let application = Http::new(token.expose_secret())
+        .get_current_application_info()
+        .await
+        .context("failed to identify the Discord application behind this token")?;
+    ensure_installation_is_a_boundary(&config, application.bot_public)?;
+    tracing::info!(
+        application = %application.name,
+        allow_all_guilds = config.discord.allow_all_guilds,
+        configured_guilds = config.discord.guilds.len(),
+        max_guilds = config.discord.max_guilds,
+        "resolved the Discord application"
+    );
+
     let cancellation = CancellationToken::new();
     let observability = ObservabilityState::default();
     let observability_server = start_observability(
@@ -242,7 +286,14 @@ impl EventHandler for DiscordHandler {
 struct BotRuntime {
     config: Arc<Config>,
     resolver: Arc<YouTubeResolver>,
-    sessions: HashMap<u64, GuildSession>,
+    pipeline: AudioPipeline,
+    /// Guild players, created when a server first uses Auxide.
+    ///
+    /// These used to be built up front from the configured guild list. Without
+    /// such a list there is nothing to enumerate at startup, and creating an
+    /// actor, a worker, and a queue for every server the bot merely sits in
+    /// would pay for servers that never issue a command.
+    sessions: Mutex<HashMap<u64, GuildSession>>,
     pending_searches: Mutex<HashMap<Uuid, PendingSearch>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     voice: Arc<Songbird>,
@@ -293,41 +344,65 @@ impl BotRuntime {
         ));
         let source: Arc<dyn SourceResolver> = resolver.clone();
         let pipeline = AudioPipeline::new(source)?;
-        let mut sessions = HashMap::with_capacity(config.discord.guilds.len());
-        let mut tasks = Vec::with_capacity(config.discord.guilds.len() * 2);
-
-        for guild in &config.discord.guilds {
-            let (player, transitions, actor_task) = spawn_guild_player(
-                guild.guild_id,
-                config.playback.max_queue_length,
-                config.playback.actor_mailbox_capacity,
-                random(),
-                Duration::from_secs(config.playback.idle_timeout_seconds),
-            );
-            tasks.push(actor_task);
-            tasks.push(tokio::spawn(playback_worker(
-                guild.guild_id,
-                player.clone(),
-                transitions,
-                Arc::clone(&voice),
-                pipeline.clone(),
-                observability.clone(),
-                cancellation.child_token(),
-            )));
-            sessions.insert(guild.guild_id, GuildSession { player });
-        }
-        observability.set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
+        observability.set_guild_players(0);
 
         Ok(Self {
             config,
             resolver,
-            sessions,
+            pipeline,
+            sessions: Mutex::new(HashMap::new()),
             pending_searches: Mutex::new(HashMap::new()),
-            tasks: Mutex::new(tasks),
+            tasks: Mutex::new(Vec::new()),
             voice,
             observability,
             cancellation,
         })
+    }
+
+    /// Returns this server's player, creating it on first use.
+    ///
+    /// Refusing past [`DiscordConfig::max_guilds`] keeps an unbounded number of
+    /// servers from becoming an unbounded number of actors and queues. It is a
+    /// per-request refusal, so servers already being served keep working.
+    ///
+    /// [`DiscordConfig::max_guilds`]: crate::config::DiscordConfig::max_guilds
+    async fn session(&self, guild_id: u64) -> Result<GuildSession> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get(&guild_id) {
+            return Ok(session.clone());
+        }
+        if sessions.len() >= self.config.discord.max_guilds {
+            bail!("Auxide is already serving as many servers as it is configured to hold");
+        }
+
+        let (player, transitions, actor_task) = spawn_guild_player(
+            guild_id,
+            self.config.playback.max_queue_length,
+            self.config.playback.actor_mailbox_capacity,
+            random(),
+            Duration::from_secs(self.config.playback.idle_timeout_seconds),
+        );
+        let worker_task = tokio::spawn(playback_worker(
+            guild_id,
+            player.clone(),
+            transitions,
+            Arc::clone(&self.voice),
+            self.pipeline.clone(),
+            self.observability.clone(),
+            self.cancellation.child_token(),
+        ));
+        {
+            let mut tasks = self.tasks.lock().await;
+            tasks.push(actor_task);
+            tasks.push(worker_task);
+        }
+
+        let session = GuildSession { player };
+        sessions.insert(guild_id, session.clone());
+        self.observability
+            .set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
+        tracing::info!(guild_id, servers = sessions.len(), "started a guild player");
+        Ok(session)
     }
 
     async fn handle_interaction(&self, ctx: &Context, interaction: Interaction) {
@@ -409,7 +484,7 @@ impl BotRuntime {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<InteractionReply> {
-        let authorization = self.authorize_command(ctx, command)?;
+        let authorization = self.authorize_command(ctx, command).await?;
         match command.data.name.as_str() {
             "play" => self.play(ctx, command, authorization).await,
             "queue" => self.queue(authorization).await,
@@ -421,7 +496,7 @@ impl BotRuntime {
         }
     }
 
-    fn authorize_command(
+    async fn authorize_command(
         &self,
         ctx: &Context,
         command: &CommandInteraction,
@@ -444,9 +519,10 @@ impl BotRuntime {
                 .map(|role| role.get())
                 .collect::<Vec<_>>(),
         )
+        .await
     }
 
-    fn authorize_component(
+    async fn authorize_component(
         &self,
         ctx: &Context,
         component: &ComponentInteraction,
@@ -469,9 +545,10 @@ impl BotRuntime {
                 .map(|role| role.get())
                 .collect::<Vec<_>>(),
         )
+        .await
     }
 
-    fn authorize(
+    async fn authorize(
         &self,
         ctx: &Context,
         guild_id: u64,
@@ -479,23 +556,23 @@ impl BotRuntime {
         user_id: UserId,
         role_ids: &[u64],
     ) -> Result<Authorization> {
-        let guild = self
-            .config
-            .guild(guild_id)
-            .with_context(|| format!("server {guild_id} is not allowlisted"))?;
-        if !guild.command_channel_ids.is_empty()
-            && !guild.command_channel_ids.contains(&response_channel_id)
-        {
-            bail!("commands are not enabled in this channel");
+        if !self.config.allows_guild(guild_id) {
+            bail!("server {guild_id} is not allowlisted");
         }
-        if !identity_is_authorized(guild, user_id.get(), role_ids) {
-            bail!("you are not authorized to control Auxide");
+        // A server with no entry of its own is unrestricted within itself, the
+        // same treatment an entry with empty lists already receives. Narrowing
+        // one server therefore stays possible without enumerating the others.
+        if let Some(guild) = self.config.guild(guild_id) {
+            if !guild.command_channel_ids.is_empty()
+                && !guild.command_channel_ids.contains(&response_channel_id)
+            {
+                bail!("commands are not enabled in this channel");
+            }
+            if !identity_is_authorized(guild, user_id.get(), role_ids) {
+                bail!("you are not authorized to control Auxide");
+            }
         }
-        let session = self
-            .sessions
-            .get(&guild_id)
-            .context("the server player is unavailable")?
-            .clone();
+        let session = self.session(guild_id).await?;
         let voice_channel_id = requester_voice_channel(ctx, guild_id, user_id);
         Ok(Authorization {
             guild_id,
@@ -719,7 +796,7 @@ impl BotRuntime {
         ctx: &Context,
         component: &ComponentInteraction,
     ) -> Result<InteractionReply> {
-        let authorization = self.authorize_component(ctx, component)?;
+        let authorization = self.authorize_component(ctx, component).await?;
         let (search_id, index) = parse_selection_id(&component.data.custom_id)?;
         let mut searches = self.pending_searches.lock().await;
         prune_searches(&mut searches);
@@ -747,12 +824,18 @@ impl BotRuntime {
     }
 
     async fn shutdown(&self) {
-        for session in self.sessions.values() {
+        // Take the map rather than holding its lock, so shutting a player down
+        // cannot deadlock against a request creating one.
+        let sessions = {
+            let mut sessions = self.sessions.lock().await;
+            std::mem::take(&mut *sessions)
+        };
+        for session in sessions.values() {
             if let Err(error) = session.player.shutdown().await {
                 tracing::debug!(%error, guild_id = session.player.guild_id(), "guild actor already stopped");
             }
         }
-        for guild_id in self.sessions.keys().copied() {
+        for guild_id in sessions.keys().copied() {
             if let Err(error) = self.voice.remove(GuildId::new(guild_id)).await {
                 tracing::debug!(%error, guild_id, "voice session was already absent during shutdown");
             }

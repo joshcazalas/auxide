@@ -109,6 +109,28 @@ mod tests {
         assert_eq!(converted["user-agent"], "test-agent");
     }
 
+    /// Guards the dependency wiring that makes playback possible at all.
+    ///
+    /// Songbird registers only DCA and raw PCM itself and takes Symphonia with
+    /// `default-features = false`, so without the direct Symphonia dependency
+    /// in `Cargo.toml` these registries are empty, every track fails the
+    /// instant it is probed, and nothing in the type system notices.
+    #[test]
+    fn the_codecs_youtube_audio_needs_are_registered() {
+        use songbird::input::codecs::get_codec_registry;
+        use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_OPUS};
+
+        let registry = get_codec_registry();
+        assert!(
+            registry.get_codec(CODEC_TYPE_OPUS).is_some(),
+            "Opus is what WebM and Ogg streams carry"
+        );
+        assert!(
+            registry.get_codec(CODEC_TYPE_AAC).is_some(),
+            "AAC is what YouTube's MP4 audio carries"
+        );
+    }
+
     #[test]
     fn rejects_header_injection() {
         let headers = BTreeMap::from([("X-Test".to_owned(), "ok\r\nevil: true".to_owned())]);

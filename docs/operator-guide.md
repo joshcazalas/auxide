@@ -13,15 +13,22 @@ then:
    token again; resetting is the normal way to obtain a replacement.
 2. Leave privileged intents disabled. Auxide uses only the `Guilds` and `Guild Voice States`
    gateway intents.
-3. On **Installation**, enable **Guild Install**. Include the `applications.commands` and `bot`
+3. On **Bot**, turn **Public Bot** off. Auxide serves every server it is installed in, so
+   installation is the authorization boundary and this checkbox is the control that holds it:
+   with it on, anyone could add Auxide and drive it. Auxide refuses to start in that combination
+   rather than let the two settings drift apart, so this is a requirement and not advice.
+4. On **Installation**, enable **Guild Install**. Include the `applications.commands` and `bot`
    scopes and grant only **View Channels**, **Connect**, and **Speak** in the intended voice channel.
-4. Use the generated installation link while logged into Discord and select the private test
+5. Use the generated installation link while logged into Discord and select the private test
    server. Do not create a public installation or paste the token into chat, Git, TOML, shell
    history, or the Nix store.
 
-Record the server, command-channel, voice-channel, authorized-user, and optional role IDs by
-enabling Discord Developer Mode and choosing **Copy ID**. These snowflakes are identifiers, not
-credentials.
+Adding Auxide to another server later needs nothing beyond this installation link. No identifier
+has to be recorded and no file has to be edited.
+
+Copy IDs only if you intend to *restrict* a server, or for the voice-channel argument the
+acceptance test takes. Enable Discord Developer Mode and use **Copy ID**; these snowflakes are
+identifiers, not credentials.
 
 ## 2. Import the NixOS module
 
@@ -63,12 +70,20 @@ sudo chmod 0600 /var/lib/auxide/config.toml
 sudo chown root:root /var/lib/auxide/config.toml
 ```
 
-Start from `config.example.toml`, replace the example Discord IDs, and keep this exact token path:
+Start from `config.example.toml`. The only line that must be right is the token path:
 
 ```toml
 [discord]
 token_file = "/run/credentials/auxide.service/discord-token"
 ```
+
+No server needs to be listed. `allow_all_guilds` defaults to true, so Auxide answers every server
+it is installed in. Add a `[[discord.guilds]]` block only to narrow one particular server, which
+leaves every other server on the permissive defaults; set `allow_all_guilds = false` to make those
+blocks the complete allowlist instead.
+
+Editing this file has no effect on a running service. `LoadCredential=` copies it into the unit's
+credential directory at start, so a change needs `sudo systemctl restart auxide.service`.
 
 Then run the credential helper. It prompts through `systemd-ask-password`, encrypts with this
 machine's systemd host key, verifies the ciphertext, and atomically installs it. The token is never
@@ -95,7 +110,8 @@ sudo systemd-run --wait --pipe --collect \
   auxide --config /run/credentials/auxide-admin.service/auxide-config check-config
 ```
 
-Register the guild-scoped commands once, then start the service:
+Register the commands once, then start the service. Registration is global, so a server added
+later needs no repeat:
 
 ```console
 sudo systemd-run --wait --pipe --collect \
@@ -107,7 +123,12 @@ sudo systemctl enable --now auxide.service
 ```
 
 Normal startup never creates or mutates commands. Repeat `register-commands` only after command
-definitions change.
+definitions change; Discord can take up to an hour to propagate such a change, though a newly
+installed server receives the current set at once.
+
+If a server previously carried per-server commands, they survive alongside the global set and
+appear as duplicates. `register-commands` clears them for every server still named in
+configuration; pass `--guild-id ID` for one that is not.
 
 Check the service and its private observability listener:
 
