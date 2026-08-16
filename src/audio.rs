@@ -22,7 +22,10 @@ use songbird::input::{
     AsyncAdapterStream, AsyncMediaSource, AudioStream, AudioStreamError, Compose, HlsRequest,
     Input, core::io::MediaSource,
 };
-use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncSeek, ReadBuf},
+    time,
+};
 use tokio_util::io::StreamReader;
 
 use crate::source::{SourceResolver, TrackMetadata};
@@ -36,12 +39,18 @@ use crate::source::{SourceResolver, TrackMetadata};
 /// 2 MiB, and the whole 3.9 MiB file were refused.
 const MAX_RANGE_SPAN: u64 = 1024 * 1024;
 
-/// Deadline for one ranged request, headers and body together.
+/// Deadline for a response's headers, and deliberately not for its body.
 ///
 /// The client's connect and read timeouts do not bound a request whose
-/// response simply never arrives, and a media fetch that hangs shows up as a
-/// track stuck before it becomes playable, with nothing logged at all.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// response simply never arrives, which showed up as a track stuck before it
+/// ever became playable, with nothing logged at all.
+///
+/// It must not cover the body. Songbird pulls from this stream at playback
+/// rate, so a one-mebibyte chunk takes about a minute of listening to drain
+/// even though it arrives from the network in under a second. A deadline
+/// spanning the body cancels healthy chunks mid-song, once every thirty
+/// seconds of audio.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many times one stream may resolve a fresh media URL before giving up.
 ///
@@ -202,18 +211,29 @@ impl ChunkedHttpRequest {
                 }
 
                 let last = position.saturating_add(MAX_RANGE_SPAN - 1);
-                let response = request
+                // Only the wait for headers is bounded. `send` resolves once
+                // they arrive, leaving the body to stream at whatever rate it
+                // is consumed.
+                let sent = request
                     .client
                     .get(&request.url)
                     .headers(request.headers.clone())
                     .header(RANGE, format!("bytes={position}-{last}"))
-                    .timeout(REQUEST_TIMEOUT)
-                    .send()
-                    .await
-                    .map_err(|error| {
+                    .send();
+                let response = match time::timeout(RESPONSE_TIMEOUT, sent).await {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(error)) => {
                         tracing::warn!(%error, position, last, "media request failed");
-                        IoError::other(error)
-                    })?;
+                        return Err(IoError::other(error));
+                    }
+                    Err(_) => {
+                        tracing::warn!(position, last, "media request timed out awaiting headers");
+                        return Err(IoError::new(
+                            IoErrorKind::TimedOut,
+                            "media request timed out awaiting response headers",
+                        ));
+                    }
+                };
 
                 let status = response.status();
                 if !status.is_success() {
