@@ -89,6 +89,17 @@ pub struct PlaybackConfig {
     pub max_queue_length: usize,
     pub actor_mailbox_capacity: usize,
     pub max_concurrent_resolutions: usize,
+
+    /// Level tracks are played at, where `1.0` is the source's own level.
+    ///
+    /// Discord applies no normalisation, and `YouTube` audio is mastered loud, so
+    /// joining at full scale is startling for everyone already in the channel.
+    ///
+    /// Anything other than `1.0` costs Songbird's Opus passthrough: a track
+    /// whose volume is untouched can be forwarded to Discord without being
+    /// decoded and re-encoded, and adjusting the level means it can no longer
+    /// be. That trade is worth it for one track at a time.
+    pub output_volume: f32,
 }
 
 impl Default for PlaybackConfig {
@@ -99,6 +110,7 @@ impl Default for PlaybackConfig {
             max_queue_length: 100,
             actor_mailbox_capacity: 128,
             max_concurrent_resolutions: 2,
+            output_volume: 0.5,
         }
     }
 }
@@ -213,38 +225,7 @@ impl Config {
             }
         }
 
-        if self.playback.max_queue_length == 0
-            || self.playback.actor_mailbox_capacity == 0
-            || self.playback.max_concurrent_resolutions == 0
-            || self.playback.max_track_duration_seconds == 0
-            || self.playback.idle_timeout_seconds == 0
-        {
-            return Err(ConfigError::Validation(
-                "all playback bounds and timeouts must be greater than zero".to_owned(),
-            ));
-        }
-        if self.playback.max_queue_length > 1_000 {
-            return Err(ConfigError::Validation(
-                "playback.max_queue_length must not exceed 1000".to_owned(),
-            ));
-        }
-        if self.playback.actor_mailbox_capacity > 4_096 {
-            return Err(ConfigError::Validation(
-                "playback.actor_mailbox_capacity must not exceed 4096".to_owned(),
-            ));
-        }
-        if self.playback.max_concurrent_resolutions > 16 {
-            return Err(ConfigError::Validation(
-                "playback.max_concurrent_resolutions must not exceed 16".to_owned(),
-            ));
-        }
-        if self.playback.max_track_duration_seconds > 24 * 60 * 60
-            || self.playback.idle_timeout_seconds > 24 * 60 * 60
-        {
-            return Err(ConfigError::Validation(
-                "playback durations and timeouts must not exceed 24 hours".to_owned(),
-            ));
-        }
+        self.validate_playback()?;
 
         if self.youtube.enabled {
             if !(1..=10).contains(&self.youtube.search_results) {
@@ -275,6 +256,51 @@ impl Config {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Checks every playback bound, timeout, and output level.
+    fn validate_playback(&self) -> Result<(), ConfigError> {
+        if self.playback.max_queue_length == 0
+            || self.playback.actor_mailbox_capacity == 0
+            || self.playback.max_concurrent_resolutions == 0
+            || self.playback.max_track_duration_seconds == 0
+            || self.playback.idle_timeout_seconds == 0
+        {
+            return Err(ConfigError::Validation(
+                "all playback bounds and timeouts must be greater than zero".to_owned(),
+            ));
+        }
+        if !self.playback.output_volume.is_finite()
+            || self.playback.output_volume <= 0.0
+            || self.playback.output_volume > 1.0
+        {
+            return Err(ConfigError::Validation(
+                "playback.output_volume must be greater than zero and at most 1.0".to_owned(),
+            ));
+        }
+        if self.playback.max_queue_length > 1_000 {
+            return Err(ConfigError::Validation(
+                "playback.max_queue_length must not exceed 1000".to_owned(),
+            ));
+        }
+        if self.playback.actor_mailbox_capacity > 4_096 {
+            return Err(ConfigError::Validation(
+                "playback.actor_mailbox_capacity must not exceed 4096".to_owned(),
+            ));
+        }
+        if self.playback.max_concurrent_resolutions > 16 {
+            return Err(ConfigError::Validation(
+                "playback.max_concurrent_resolutions must not exceed 16".to_owned(),
+            ));
+        }
+        if self.playback.max_track_duration_seconds > 24 * 60 * 60
+            || self.playback.idle_timeout_seconds > 24 * 60 * 60
+        {
+            return Err(ConfigError::Validation(
+                "playback durations and timeouts must not exceed 24 hours".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -496,6 +522,37 @@ authorized_user_ids = [7]
         assert!(config.allows_guild(456));
         let guild = config.guild(123).unwrap();
         assert!(guild.authorized_user_ids.contains(&7));
+    }
+
+    #[test]
+    fn rejects_an_unusable_output_volume() {
+        for volume in ["0.0", "-0.5", "1.5", "nan"] {
+            let source = format!(
+                r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+
+[playback]
+output_volume = {volume}
+"#
+            );
+            let config: Config = toml::from_str(&source).unwrap();
+            assert!(
+                config.validate().is_err(),
+                "accepted output_volume = {volume}"
+            );
+        }
+    }
+
+    #[test]
+    fn defaults_to_half_scale_output() {
+        let source = r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        config.validate().unwrap();
+        assert!((config.playback.output_volume - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]

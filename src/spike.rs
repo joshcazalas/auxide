@@ -183,6 +183,11 @@ async fn run_after_gateway_ready(
     );
 
     let handle = call.lock().await.play_only_input(input);
+    // The spike is the control case for the acceptance gate, so it has to be
+    // as loud as the bot proper rather than a different reference point.
+    handle
+        .set_volume(config.playback.output_volume)
+        .context("failed to set playback volume")?;
     let (finished_tx, finished_rx) = oneshot::channel();
     handle
         .add_event(
@@ -251,7 +256,9 @@ async fn prepare_input(config: &Config, source: VoiceSpikeSource) -> Result<Inpu
                 title = %metadata.title,
                 "YouTube source inspected"
             );
-            AudioPipeline::new(resolver)?.prepare(&metadata).await
+            AudioPipeline::new(resolver, config.playback.output_volume)?
+                .prepare(&metadata)
+                .await
         }
     }
 }

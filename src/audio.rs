@@ -41,6 +41,7 @@ const MAX_RANGE_SPAN: u64 = 1024 * 1024;
 pub struct AudioPipeline {
     resolver: Arc<dyn SourceResolver>,
     http: HttpClient,
+    output_volume: f32,
 }
 
 impl std::fmt::Debug for AudioPipeline {
@@ -57,7 +58,7 @@ impl AudioPipeline {
     /// # Errors
     ///
     /// Returns an error when the HTTP client cannot be configured.
-    pub fn new(resolver: Arc<dyn SourceResolver>) -> Result<Self> {
+    pub fn new(resolver: Arc<dyn SourceResolver>, output_volume: f32) -> Result<Self> {
         let http = HttpClient::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
@@ -77,7 +78,17 @@ impl AudioPipeline {
             .user_agent(concat!("auxide/", env!("CARGO_PKG_VERSION")))
             .build()
             .context("failed to build the media HTTP client")?;
-        Ok(Self { resolver, http })
+        Ok(Self {
+            resolver,
+            http,
+            output_volume,
+        })
+    }
+
+    /// Level every track starts at, from `playback.output_volume`.
+    #[must_use]
+    pub const fn output_volume(&self) -> f32 {
+        self.output_volume
     }
 
     /// Resolves a queued track and creates its streaming input.
