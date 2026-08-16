@@ -343,7 +343,7 @@ impl BotRuntime {
             &config.playback,
         ));
         let source: Arc<dyn SourceResolver> = resolver.clone();
-        let pipeline = AudioPipeline::new(source)?;
+        let pipeline = AudioPipeline::new(source, config.playback.output_volume)?;
         observability.set_guild_players(0);
 
         Ok(Self {
@@ -1024,6 +1024,9 @@ async fn start_track(
         }
     };
     let handle = call.lock().await.play_only_input(input);
+    if let Err(error) = handle.set_volume(pipeline.output_volume()) {
+        tracing::warn!(%error, guild_id, "failed to set playback volume");
+    }
     let event = RuntimeTrackFinished {
         player: player.clone(),
         guild_id,

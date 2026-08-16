@@ -32,6 +32,9 @@ max_track_duration_seconds = 14400
 max_queue_length = 100
 actor_mailbox_capacity = 128
 max_concurrent_resolutions = 2
+# Level tracks play at, where 1.0 is the source's own level. Discord applies no
+# normalisation and YouTube audio is mastered loud, so full scale is startling.
+output_volume = 0.5
 
 [youtube]
 enabled = true
