@@ -25,9 +25,9 @@ struct Cli {
 enum Command {
     /// Run the long-lived Discord bot and private observability server.
     Run,
-    /// Replace this application's slash commands in configured guilds.
+    /// Replace this application's slash commands, for every server it is installed in.
     RegisterCommands {
-        /// Limit registration to one configured guild.
+        /// Also clear leftover per-server commands from this server.
         #[arg(long)]
         guild_id: Option<u64>,
     },

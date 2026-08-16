@@ -1,13 +1,30 @@
 [discord]
 token_file = "/run/credentials/auxide.service/discord-token"
 
-[[discord.guilds]]
-guild_id = 123456789012345678
-# An empty list permits commands in every text channel in this allowlisted guild.
-command_channel_ids = [234567890123456789]
-# When both lists are empty, any member in the requester's voice channel is authorized.
-authorized_role_ids = []
-authorized_user_ids = []
+# Serve every server this application is installed in, which is the default.
+# Installation is then the authorization boundary: with Public Bot disabled on
+# the Bot page of the Discord Developer Portal, only this application's owner
+# can add it anywhere. Auxide refuses to start if that is not the case, so the
+# two settings cannot silently drift apart.
+#
+# Adding Auxide to another server needs no change to this file.
+allow_all_guilds = true
+
+# Servers held in memory at once. Each one owns a player, a worker, and a queue.
+max_guilds = 50
+
+# Nothing below is required. Add a [[discord.guilds]] block only to restrict a
+# particular server; every other server keeps the permissive defaults above.
+# Setting allow_all_guilds = false instead makes these blocks the complete
+# allowlist, and every unlisted server is refused.
+#
+# [[discord.guilds]]
+# guild_id = 123456789012345678
+# # An empty list permits commands in every text channel in this server.
+# command_channel_ids = [234567890123456789]
+# # When both lists are empty, any member in the requester's voice channel is authorized.
+# authorized_role_ids = []
+# authorized_user_ids = []
 
 [playback]
 idle_timeout_seconds = 600
