@@ -20,7 +20,7 @@ const AUDIO_FORMAT: &str = "bestaudio[abr>0][vcodec=none]/bestaudio";
 /// `automatic_captions` was 496 KB and `formats` 86 KB; the eleven fields below
 /// came to 1.7 KB. Five search results therefore ran past the configured output
 /// bound and failed the whole query before it could be parsed.
-const ENTRY_TEMPLATE: &str = "%(.{id,title,duration,channel,uploader,thumbnail,is_live,live_status,url,protocol,http_headers,filesize,filesize_approx})j";
+const ENTRY_TEMPLATE: &str = "%(.{id,title,duration,channel,uploader,thumbnail,is_live,live_status,url,protocol,http_headers})j";
 
 #[derive(Debug)]
 pub struct YouTubeResolver {
@@ -240,7 +240,6 @@ impl SourceResolver for YouTubeResolver {
             stream_url,
             headers: entry.http_headers.clone().unwrap_or_default(),
             protocol: entry.protocol.clone(),
-            content_length: entry.content_length(),
         })
     }
 }
@@ -258,19 +257,6 @@ struct YtDlpEntry {
     url: Option<String>,
     protocol: Option<String>,
     http_headers: Option<BTreeMap<String, String>>,
-    filesize: Option<u64>,
-    filesize_approx: Option<u64>,
-}
-
-impl YtDlpEntry {
-    /// The media length to bound range requests with.
-    ///
-    /// The exact size is preferred because the approximation is derived from
-    /// bitrate and duration and can fall short of the real end, which would
-    /// truncate the final moments of a track.
-    fn content_length(&self) -> Option<u64> {
-        self.filesize.or(self.filesize_approx)
-    }
 }
 
 fn sanitize_stderr(stderr: &[u8]) -> String {
@@ -405,23 +391,6 @@ mod tests {
             Err(SourceError::LiveStream)
         ));
         assert!(resolver(300).playable_metadata(&[]).unwrap().is_empty());
-    }
-
-    #[test]
-    fn prefers_the_exact_media_size_for_bounding_range_requests() {
-        let exact: YtDlpEntry = serde_json::from_str(
-            r#"{"id": "a", "title": "A", "filesize": 4092844, "filesize_approx": 4092817}"#,
-        )
-        .unwrap();
-        assert_eq!(exact.content_length(), Some(4_092_844));
-
-        let approximate: YtDlpEntry =
-            serde_json::from_str(r#"{"id": "a", "title": "A", "filesize_approx": 4092817}"#)
-                .unwrap();
-        assert_eq!(approximate.content_length(), Some(4_092_817));
-
-        let neither: YtDlpEntry = serde_json::from_str(r#"{"id": "a", "title": "A"}"#).unwrap();
-        assert_eq!(neither.content_length(), None);
     }
 
     #[test]
