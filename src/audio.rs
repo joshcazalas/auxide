@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult, SeekFrom},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context as TaskContext, Poll},
     time::Duration,
 };
@@ -32,6 +35,20 @@ use crate::source::{SourceResolver, TrackMetadata};
 /// 1 KiB, 512 KiB, 768 KiB, and 1 MiB were served, while 1.25 MiB, 1.5 MiB,
 /// 2 MiB, and the whole 3.9 MiB file were refused.
 const MAX_RANGE_SPAN: u64 = 1024 * 1024;
+
+/// Deadline for one ranged request, headers and body together.
+///
+/// The client's connect and read timeouts do not bound a request whose
+/// response simply never arrives, and a media fetch that hangs shows up as a
+/// track stuck before it becomes playable, with nothing logged at all.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many times one stream may resolve a fresh media URL before giving up.
+///
+/// A signed URL can be refused from the moment it is issued, and asking the
+/// source again reliably produces one that is not, so a refusal is treated as a
+/// stale URL rather than as an unplayable track.
+const MAX_URL_REFRESHES: u32 = 3;
 
 /// Converts stable source metadata into a fresh, streaming Songbird input.
 ///
@@ -103,6 +120,8 @@ impl AudioPipeline {
         match audio.protocol.as_deref() {
             None | Some("https") => Ok(Input::Lazy(Box::new(ChunkedHttpRequest {
                 client: self.http.clone(),
+                resolver: Arc::clone(&self.resolver),
+                track: track.clone(),
                 url: audio.stream_url.to_string(),
                 headers,
             }))),
@@ -124,11 +143,24 @@ impl AudioPipeline {
 /// to chunk either: its adapter only retries after a read *error*, so a
 /// deliberately short response would read as a clean end of track and truncate
 /// playback rather than continue.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ChunkedHttpRequest {
     client: HttpClient,
+    resolver: Arc<dyn SourceResolver>,
+    track: TrackMetadata,
     url: String,
     headers: HeaderMap,
+}
+
+impl std::fmt::Debug for ChunkedHttpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The media URL is a signed, short-lived credential of sorts and has no
+        // place in a log line or a panic message.
+        formatter
+            .debug_struct("ChunkedHttpRequest")
+            .field("source_id", &self.track.source_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChunkedHttpRequest {
@@ -138,88 +170,109 @@ impl ChunkedHttpRequest {
     /// than from the caller, so it is whatever the origin actually serves. A
     /// server that ignores the range header and answers 200 is handled by
     /// taking its single response as the complete body.
-    fn body(&self, offset: u64) -> impl Stream<Item = IoResult<Bytes>> + Send + Sync + use<> {
+    fn body(&self, start: u64) -> impl Stream<Item = IoResult<Bytes>> + Send + Sync + use<> {
         let request = self.clone();
-        stream::try_unfold(Some((offset, None)), move |state| {
+        // Where the next request resumes is decided by the bytes that actually
+        // arrived, never by the length a response advertised. A body cut short
+        // mid-chunk would otherwise leave a gap the container never recovers
+        // from, which reads as audio that simply stops.
+        let delivered = Arc::new(AtomicU64::new(0));
+
+        stream::try_unfold(Some((None::<u64>, None::<u64>)), move |state| {
             let request = request.clone();
+            let delivered = Arc::clone(&delivered);
             async move {
-                let Some((offset, total)) = state else {
+                let Some((total, previous)) = state else {
                     return Ok(None);
                 };
-                if total.is_some_and(|total| offset >= total) {
+                let consumed = delivered.load(Ordering::Relaxed);
+                let position = start.saturating_add(consumed);
+
+                if total.is_some_and(|total| position >= total) {
+                    return Ok(None);
+                }
+                // A response that delivered nothing would otherwise have this
+                // ask for the same bytes forever.
+                if previous == Some(consumed) {
+                    tracing::warn!(
+                        position,
+                        "media request delivered no bytes; ending the stream"
+                    );
                     return Ok(None);
                 }
 
-                let last = offset.saturating_add(MAX_RANGE_SPAN - 1);
+                let last = position.saturating_add(MAX_RANGE_SPAN - 1);
                 let response = request
                     .client
                     .get(&request.url)
                     .headers(request.headers.clone())
-                    .header(RANGE, format!("bytes={offset}-{last}"))
+                    .header(RANGE, format!("bytes={position}-{last}"))
+                    .timeout(REQUEST_TIMEOUT)
                     .send()
                     .await
-                    .map_err(IoError::other)?;
+                    .map_err(|error| {
+                        tracing::warn!(%error, position, last, "media request failed");
+                        IoError::other(error)
+                    })?;
+
                 let status = response.status();
                 if !status.is_success() {
+                    // Reported as an error so Songbird's adapter calls
+                    // try_resume, which is where a fresh URL is obtained.
+                    tracing::warn!(
+                        position,
+                        last,
+                        status = status.as_u16(),
+                        "media request was refused"
+                    );
                     return Err(IoError::other(format!(
-                        "media request for bytes {offset}-{last} failed with status {status}"
+                        "media request for bytes {position}-{last} failed with status {status}"
                     )));
                 }
 
+                let total = total.or_else(|| content_range_total(response.headers()));
+                tracing::debug!(
+                    position,
+                    last,
+                    status = status.as_u16(),
+                    served = response.content_length(),
+                    total,
+                    "fetched a media chunk"
+                );
+
                 // A 200 means the range was ignored and the whole resource is
                 // in this one response, so there is nothing left to ask for.
-                let served = response.content_length();
                 let next = if status == StatusCode::OK {
                     None
                 } else {
-                    let total = total.or_else(|| content_range_total(response.headers()));
-                    match served {
-                        // No progress would loop forever asking for the same bytes.
-                        None | Some(0) => None,
-                        Some(served) => {
-                            let next = offset.saturating_add(served);
-                            if total.is_some_and(|total| next >= total) {
-                                None
-                            } else {
-                                Some((next, total))
-                            }
-                        }
-                    }
+                    Some((total, Some(consumed)))
                 };
-
-                Ok(Some((
-                    response.bytes_stream().map_err(IoError::other),
-                    next,
-                )))
+                let counter = Arc::clone(&delivered);
+                let body = response
+                    .bytes_stream()
+                    .map_ok(move |chunk| {
+                        counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                        chunk
+                    })
+                    .map_err(IoError::other);
+                Ok(Some((body, next)))
             }
         })
         .try_flatten()
     }
 
-    async fn open(&self, offset: u64) -> Result<ChunkedHttpStream, AudioStreamError> {
-        // Ask for the first chunk immediately so an unplayable source fails
-        // here, where the error reaches the requester, instead of part-way
-        // through a track.
-        let probe = self
-            .client
-            .get(&self.url)
-            .headers(self.headers.clone())
-            .header(RANGE, format!("bytes={offset}-{offset}"))
-            .send()
-            .await
-            .map_err(|error| AudioStreamError::Fail(Box::new(error)))?;
-        if !probe.status().is_success() {
-            let message: Box<dyn std::error::Error + Send + Sync + 'static> =
-                format!("media request failed with status {}", probe.status()).into();
-            return Err(AudioStreamError::Fail(message));
-        }
-        let total = content_range_total(probe.headers());
-
-        Ok(ChunkedHttpStream {
+    /// Builds the stream without first probing the URL.
+    ///
+    /// An earlier version asked for a single byte here to fail fast. That was
+    /// worse than useless: a one-byte range is accepted even by a URL that
+    /// refuses every real chunk, so it reported success and left the failure to
+    /// surface later as a container that would not parse.
+    fn open(&self, offset: u64) -> ChunkedHttpStream {
+        ChunkedHttpStream {
             stream: Box::pin(StreamReader::new(self.body(offset))),
             request: self.clone(),
-            total,
-        })
+            refreshes: 0,
+        }
     }
 }
 
@@ -236,7 +289,7 @@ fn content_range_total(headers: &HeaderMap) -> Option<u64> {
 struct ChunkedHttpStream {
     stream: Pin<Box<dyn AsyncRead + Send + Sync>>,
     request: ChunkedHttpRequest,
-    total: Option<u64>,
+    refreshes: u32,
 }
 
 impl AsyncRead for ChunkedHttpStream {
@@ -266,17 +319,49 @@ impl AsyncMediaSource for ChunkedHttpStream {
     }
 
     async fn byte_len(&self) -> Option<u64> {
-        self.total
+        None
     }
 
+    /// Continues the track after a read error, on a freshly resolved URL.
+    ///
+    /// A signed media URL can be refused from the moment it is issued, and
+    /// asking the source again yields one that is not. Resolution is already
+    /// just-in-time for exactly this reason, so a refusal is treated as a stale
+    /// URL rather than as an unplayable track. Songbird calls this on any read
+    /// error, which is what makes it the right place to do it.
     async fn try_resume(
         &mut self,
         offset: u64,
     ) -> Result<Box<dyn AsyncMediaSource>, AudioStreamError> {
-        self.request
-            .open(offset)
+        if self.refreshes >= MAX_URL_REFRESHES {
+            tracing::warn!(
+                offset,
+                "giving up after refreshing the media URL repeatedly"
+            );
+            return Err(AudioStreamError::Unsupported);
+        }
+        let refreshes = self.refreshes + 1;
+        tracing::warn!(offset, refreshes, "resolving a fresh media URL mid-track");
+
+        let audio = self
+            .request
+            .resolver
+            .resolve(&self.request.track)
             .await
-            .map(|stream| Box::new(stream) as Box<dyn AsyncMediaSource>)
+            .map_err(|error| AudioStreamError::Fail(Box::new(error)))?;
+        if audio.metadata.source_id != self.request.track.source_id {
+            let message: Box<dyn std::error::Error + Send + Sync + 'static> =
+                "resolved media identity changed mid-track".into();
+            return Err(AudioStreamError::Fail(message));
+        }
+
+        let mut request = self.request.clone();
+        request.url = audio.stream_url.to_string();
+        request.headers = convert_headers(&audio.headers)
+            .map_err(|error| AudioStreamError::Fail(error.into()))?;
+        let mut resumed = request.open(offset);
+        resumed.refreshes = refreshes;
+        Ok(Box::new(resumed) as Box<dyn AsyncMediaSource>)
     }
 }
 
@@ -289,7 +374,7 @@ impl Compose for ChunkedHttpRequest {
     async fn create_async(
         &mut self,
     ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-        let stream = self.open(0).await?;
+        let stream = self.open(0);
         Ok(AudioStream {
             input: Box::new(AsyncAdapterStream::new(Box::new(stream), 64 * 1024))
                 as Box<dyn MediaSource>,
