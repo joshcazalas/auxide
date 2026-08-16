@@ -13,6 +13,15 @@ use crate::{
 
 const AUDIO_FORMAT: &str = "bestaudio[abr>0][vcodec=none]/bestaudio";
 
+/// The exact fields [`YtDlpEntry`] deserialises, as a yt-dlp output template.
+///
+/// `--dump-json` emits the complete info dictionary instead, which is dominated
+/// by fields nothing here reads. One measured video produced 630 KB, of which
+/// `automatic_captions` was 496 KB and `formats` 86 KB; the eleven fields below
+/// came to 1.7 KB. Five search results therefore ran past the configured output
+/// bound and failed the whole query before it could be parsed.
+const ENTRY_TEMPLATE: &str = "%(.{id,title,duration,channel,uploader,thumbnail,is_live,live_status,url,protocol,http_headers})j";
+
 #[derive(Debug)]
 pub struct YouTubeResolver {
     config: YouTubeConfig,
@@ -64,7 +73,8 @@ impl YouTubeResolver {
         })?;
         let runtime = format!("deno:{}", self.config.deno_path.display());
         let args = [
-            OsString::from("--dump-json"),
+            OsString::from("--print"),
+            OsString::from(ENTRY_TEMPLATE),
             OsString::from("--skip-download"),
             OsString::from("--no-playlist"),
             OsString::from("--no-warnings"),
@@ -84,10 +94,6 @@ impl YouTubeResolver {
         .run()
         .await?;
 
-        if !output.status.success() {
-            return Err(SourceError::ResolverFailed(sanitize_stderr(&output.stderr)));
-        }
-
         let entries = output
             .stdout
             .split(|byte| *byte == b'\n')
@@ -98,12 +104,49 @@ impl YouTubeResolver {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        // A search asks yt-dlp about several videos at once and it reports a
+        // failure status if any single one could not be prepared, which is
+        // routine: two of five results for one ordinary query had no matching
+        // audio format. Treat the status as advisory whenever usable entries
+        // came back, and fall back to its stderr only when none did.
         if entries.is_empty() {
-            return Err(SourceError::InvalidResponse(
-                "yt-dlp returned no results".to_owned(),
-            ));
+            if output.status.success() {
+                return Err(SourceError::InvalidResponse(
+                    "yt-dlp returned no results".to_owned(),
+                ));
+            }
+            return Err(SourceError::ResolverFailed(sanitize_stderr(&output.stderr)));
         }
         Ok(entries)
+    }
+
+    /// Converts search results into playable tracks, dropping the ones this bot
+    /// cannot play.
+    ///
+    /// A search is a list of suggestions, not a request for one specific video,
+    /// so a live stream or an over-long result among them is a result to skip
+    /// rather than a reason to fail the query. When nothing survives, the first
+    /// rejection is returned so the requester still learns why.
+    fn playable_metadata(&self, entries: &[YtDlpEntry]) -> Result<Vec<TrackMetadata>, SourceError> {
+        let mut tracks = Vec::with_capacity(entries.len());
+        let mut first_rejection = None;
+        for entry in entries {
+            match self.metadata(entry) {
+                Ok(track) => tracks.push(track),
+                Err(error) => {
+                    tracing::debug!(source_id = %entry.id, %error, "skipped an unplayable search result");
+                    if first_rejection.is_none() {
+                        first_rejection = Some(error);
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = first_rejection.filter(|_| tracks.is_empty()) {
+            return Err(error);
+        }
+        Ok(tracks)
     }
 
     fn metadata(&self, entry: &YtDlpEntry) -> Result<TrackMetadata, SourceError> {
@@ -157,11 +200,8 @@ impl SourceResolver for YouTubeResolver {
             ));
         }
         let target = format!("ytsearch{}:{query}", self.config.search_results);
-        self.query(&target)
-            .await?
-            .iter()
-            .map(|entry| self.metadata(entry))
-            .collect()
+        let entries = self.query(&target).await?;
+        self.playable_metadata(&entries)
     }
 
     async fn inspect(&self, url: &Url) -> Result<TrackMetadata, SourceError> {
@@ -318,6 +358,36 @@ mod tests {
             resolver(121).metadata(&entry),
             Err(SourceError::LiveStream)
         ));
+    }
+
+    fn entry(id: &str, duration: u64, live: bool) -> YtDlpEntry {
+        serde_json::from_str(&format!(
+            r#"{{"id": "{id}", "title": "Example", "duration": {duration}, "is_live": {live}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn search_keeps_playable_results_and_drops_the_rest() {
+        let entries = [
+            entry("live", 120, true),
+            entry("playable", 120, false),
+            entry("too-long", 600, false),
+            entry("also-playable", 60, false),
+        ];
+        let tracks = resolver(300).playable_metadata(&entries).unwrap();
+        let ids: Vec<_> = tracks.iter().map(|track| track.source_id.as_str()).collect();
+        assert_eq!(ids, ["playable", "also-playable"]);
+    }
+
+    #[test]
+    fn search_reports_why_when_no_result_is_playable() {
+        let entries = [entry("live", 120, true), entry("too-long", 600, false)];
+        assert!(matches!(
+            resolver(300).playable_metadata(&entries),
+            Err(SourceError::LiveStream)
+        ));
+        assert!(resolver(300).playable_metadata(&[]).unwrap().is_empty());
     }
 
     #[test]
