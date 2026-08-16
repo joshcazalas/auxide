@@ -376,7 +376,10 @@ mod tests {
             entry("also-playable", 60, false),
         ];
         let tracks = resolver(300).playable_metadata(&entries).unwrap();
-        let ids: Vec<_> = tracks.iter().map(|track| track.source_id.as_str()).collect();
+        let ids: Vec<_> = tracks
+            .iter()
+            .map(|track| track.source_id.as_str())
+            .collect();
         assert_eq!(ids, ["playable", "also-playable"]);
     }
 
