@@ -198,9 +198,6 @@ pub async fn run_with(config: Config, overrides: Overrides) -> Result<()> {
     ensure_installation_is_a_boundary(&config, application.bot_public)?;
     tracing::info!(
         application = %application.name,
-        allow_all_guilds = config.discord.allow_all_guilds,
-        configured_guilds = config.discord.guilds.len(),
-        max_guilds = config.discord.max_guilds,
         "resolved the Discord application"
     );
 

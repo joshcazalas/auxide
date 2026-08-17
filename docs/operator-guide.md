@@ -114,7 +114,30 @@ The same applies to `command_channel_ids`. Discord can already restrict a comman
 this exists for the case where you want that guaranteed from outside the server.
 
 Editing this file has no effect on a running service. `LoadCredential=` copies it into the unit's
-credential directory at start, so a change needs `sudo systemctl restart auxide.service`.
+credential directory at start, so a change needs `sudo systemctl restart auxide.service`. There is
+no reload path, and that is deliberate: a running process should not have its credentials change
+underneath it.
+
+The cost of that is a failure mode worth knowing, because it looks like a bug in a file that is
+correct. A command refused with *"Auxide's own configuration does not list you as permitted"*, or
+a setting that appears to do nothing, is usually the service still running on an older copy. So
+Auxide opens its journal with what it actually loaded:
+
+```console
+journalctl -u auxide.service | grep "loaded configuration" | tail -2
+```
+
+```
+loaded configuration configuration=/run/credentials/auxide.service/auxide-config
+  allow_all_guilds=true configured_guilds=1 max_guilds=50 idle_timeout_seconds=900
+  starting_volume_percent=50 max_queue_length=100 youtube_enabled=true
+loaded settings for one server guild_id=730675093197422623 command_channels=1
+  authorized_roles=0 authorized_users=0 announce_channel_id=None announce_tracks=true
+```
+
+The path on that first line is the copy, not the file you edited. If what follows disagrees with
+what is on disk, the answer is a restart rather than a change. Every value there is a setting or a
+snowflake; the token is read separately and never appears.
 
 Then run the credential helper. It prompts through `systemd-ask-password`, encrypts with this
 machine's systemd host key, verifies the ciphertext, and atomically installs it. The token is never
@@ -140,6 +163,9 @@ sudo systemd-run --wait --pipe --collect \
   --property=LoadCredentialEncrypted=discord-token:/var/lib/auxide/discord-token \
   auxide --config /run/credentials/auxide-admin.service/auxide-config check-config
 ```
+
+That prints the same description the service logs, read from the same credential, so comparing the
+two is how you confirm a running service is on the configuration you think it is.
 
 Register the commands once, then start the service. Registration is global, so a server added
 later needs no repeat:

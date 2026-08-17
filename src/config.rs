@@ -15,6 +15,15 @@ const MAX_SECRET_BYTES: u64 = 4 * 1024;
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Where this was read from.
+    ///
+    /// Under systemd that is the credential directory rather than the file an
+    /// operator edits, and saying so is the whole point: a refusal that looks
+    /// wrong against the file on disk is usually right against the copy the
+    /// service started with.
+    #[serde(skip)]
+    pub loaded_from: PathBuf,
+
     pub discord: DiscordConfig,
     #[serde(default)]
     pub playback: PlaybackConfig,
@@ -227,7 +236,8 @@ impl Config {
             path: path.to_path_buf(),
             source,
         })?;
-        let config: Self = toml::from_str(&source).map_err(ConfigError::Parse)?;
+        let mut config: Self = toml::from_str(&source).map_err(ConfigError::Parse)?;
+        config.loaded_from = path.to_path_buf();
         config.validate()?;
         Ok(config)
     }
@@ -365,6 +375,45 @@ impl Config {
         read_secret(&self.discord.token_file)
     }
 
+    /// Writes what was actually loaded to the log, once, at startup.
+    ///
+    /// Every value here is a setting or a snowflake, never a credential — the
+    /// token is read separately and never reaches this.
+    ///
+    /// It lives beside the configuration rather than at either call site
+    /// because `check-config` and `run` both need it, and an operator
+    /// comparing the two is the point: they should be able to see the same
+    /// description from the file and from the copy the service is running on.
+    pub fn log_effective(&self) {
+        tracing::info!(
+            configuration = %self.loaded_from.display(),
+            allow_all_guilds = self.discord.allow_all_guilds,
+            configured_guilds = self.discord.guilds.len(),
+            max_guilds = self.discord.max_guilds,
+            idle_timeout_seconds = self.playback.idle_timeout_seconds,
+            starting_volume_percent = self.starting_volume_percent(),
+            max_queue_length = self.playback.max_queue_length,
+            youtube_enabled = self.youtube.enabled,
+            "loaded configuration"
+        );
+        for guild in &self.discord.guilds {
+            tracing::info!(
+                guild_id = guild.guild_id,
+                command_channels = guild.command_channel_ids.len(),
+                authorized_roles = guild.authorized_role_ids.len(),
+                authorized_users = guild.authorized_user_ids.len(),
+                announce_channel_id = ?guild.announce_channel_id,
+                announce_tracks = guild.announce_tracks,
+                "loaded settings for one server"
+            );
+        }
+    }
+
+    #[must_use]
+    pub fn starting_volume_percent(&self) -> u16 {
+        self.playback.starting_volume_percent()
+    }
+
     #[must_use]
     pub fn guild(&self, guild_id: u64) -> Option<&GuildConfig> {
         self.discord
@@ -471,6 +520,20 @@ enabled = true
             "not-a-real-token"
         );
         assert!(!format!("{loaded:?}").contains("not-a-real-token"));
+    }
+
+    #[test]
+    fn a_loaded_configuration_remembers_where_it_came_from() {
+        let mut token = NamedTempFile::new().unwrap();
+        writeln!(token, "not-a-real-token").unwrap();
+        let mut config = NamedTempFile::new().unwrap();
+        write!(config, "{}", valid_config(token.path())).unwrap();
+
+        // Under systemd this is the credential copy rather than the file an
+        // operator edits, which is exactly the distinction a refusal that looks
+        // wrong against the file on disk turns on.
+        let loaded = Config::load(config.path()).unwrap();
+        assert_eq!(loaded.loaded_from, config.path());
     }
 
     #[test]
