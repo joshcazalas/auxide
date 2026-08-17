@@ -48,7 +48,7 @@ use crate::{
         GuildPlayerHandle, PlaybackDirective, PlayerSnapshot, PlayerTransition, QueueItem,
         spawn_guild_player,
     },
-    source::{SourceResolver, TrackMetadata, YouTubeResolver},
+    source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
 };
 
 const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
@@ -861,6 +861,15 @@ impl BotRuntime {
         let query = query_option(command).context("the required query option was missing")?;
 
         if let Ok(url) = Url::parse(query) {
+            let result = self.resolver.playlist(&url).await;
+            self.observability.record_source_resolution(result.is_ok());
+            if let Some(playlist) = result? {
+                return self
+                    .enqueue_playlist(&authorization, voice_channel_id, &url, playlist)
+                    .await
+                    .map(InteractionReply::from);
+            }
+
             let result = self.resolver.inspect(&url).await;
             self.observability.record_source_resolution(result.is_ok());
             let track = result?;
@@ -967,6 +976,62 @@ impl BotRuntime {
             authorization.user_id,
             Some(position),
         )))
+    }
+
+    /// Adds a whole playlist and describes it as the one thing it was.
+    async fn enqueue_playlist(
+        &self,
+        authorization: &Authorization,
+        voice_channel_id: u64,
+        url: &Url,
+        playlist: Playlist,
+    ) -> Result<Announcement> {
+        if playlist.tracks.is_empty() {
+            bail!("that playlist has nothing Auxide can play");
+        }
+        let played = playlist.tracks.len();
+        let listed = playlist.total;
+        let duration: Duration = playlist.tracks.iter().map(|track| track.duration).sum();
+        let items = playlist
+            .tracks
+            .into_iter()
+            .map(|track| {
+                QueueItem::new(
+                    track,
+                    authorization.user_id,
+                    authorization.response_channel_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        let bulk = authorization
+            .session
+            .player
+            .enqueue_all(items, voice_channel_id)
+            .await?;
+
+        let title = playlist
+            .title
+            .as_deref()
+            .map_or_else(|| "a playlist".to_owned(), |title| single_line(title, 150));
+        let mut embed = CreateEmbed::new()
+            .author(CreateEmbedAuthor::new("Added to the queue"))
+            .title(single_line(&title, EMBED_TITLE_CHARS))
+            .url(url.as_str())
+            .colour(EMBED_COLOUR)
+            .field("Tracks", bulk.accepted.to_string(), true)
+            .field("Duration", format_duration(duration), true)
+            .field("Requested by", mention(authorization.user_id), true);
+        // Say what was left behind rather than quietly dropping it. Entries can
+        // go missing twice over: unplayable ones never became tracks, and the
+        // queue may not have had room for the ones that did.
+        let dropped = listed.saturating_sub(played) + bulk.refused;
+        if dropped > 0 {
+            embed = embed.footer(CreateEmbedFooter::new(format!(
+                "{dropped} of {listed} left out — unplayable, or past the {}-track queue limit",
+                self.config.playback.max_queue_length
+            )));
+        }
+        Ok(Announcement::card(embed))
     }
 
     async fn queue(&self, authorization: Authorization) -> Result<InteractionReply> {

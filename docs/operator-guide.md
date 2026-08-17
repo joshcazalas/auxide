@@ -182,6 +182,9 @@ concurrently, and run every control command. Acceptance requires:
    the last person in the voice channel disconnect immediately, and each of the two departures
    Auxide decides on for itself says why in the channel;
 7. `/pause` holds a track and starts the same countdown, `/resume` cancels it, and `/volume`
-   changes the level of what is playing and of everything queued behind it; and
-8. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+   changes the level of what is playing and of everything queued behind it;
+8. a playlist link queues its tracks in one step and one message, stops at
+   `playback.max_queue_length`, says how many it left out, and a `watch?v=…&list=…` link still
+   queues only the one video; and
+9. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.
