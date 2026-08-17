@@ -10,7 +10,7 @@
 //! because a worker is per guild too — it removes the guild id from every
 //! method and gives the implementation somewhere to keep the track it started.
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use async_trait::async_trait;
 use serenity::model::id::{ChannelId, GuildId};
@@ -38,17 +38,14 @@ pub trait TrackEnded: Send + Sync + 'static {
 /// two against each other.
 #[async_trait]
 pub trait VoiceGateway: Send + Sync + 'static {
-    /// A source made ready to play, meaningful only to the gateway that made it.
-    type Prepared: Send;
-
     /// Resolves a track into something playable, without playing it.
-    async fn prepare(&self, track: &TrackMetadata) -> Result<Self::Prepared, VoiceError>;
+    async fn prepare(&self, track: &TrackMetadata) -> Result<Prepared, VoiceError>;
 
     /// Joins `channel_id` if needed and plays, replacing anything already playing.
     async fn play(
         &self,
         channel_id: u64,
-        prepared: Self::Prepared,
+        prepared: Prepared,
         volume: f32,
         ended: Arc<dyn TrackEnded>,
     ) -> Result<(), VoiceError>;
@@ -64,6 +61,42 @@ pub trait VoiceGateway: Send + Sync + 'static {
     async fn leave(&self);
 }
 
+/// A source made ready to play, opaque to everything but the gateway that made it.
+///
+/// Boxed rather than an associated type so the trait stays object-safe, which
+/// is what lets the whole runtime be handed a different gateway without every
+/// type between here and `run` becoming generic. The worker only ever passes
+/// this straight back to the gateway it came from.
+pub struct Prepared(Box<dyn Any + Send>);
+
+impl Prepared {
+    #[must_use]
+    pub fn new<T: Send + 'static>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    /// Recovers what [`Prepared::new`] was given.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a gateway is handed something another gateway prepared, which
+    /// the worker's structure makes impossible: it passes back exactly what the
+    /// same gateway just returned.
+    #[must_use]
+    pub fn take<T: Send + 'static>(self) -> T {
+        *self
+            .0
+            .downcast()
+            .expect("a gateway only ever receives what it prepared")
+    }
+}
+
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Prepared").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VoiceError {
     /// The source could not be made playable, which is the track's fault.
@@ -76,6 +109,38 @@ pub enum VoiceError {
     Join(String),
     #[error("failed to start playback: {0}")]
     Play(String),
+}
+
+/// Makes a gateway for a guild, the first time that guild needs one.
+///
+/// A session's gateway cannot be built before the session exists, so the
+/// runtime is given something that builds them rather than one to share. It is
+/// also the seam a test replaces to run the whole bot without touching voice.
+pub trait VoiceGatewayFactory: Send + Sync + 'static {
+    fn create(&self, guild_id: u64) -> Arc<dyn VoiceGateway>;
+}
+
+/// Builds Songbird-backed gateways, one per guild.
+pub struct SongbirdVoice {
+    songbird: Arc<Songbird>,
+    pipeline: AudioPipeline,
+}
+
+impl SongbirdVoice {
+    #[must_use]
+    pub const fn new(songbird: Arc<Songbird>, pipeline: AudioPipeline) -> Self {
+        Self { songbird, pipeline }
+    }
+}
+
+impl VoiceGatewayFactory for SongbirdVoice {
+    fn create(&self, guild_id: u64) -> Arc<dyn VoiceGateway> {
+        Arc::new(SongbirdGateway::new(
+            Arc::clone(&self.songbird),
+            self.pipeline.clone(),
+            guild_id,
+        ))
+    }
 }
 
 /// The real thing: Songbird, driving one guild's voice connection.
@@ -124,22 +189,22 @@ impl SongbirdGateway {
 
 #[async_trait]
 impl VoiceGateway for SongbirdGateway {
-    type Prepared = Input;
-
-    async fn prepare(&self, track: &TrackMetadata) -> Result<Input, VoiceError> {
+    async fn prepare(&self, track: &TrackMetadata) -> Result<Prepared, VoiceError> {
         self.pipeline
             .prepare(track)
             .await
+            .map(Prepared::new::<Input>)
             .map_err(|error| VoiceError::Prepare(error.to_string()))
     }
 
     async fn play(
         &self,
         channel_id: u64,
-        prepared: Input,
+        prepared: Prepared,
         volume: f32,
         ended: Arc<dyn TrackEnded>,
     ) -> Result<(), VoiceError> {
+        let prepared: Input = prepared.take();
         let call = self
             .songbird
             .join(GuildId::new(self.guild_id), ChannelId::new(channel_id))
@@ -225,7 +290,7 @@ pub mod fake {
     use async_trait::async_trait;
     use tokio::sync::Notify;
 
-    use super::{TrackEnded, VoiceError, VoiceGateway};
+    use super::{Prepared, TrackEnded, VoiceError, VoiceGateway};
     use crate::source::TrackMetadata;
 
     /// One thing that happened to a voice channel.
@@ -316,11 +381,15 @@ pub mod fake {
         }
     }
 
+    impl super::VoiceGatewayFactory for FakeVoice {
+        fn create(&self, _guild_id: u64) -> Arc<dyn VoiceGateway> {
+            Arc::new(self.clone())
+        }
+    }
+
     #[async_trait]
     impl VoiceGateway for FakeVoice {
-        type Prepared = String;
-
-        async fn prepare(&self, track: &TrackMetadata) -> Result<String, VoiceError> {
+        async fn prepare(&self, track: &TrackMetadata) -> Result<Prepared, VoiceError> {
             if self
                 .state
                 .lock()
@@ -332,23 +401,24 @@ pub mod fake {
                     "live streams are not supported".to_owned(),
                 ));
             }
-            Ok(track.source_id.clone())
+            Ok(Prepared::new(track.source_id.clone()))
         }
 
         async fn play(
             &self,
             channel_id: u64,
-            prepared: String,
+            prepared: Prepared,
             volume: f32,
             ended: Arc<dyn TrackEnded>,
         ) -> Result<(), VoiceError> {
+            let source_id: String = prepared.take();
             self.state
                 .lock()
                 .expect("fake voice state is not poisoned")
                 .ended = Some(ended);
             self.record(VoiceAction::Played {
                 channel_id,
-                source_id: prepared,
+                source_id,
                 volume_percent: percent(volume),
             });
             Ok(())

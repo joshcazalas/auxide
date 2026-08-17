@@ -47,6 +47,11 @@ nix develop
 nix flake check --print-build-logs
 ```
 
+`./scripts/source-check.sh` is deliberately not among them. It asks YouTube for
+real answers, which is what makes it able to notice extraction breaking and what
+makes it the wrong thing to gate a merge on. CI runs it daily instead, and files
+an issue when it stops answering.
+
 `config.example.toml` documents every MVP setting. A local `config.toml`, tokens, build outputs,
 and release bundles are ignored by Git. These checks do not need a Discord token; only command
 registration, the long-running bot, and the explicit voice spike contact Discord.

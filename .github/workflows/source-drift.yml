@@ -1,0 +1,89 @@
+name: Source drift
+
+# YouTube extraction breaks independently of anything in this repository, and
+# nothing in the test suite can see it — the fixtures prove the parser handles
+# the JSON yt-dlp used to produce. This asks YouTube for real answers.
+#
+# Deliberately not a pull-request gate. A network check in a merge gate turns
+# every unrelated change into a coin flip, and the thing being detected is never
+# caused by the change under review.
+on:
+  schedule:
+    # Early morning UTC, when nobody is listening to anything.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: source-drift
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: Ask YouTube for real answers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reserve runner space for the Nix store
+        uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
+        with:
+          hatchet-protocol: holster
+          mnt-safe-haven: "12288"
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+
+      # The probes never read this — only the Discord commands load the token —
+      # but configuration is parsed and validated before any subcommand runs.
+      - name: Write a probe configuration with no credentials
+        run: |
+          cat > probe-config.toml <<'TOML'
+          [discord]
+          token_file = "/dev/null"
+          TOML
+
+      - name: Run the probes against YouTube
+        id: probe
+        env:
+          AUXIDE_CONFIG: probe-config.toml
+          CARGO_TARGET_DIR: ${{ runner.temp }}/auxide-cargo-target
+        run: nix develop --command ./scripts/source-check.sh
+
+      # One open issue at a time. A daily job that filed a new one every morning
+      # would bury the first report, which is the one with the useful timestamp.
+      - name: Report drift, if nothing already has
+        if: failure() && steps.probe.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing="$(gh issue list --state open --label source-drift --limit 1 --json number --jq 'length')"
+          if [[ "${existing}" != "0" ]]; then
+            echo "A source-drift issue is already open; not filing another."
+            exit 0
+          fi
+          gh issue create \
+            --title "YouTube extraction has drifted" \
+            --label source-drift \
+            --body "The daily probes stopped answering, so something about YouTube extraction has moved.
+
+          This is expected to happen periodically and independently of anything in this repository — ADR 0001 says so. The usual cause is that yt-dlp needs updating, or that the fields \`ENTRY_TEMPLATE\` names have changed shape.
+
+          Run: ${RUN_URL}
+
+          Reproduce locally with \`nix develop --command ./scripts/source-check.sh\`.
+
+          Close this once the probes pass again; the workflow will file a fresh one if it happens later."

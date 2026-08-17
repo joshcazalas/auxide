@@ -9,16 +9,17 @@ use anyhow::{Context as _, Result, bail};
 use rand::random;
 use secrecy::ExposeSecret;
 use serenity::{
-    Client, async_trait,
+    async_trait,
     builder::{
         CreateActionRow, CreateAllowedMentions, CreateAutocompleteResponse, CreateButton,
         CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
         CreateInteractionResponse, CreateInteractionResponseFollowup,
         CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse,
     },
+    client::ClientBuilder,
     client::{Context, EventHandler},
     gateway::{ConnectionStage, ShardStageUpdateEvent},
-    http::Http,
+    http::{Http, HttpBuilder},
     model::application::{
         Command, CommandDataOptionValue, CommandInteraction, CommandOptionType,
         ComponentInteraction, Interaction,
@@ -46,7 +47,7 @@ use crate::{
         RepeatMode, ShuffleChange, spawn_guild_player,
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
-    voice::{SongbirdGateway, TrackEnded, VoiceGateway},
+    voice::{SongbirdVoice, TrackEnded, VoiceGateway, VoiceGatewayFactory},
 };
 
 const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
@@ -150,6 +151,32 @@ fn ensure_installation_is_a_boundary(config: &Config, bot_public: bool) -> Resul
 ///
 /// Returns an error when startup fails or the Discord client exits unexpectedly.
 pub async fn run(config: Config) -> Result<()> {
+    run_with(config, Overrides::default()).await
+}
+
+/// What `run` reaches outside this process, and a way to replace it.
+///
+/// Every field is empty in production. A test fills them to run the real
+/// runtime — the real gateway handling, the real command dispatch, the real
+/// interaction lifecycle — against a Discord that does not exist, a source that
+/// answers from memory, and a voice channel that only records what it was told.
+#[derive(Default)]
+pub struct Overrides {
+    pub source: Option<Arc<dyn SourceResolver>>,
+    pub voice: Option<Arc<dyn VoiceGatewayFactory>>,
+    /// Where Discord's HTTP API lives, when it is not Discord.
+    ///
+    /// Serenity asks this for the gateway address too, so redirecting it is
+    /// enough to redirect the websocket as well.
+    pub api_base: Option<String>,
+}
+
+/// Runs the bot with some of what it reaches outside this process replaced.
+///
+/// # Errors
+///
+/// Returns whatever [`run`] would, since this is the body of it.
+pub async fn run_with(config: Config, overrides: Overrides) -> Result<()> {
     let config = Arc::new(config);
     let token = config
         .load_discord_token()
@@ -157,7 +184,7 @@ pub async fn run(config: Config) -> Result<()> {
 
     // Check before opening a listener or a gateway, so an application that
     // anyone could add never reaches the point of accepting commands.
-    let application = Http::new(token.expose_secret())
+    let application = build_http(token.expose_secret(), overrides.api_base.as_deref())
         .get_current_application_info()
         .await
         .context("failed to identify the Discord application behind this token")?;
@@ -182,22 +209,39 @@ pub async fn run(config: Config) -> Result<()> {
     tracing::info!(address = %observability_server.local_address, "observability listener ready");
 
     let voice = Songbird::serenity();
+    let resolver = overrides.source.unwrap_or_else(|| {
+        Arc::new(YouTubeResolver::new(
+            config.youtube.clone(),
+            &config.playback,
+        ))
+    });
+    let voice_factory = match overrides.voice {
+        Some(factory) => factory,
+        None => Arc::new(SongbirdVoice::new(
+            Arc::clone(&voice),
+            AudioPipeline::new(Arc::clone(&resolver), config.playback.output_volume)?,
+        )),
+    };
     let runtime = Arc::new(BotRuntime::new(
         Arc::clone(&config),
-        Arc::clone(&voice),
+        resolver,
+        voice_factory,
         observability.clone(),
         cancellation.child_token(),
-    )?);
+    ));
     let handler = DiscordHandler {
         runtime: Arc::clone(&runtime),
     };
     let intents = serenity::model::gateway::GatewayIntents::GUILDS
         | serenity::model::gateway::GatewayIntents::GUILD_VOICE_STATES;
-    let mut client = Client::builder(token.expose_secret(), intents)
-        .event_handler(handler)
-        .register_songbird_with(Arc::clone(&voice))
-        .await
-        .context("failed to construct the Discord client")?;
+    let mut client = ClientBuilder::new_with_http(
+        build_http(token.expose_secret(), overrides.api_base.as_deref()),
+        intents,
+    )
+    .event_handler(handler)
+    .register_songbird_with(Arc::clone(&voice))
+    .await
+    .context("failed to construct the Discord client")?;
     let shard_manager = Arc::clone(&client.shard_manager);
     let mut client_task = tokio::spawn(async move { client.start().await });
 
@@ -240,6 +284,18 @@ async fn wait_observability(server: ObservabilityServer) -> Result<()> {
         .await
         .context("observability server did not stop within five seconds")??;
     Ok(())
+}
+
+/// Builds an HTTP client, optionally pointed somewhere other than Discord.
+///
+/// The rate limiter goes off with a redirected base, because it is Discord's
+/// budget it is tracking and a local stand-in has none.
+fn build_http(token: &str, api_base: Option<&str>) -> Http {
+    let mut builder = HttpBuilder::new(token);
+    if let Some(base) = api_base {
+        builder = builder.proxy(base).ratelimiter_disabled(true);
+    }
+    builder.build()
 }
 
 fn command_definitions() -> Vec<CreateCommand> {
@@ -362,8 +418,8 @@ impl EventHandler for DiscordHandler {
 
 struct BotRuntime {
     config: Arc<Config>,
-    resolver: Arc<YouTubeResolver>,
-    pipeline: AudioPipeline,
+    resolver: Arc<dyn SourceResolver>,
+    voice_factory: Arc<dyn VoiceGatewayFactory>,
     /// Guild players, created when a server first uses Auxide.
     ///
     /// These used to be built up front from the configured guild list. Without
@@ -373,7 +429,6 @@ struct BotRuntime {
     sessions: Mutex<HashMap<u64, GuildSession>>,
     pending_searches: Mutex<HashMap<Uuid, PendingSearch>>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
-    voice: Arc<Songbird>,
     observability: ObservabilityState,
     cancellation: CancellationToken,
 }
@@ -534,29 +589,22 @@ impl InteractionReply {
 impl BotRuntime {
     fn new(
         config: Arc<Config>,
-        voice: Arc<Songbird>,
+        resolver: Arc<dyn SourceResolver>,
+        voice_factory: Arc<dyn VoiceGatewayFactory>,
         observability: ObservabilityState,
         cancellation: CancellationToken,
-    ) -> Result<Self> {
-        let resolver = Arc::new(YouTubeResolver::new(
-            config.youtube.clone(),
-            &config.playback,
-        ));
-        let source: Arc<dyn SourceResolver> = resolver.clone();
-        let pipeline = AudioPipeline::new(source, config.playback.output_volume)?;
+    ) -> Self {
         observability.set_guild_players(0);
-
-        Ok(Self {
+        Self {
             config,
             resolver,
-            pipeline,
+            voice_factory,
             sessions: Mutex::new(HashMap::new()),
             pending_searches: Mutex::new(HashMap::new()),
             tasks: Mutex::new(Vec::new()),
-            voice,
             observability,
             cancellation,
-        })
+        }
     }
 
     /// Returns this server's player, creating it on first use.
@@ -587,11 +635,7 @@ impl BotRuntime {
             guild_id,
             player.clone(),
             transitions,
-            Arc::new(SongbirdGateway::new(
-                Arc::clone(&self.voice),
-                self.pipeline.clone(),
-                guild_id,
-            )),
+            self.voice_factory.create(guild_id),
             self.announcer(http),
             self.observability.clone(),
             self.cancellation.child_token(),
@@ -1398,11 +1442,6 @@ impl BotRuntime {
                 tracing::debug!(%error, guild_id = session.player.guild_id(), "guild actor already stopped");
             }
         }
-        for guild_id in sessions.keys().copied() {
-            if let Err(error) = self.voice.remove(GuildId::new(guild_id)).await {
-                tracing::debug!(%error, guild_id, "voice session was already absent during shutdown");
-            }
-        }
         self.cancellation.cancel();
         let mut tasks = self.tasks.lock().await;
         let draining = std::mem::take(&mut *tasks);
@@ -1659,11 +1698,11 @@ fn abandoned_channel(occupants: &[VoiceOccupant], bot_user_id: u64) -> Option<u6
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn playback_worker<V: VoiceGateway>(
+async fn playback_worker(
     guild_id: u64,
     player: GuildPlayerHandle,
     mut transitions: mpsc::Receiver<PlayerTransition>,
-    voice: Arc<V>,
+    voice: Arc<dyn VoiceGateway>,
     announcer: Announcer,
     observability: ObservabilityState,
     cancellation: CancellationToken,
@@ -1751,12 +1790,12 @@ enum StartTrackOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start_track<V: VoiceGateway>(
+async fn start_track(
     guild_id: u64,
     channel_id: u64,
     player: &GuildPlayerHandle,
     transitions: &mut mpsc::Receiver<PlayerTransition>,
-    voice: &V,
+    voice: &dyn VoiceGateway,
     announcer: &Announcer,
     observability: &ObservabilityState,
     cancellation: &CancellationToken,
