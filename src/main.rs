@@ -82,12 +82,15 @@ async fn main() -> Result<()> {
     let config = Config::load(&cli.config)
         .with_context(|| format!("failed to load {}", cli.config.display()))?;
     init_logging(&config.observability)?;
+    // Before anything else does anything, so a journal always opens with what
+    // the process is actually working from.
+    config.log_effective();
 
     match cli.command {
         Command::Run => run(config).await?,
         Command::RegisterCommands { guild_id } => register_commands(&config, guild_id).await?,
         Command::CheckConfig => {
-            tracing::info!(path = %cli.config.display(), "configuration is valid");
+            tracing::info!("configuration is valid");
         }
         Command::YouTubeInspect { url } => {
             let resolver = YouTubeResolver::new(config.youtube.clone(), &config.playback);
