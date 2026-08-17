@@ -11,4 +11,5 @@ pub mod player;
 pub mod process;
 pub mod source;
 pub mod spike;
+pub mod suggest;
 pub mod voice;

@@ -47,6 +47,7 @@ use crate::{
         RepeatMode, ShuffleChange, SkipVerdict, spawn_guild_player,
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
+    suggest::Suggestions,
     voice::{SeekTo, SongbirdVoice, TrackEnded, VoiceGateway, VoiceGatewayFactory},
 };
 
@@ -323,6 +324,7 @@ fn playing_commands() -> Vec<CreateCommand> {
                     "YouTube URL or search terms",
                 )
                 .required(true)
+                .set_autocomplete(true)
                 .min_length(1)
                 .max_length(200),
             ),
@@ -514,6 +516,7 @@ impl EventHandler for DiscordHandler {
 struct BotRuntime {
     config: Arc<Config>,
     resolver: Arc<dyn SourceResolver>,
+    suggestions: Suggestions,
     voice_factory: Arc<dyn VoiceGatewayFactory>,
     /// Guild players, created when a server first uses Auxide.
     ///
@@ -707,6 +710,7 @@ impl BotRuntime {
         observability.set_guild_players(0);
         Self {
             config,
+            suggestions: Suggestions::new(Arc::clone(&resolver)),
             resolver,
             voice_factory,
             sessions: Mutex::new(HashMap::new()),
@@ -763,6 +767,34 @@ impl BotRuntime {
             .set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
         tracing::info!(guild_id, servers = sessions.len(), "started a guild player");
         Ok(session)
+    }
+
+    /// Offers what has already been searched for, and never waits.
+    ///
+    /// Deliberately unauthorized: a suggestion reveals only what `YouTube`
+    /// would return for words the person typed themselves, changes nothing, and
+    /// costs nothing beyond a cache lookup. Refusing here would mean answering
+    /// a keystroke with a permission check.
+    async fn suggest(&self, ctx: &Context, autocomplete: &CommandInteraction) {
+        let choices = match autocomplete
+            .data
+            .autocomplete()
+            .filter(|option| option.name == "query")
+        {
+            Some(option) => self.suggestions.for_query(option.value).await,
+            None => Vec::new(),
+        };
+        let mut response = CreateAutocompleteResponse::new();
+        for (name, value) in choices {
+            response = response.add_string_choice(name, value);
+        }
+        let answered = autocomplete
+            .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
+            .await;
+        self.observability.record_interaction(answered.is_ok());
+        if let Err(error) = answered {
+            tracing::warn!(%error, "failed to answer an autocomplete interaction");
+        }
     }
 
     fn announcer(&self, http: &Arc<Http>) -> Announcer {
@@ -826,16 +858,7 @@ impl BotRuntime {
             Interaction::Command(command) => self.handle_command(ctx, &command).await,
             Interaction::Component(component) => self.handle_component(ctx, &component).await,
             Interaction::Autocomplete(autocomplete) => {
-                let result = autocomplete
-                    .create_response(
-                        &ctx.http,
-                        CreateInteractionResponse::Autocomplete(CreateAutocompleteResponse::new()),
-                    )
-                    .await;
-                self.observability.record_interaction(result.is_ok());
-                if let Err(error) = result {
-                    tracing::warn!(%error, "failed to acknowledge autocomplete interaction");
-                }
+                self.suggest(ctx, &autocomplete).await;
             }
             Interaction::Ping(ping) => {
                 let result = ctx

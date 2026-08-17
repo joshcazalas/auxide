@@ -202,5 +202,8 @@ concurrently, and run every control command. Acceptance requires:
     which is the boundary the container could resume from rather than the exact instant asked
     for, and a source whose origin will not serve ranges refuses them rather than failing
     silently; and
-14. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+14. typing into `/play` offers suggestions without ever making a keystroke wait, choosing one
+    queues it as a link rather than a fresh search, and a burst of typing never leaves a track
+    waiting behind it; and
+15. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.
