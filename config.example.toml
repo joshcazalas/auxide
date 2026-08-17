@@ -27,7 +27,11 @@ max_guilds = 50
 # authorized_user_ids = []
 
 [playback]
-idle_timeout_seconds = 600
+# How long Auxide waits in a voice channel after its queue runs dry. Every track
+# that starts playing resets it, so only a channel nobody queues anything in
+# reaches the disconnect. Leaving the channel empty of people ends the session
+# straight away regardless of this.
+idle_timeout_seconds = 900
 max_track_duration_seconds = 14400
 max_queue_length = 100
 actor_mailbox_capacity = 128

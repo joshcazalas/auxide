@@ -56,6 +56,12 @@ pub enum PlaybackDirective {
     None,
     Play(QueueItem),
     Replace(QueueItem),
+    /// Stop what is playing but stay in the voice channel.
+    ///
+    /// Emptying the queue is not a reason to leave. Auxide holds the channel
+    /// until the idle timer expires, so the next request joins an already
+    /// connected bot instead of waiting through another handshake.
+    Stop,
     StopAndDisconnect,
     Disconnect,
 }
@@ -64,6 +70,18 @@ pub enum PlaybackDirective {
 pub struct PlayerTransition {
     pub directive: PlaybackDirective,
     pub snapshot: PlayerSnapshot,
+}
+
+/// The result of a [`GuildPlayerHandle::skip`], carrying what was interrupted.
+///
+/// The transition alone describes only what plays next, and announcing a skip
+/// means naming the track that was cut short, which is gone from the snapshot by
+/// the time the caller sees it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SkipOutcome {
+    /// The track that was playing, or `None` when nothing was.
+    pub skipped: Option<QueueItem>,
+    pub transition: PlayerTransition,
 }
 
 #[derive(Clone, Debug)]
@@ -99,10 +117,13 @@ impl GuildPlayerHandle {
 
     /// Removes the current item and advances atomically to the next item, if any.
     ///
+    /// Skipping the last track stops playback and starts the idle timer rather
+    /// than disconnecting, so the queue can be refilled without rejoining.
+    ///
     /// # Errors
     ///
     /// Returns an error if the actor has stopped.
-    pub async fn skip(&self) -> Result<PlayerTransition, PlayerError> {
+    pub async fn skip(&self) -> Result<SkipOutcome, PlayerError> {
         self.request(|reply| PlayerCommand::Skip { reply }).await
     }
 
@@ -222,7 +243,7 @@ enum PlayerCommand {
         reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
     },
     Skip {
-        reply: oneshot::Sender<PlayerTransition>,
+        reply: oneshot::Sender<SkipOutcome>,
     },
     Stop {
         reply: oneshot::Sender<PlayerTransition>,
@@ -290,9 +311,9 @@ impl GuildPlayer {
                     let _ = reply.send(result);
                 }
                 PlayerCommand::Skip { reply } => {
-                    let transition = self.skip();
-                    self.emit(transition.clone()).await;
-                    let _ = reply.send(transition);
+                    let outcome = self.skip();
+                    self.emit(outcome.transition.clone()).await;
+                    let _ = reply.send(outcome);
                 }
                 PlayerCommand::Stop { reply } => {
                     let transition = self.stop();
@@ -358,26 +379,24 @@ impl GuildPlayer {
         }
     }
 
-    fn skip(&mut self) -> PlayerTransition {
-        if self.current.is_none() {
-            let was_connected = self.voice_channel_id.take().is_some();
-            self.idle_deadline = None;
-            return self.transition(if was_connected {
-                PlaybackDirective::Disconnect
-            } else {
-                PlaybackDirective::None
-            });
+    fn skip(&mut self) -> SkipOutcome {
+        let Some(skipped) = self.current.take() else {
+            // Nothing was playing, so there is nothing to skip and no reason to
+            // give up the channel. Any idle countdown already under way keeps
+            // running, because a command that changed nothing should not
+            // shorten or extend the hold.
+            return SkipOutcome {
+                skipped: None,
+                transition: self.transition(PlaybackDirective::None),
+            };
+        };
+        let directive = self
+            .advance()
+            .map_or(PlaybackDirective::Stop, PlaybackDirective::Replace);
+        SkipOutcome {
+            skipped: Some(skipped),
+            transition: self.transition(directive),
         }
-        self.current = self.pending.pop_front();
-        self.idle_deadline = None;
-        let directive = self.current.clone().map_or(
-            PlaybackDirective::StopAndDisconnect,
-            PlaybackDirective::Replace,
-        );
-        if self.current.is_none() {
-            self.voice_channel_id = None;
-        }
-        self.transition(directive)
     }
 
     fn stop(&mut self) -> PlayerTransition {
@@ -398,14 +417,25 @@ impl GuildPlayer {
         if self.current.as_ref().map(|item| item.queue_id) != Some(queue_id) {
             return self.transition(PlaybackDirective::None);
         }
-        self.current = self.pending.pop_front();
-        let directive = if let Some(item) = self.current.clone() {
-            PlaybackDirective::Play(item)
-        } else {
-            self.idle_deadline = Some(Instant::now() + self.idle_timeout);
-            PlaybackDirective::None
-        };
+        let directive = self
+            .advance()
+            .map_or(PlaybackDirective::Stop, PlaybackDirective::Play);
         self.transition(directive)
+    }
+
+    /// Takes the next queued item, or starts the idle countdown when none is left.
+    ///
+    /// Running out of tracks is not a reason to leave: the channel is held for
+    /// the whole idle timeout, and each track that begins playing cancels the
+    /// countdown, so a queue kept fed never reaches it.
+    fn advance(&mut self) -> Option<QueueItem> {
+        self.current = self.pending.pop_front();
+        self.idle_deadline = if self.current.is_some() {
+            None
+        } else {
+            Some(Instant::now() + self.idle_timeout)
+        };
+        self.current.clone()
     }
 
     fn transition(&self, directive: PlaybackDirective) -> PlayerTransition {
@@ -521,8 +551,10 @@ mod tests {
         player.enqueue(first.clone(), 10).await.unwrap();
         player.enqueue(second.clone(), 10).await.unwrap();
 
+        let skipped = player.skip().await.unwrap();
+        assert_eq!(skipped.skipped, Some(first.clone()));
         assert_eq!(
-            player.skip().await.unwrap().directive,
+            skipped.transition.directive,
             PlaybackDirective::Replace(second.clone())
         );
         let stale = player.track_finished(first.queue_id).await.unwrap();
@@ -571,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnects_only_after_the_idle_deadline() {
+    async fn an_exhausted_queue_holds_the_channel_until_the_idle_deadline() {
         let (player, mut transitions, task) =
             spawn_guild_player(7, 2, 8, 1, Duration::from_millis(20));
         let first = item(1);
@@ -582,7 +614,10 @@ mod tests {
         ));
 
         let completed = player.track_finished(first.queue_id).await.unwrap();
-        assert_eq!(completed.directive, PlaybackDirective::None);
+        assert_eq!(completed.directive, PlaybackDirective::Stop);
+        assert_eq!(completed.snapshot.voice_channel_id, Some(10));
+        assert_eq!(transitions.recv().await.unwrap(), completed);
+
         let idle = time::timeout(Duration::from_secs(1), transitions.recv())
             .await
             .unwrap()
@@ -595,7 +630,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_disconnects_an_idle_voice_session() {
+    async fn every_played_track_restarts_the_idle_countdown() {
+        let idle_timeout = Duration::from_millis(200);
+        let (player, mut transitions, task) = spawn_guild_player(7, 3, 8, 1, idle_timeout);
+        let first = item(1);
+        player.enqueue(first.clone(), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.track_finished(first.queue_id).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        // Queueing inside the idle window has to cancel the pending disconnect
+        // rather than leave it armed, or the channel would drop mid-track.
+        let second = item(2);
+        player.enqueue(second.clone(), 10).await.unwrap();
+        assert!(matches!(
+            transitions.recv().await.unwrap().directive,
+            PlaybackDirective::Play(_)
+        ));
+        assert!(
+            time::timeout(idle_timeout * 2, transitions.recv())
+                .await
+                .is_err(),
+            "the disconnect armed by the first track survived the second"
+        );
+
+        player.track_finished(second.queue_id).await.unwrap();
+        assert_eq!(
+            transitions.recv().await.unwrap().directive,
+            PlaybackDirective::Stop
+        );
+        let idle = time::timeout(Duration::from_secs(1), transitions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(idle.directive, PlaybackDirective::Disconnect);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skipping_the_last_track_holds_the_channel() {
         let (player, mut transitions, task) =
             spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30));
         let current = item(1);
@@ -604,12 +679,31 @@ mod tests {
             transitions.recv().await.unwrap().directive,
             PlaybackDirective::Play(_)
         ));
-        player.track_finished(current.queue_id).await.unwrap();
 
-        let skipped = player.skip().await.unwrap();
-        assert_eq!(skipped.directive, PlaybackDirective::Disconnect);
-        assert_eq!(transitions.recv().await.unwrap(), skipped);
-        assert!(skipped.snapshot.voice_channel_id.is_none());
+        let outcome = player.skip().await.unwrap();
+        assert_eq!(outcome.skipped, Some(current));
+        assert_eq!(outcome.transition.directive, PlaybackDirective::Stop);
+        assert_eq!(outcome.transition.snapshot.voice_channel_id, Some(10));
+        assert_eq!(transitions.recv().await.unwrap(), outcome.transition);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skipping_an_idle_session_changes_nothing() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30));
+        let current = item(1);
+        player.enqueue(current.clone(), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.track_finished(current.queue_id).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        let outcome = player.skip().await.unwrap();
+        assert_eq!(outcome.skipped, None);
+        assert_eq!(outcome.transition.directive, PlaybackDirective::None);
+        assert_eq!(outcome.transition.snapshot.voice_channel_id, Some(10));
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

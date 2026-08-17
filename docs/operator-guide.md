@@ -140,9 +140,10 @@ curl --fail http://127.0.0.1:9090/health/ready
 curl --fail http://127.0.0.1:9090/metrics
 ```
 
-## 5. Deferred private-guild acceptance gate
+## 5. Private-guild acceptance gate
 
-When you are ready to test, first use a short known-good local audio file as a control:
+Run this against a private test server after any change to resolution, voice, or the session
+lifecycle. Start with a short known-good local audio file as a control:
 
 ```console
 auxide --config config.toml voice-spike \
@@ -164,9 +165,10 @@ concurrently, and run every control command. Acceptance requires:
 2. audio is continuous and no complete media or orphaned yt-dlp/FFmpeg process remains;
 3. queue order is deterministic, stale completion events do not skip replacements, and each
    interaction receives one response;
-4. natural completion idles before disconnect, while stop and an empty final skip disconnect
-   immediately; and
-5. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+4. what was queued, skipped, stopped, or shuffled is visible to the whole channel, while search
+   results and refusals reach only the person who asked;
+5. an emptied queue holds the voice channel for `playback.idle_timeout_seconds` and any track
+   queued inside that window cancels the pending disconnect, while `/stop` and the departure of
+   the last person in the voice channel disconnect immediately; and
+6. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.
-
-Do not remove the Go prototype until this gate passes.

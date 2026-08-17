@@ -13,7 +13,8 @@ use serenity::{
     builder::{
         CreateActionRow, CreateAllowedMentions, CreateAutocompleteResponse, CreateButton,
         CreateCommand, CreateCommandOption, CreateInteractionResponse,
-        CreateInteractionResponseMessage, EditInteractionResponse,
+        CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+        EditInteractionResponse,
     },
     client::{Context, EventHandler},
     gateway::{ConnectionStage, ShardStageUpdateEvent},
@@ -24,6 +25,7 @@ use serenity::{
     },
     model::gateway::Ready,
     model::id::{ChannelId, GuildId, UserId},
+    model::voice::VoiceState,
 };
 use songbird::{
     Event, EventContext, EventHandler as VoiceEventHandler, SerenityInit, Songbird, TrackEvent,
@@ -281,6 +283,16 @@ impl EventHandler for DiscordHandler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         self.runtime.handle_interaction(&ctx, interaction).await;
     }
+
+    async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
+        let Some(guild_id) = new
+            .guild_id
+            .or_else(|| old.as_ref().and_then(|old| old.guild_id))
+        else {
+            return;
+        };
+        self.runtime.handle_voice_state_update(&ctx, guild_id).await;
+    }
 }
 
 struct BotRuntime {
@@ -316,10 +328,30 @@ struct PendingSearch {
     tracks: Vec<TrackMetadata>,
 }
 
+/// Who a command's answer is for.
+///
+/// Auxide is driven by a room, not by one person: what somebody queued or
+/// skipped is the room's business, while their half-finished search and the
+/// reason a command was refused are not. This is fixed before the interaction is
+/// acknowledged because Discord decides an interaction's audience when it is
+/// first answered and will not revisit it afterwards.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Audience {
+    /// Visible to the whole text channel.
+    Channel,
+    /// Visible only to the person who ran the command.
+    Requester,
+}
+
 #[derive(Debug)]
 struct InteractionReply {
     content: String,
     components: Vec<CreateActionRow>,
+    /// A second, channel-visible message to post alongside a private answer.
+    ///
+    /// A search picker has to stay private while the choice made with it does
+    /// not, and one interaction cannot answer twice with different audiences.
+    announcement: Option<String>,
 }
 
 impl InteractionReply {
@@ -327,7 +359,13 @@ impl InteractionReply {
         Self {
             content: bounded_message(content.into()),
             components: Vec::new(),
+            announcement: None,
         }
+    }
+
+    fn announcing(mut self, announcement: impl Into<String>) -> Self {
+        self.announcement = Some(bounded_message(announcement.into()));
+        self
     }
 }
 
@@ -405,6 +443,38 @@ impl BotRuntime {
         Ok(session)
     }
 
+    /// Returns a server's player only if it already has one.
+    ///
+    /// Voice traffic arrives for every server Auxide sits in, including ones
+    /// that have never issued a command, so this deliberately cannot create a
+    /// player the way [`BotRuntime::session`] does.
+    async fn existing_session(&self, guild_id: u64) -> Option<GuildSession> {
+        self.sessions.lock().await.get(&guild_id).cloned()
+    }
+
+    /// Ends the session once the last person leaves the channel Auxide is in.
+    ///
+    /// Playing to an empty channel holds a voice connection and burns bandwidth
+    /// for an audience of nobody, and the idle timer never fires while a track
+    /// is still running, so nothing else would end it.
+    async fn handle_voice_state_update(&self, ctx: &Context, guild_id: GuildId) {
+        let Some(session) = self.existing_session(guild_id.get()).await else {
+            return;
+        };
+        let Some(channel_id) = abandoned_voice_channel(ctx, guild_id) else {
+            return;
+        };
+
+        tracing::info!(
+            guild_id = guild_id.get(),
+            channel_id = channel_id.get(),
+            "left an empty voice channel"
+        );
+        if let Err(error) = session.player.stop().await {
+            tracing::debug!(%error, guild_id = guild_id.get(), "guild player already stopped");
+        }
+    }
+
     async fn handle_interaction(&self, ctx: &Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(command) => self.handle_command(ctx, &command).await,
@@ -455,27 +525,72 @@ impl BotRuntime {
     }
 
     async fn handle_command(&self, ctx: &Context, command: &CommandInteraction) {
-        if let Err(error) = command.defer_ephemeral(&ctx.http).await {
+        let audience = command_audience(command);
+        let deferred = match audience {
+            Audience::Channel => command.defer(&ctx.http).await,
+            Audience::Requester => command.defer_ephemeral(&ctx.http).await,
+        };
+        if let Err(error) = deferred {
             self.observability.record_interaction(false);
             tracing::warn!(%error, command = %command.data.name, "failed to defer interaction");
             return;
         }
 
-        let result = self.dispatch_command(ctx, command).await;
-        let succeeded = result.is_ok();
-        let reply = result.unwrap_or_else(|error| {
-            tracing::warn!(%error, command = %command.data.name, "command failed");
-            InteractionReply::message(format!("Unable to complete that command: {error}"))
-        });
+        let reply = match self.dispatch_command(ctx, command).await {
+            Ok(reply) => reply,
+            Err(error) => {
+                tracing::warn!(%error, command = %command.data.name, "command failed");
+                self.refuse_command(ctx, command, audience, &error).await;
+                return;
+            }
+        };
         let edit = EditInteractionResponse::new()
             .content(reply.content)
             .components(reply.components)
             .allowed_mentions(no_mentions());
         let response = command.edit_response(&ctx.http, edit).await;
-        self.observability
-            .record_interaction(succeeded && response.is_ok());
+        self.observability.record_interaction(response.is_ok());
         if let Err(error) = response {
             tracing::warn!(%error, command = %command.data.name, "failed to edit interaction response");
+        }
+    }
+
+    /// Answers a failed command privately, whoever its success would have been for.
+    ///
+    /// Refusals name missing authorization and absent voice channels, which is
+    /// the requester's business alone. A command whose answer was going to be
+    /// public has already been acknowledged in the channel, so the placeholder
+    /// Discord is showing there has to be withdrawn before answering again.
+    async fn refuse_command(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        audience: Audience,
+        error: &anyhow::Error,
+    ) {
+        let content = format!("Unable to complete that command: {error}");
+        let response = if audience == Audience::Channel {
+            if let Err(error) = command.delete_response(&ctx.http).await {
+                tracing::warn!(%error, command = %command.data.name, "failed to withdraw the public placeholder");
+            }
+            command
+                .create_followup(&ctx.http, followup_message(content).ephemeral(true))
+                .await
+                .map(|_| ())
+        } else {
+            command
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new()
+                        .content(bounded_message(content))
+                        .allowed_mentions(no_mentions()),
+                )
+                .await
+                .map(|_| ())
+        };
+        self.observability.record_interaction(false);
+        if let Err(error) = response {
+            tracing::warn!(%error, command = %command.data.name, "failed to report a refused command");
         }
     }
 
@@ -592,24 +707,16 @@ impl BotRuntime {
         let voice_channel_id = authorization
             .voice_channel_id
             .context("join a voice channel before using /play")?;
-        let query = command
-            .data
-            .options
-            .iter()
-            .find(|option| option.name == "query")
-            .and_then(|option| match &option.value {
-                CommandDataOptionValue::String(value) => Some(value.as_str()),
-                _ => None,
-            })
-            .context("the required query option was missing")?;
+        let query = query_option(command).context("the required query option was missing")?;
 
         if let Ok(url) = Url::parse(query) {
             let result = self.resolver.inspect(&url).await;
             self.observability.record_source_resolution(result.is_ok());
             let track = result?;
             return self
-                .enqueue_track(authorization, voice_channel_id, track)
-                .await;
+                .enqueue_track(&authorization, voice_channel_id, track)
+                .await
+                .map(InteractionReply::message);
         }
 
         let result = self.resolver.search(query).await;
@@ -662,15 +769,21 @@ impl BotRuntime {
         Ok(InteractionReply {
             content: bounded_message(content),
             components: vec![CreateActionRow::Buttons(buttons)],
+            announcement: None,
         })
     }
 
+    /// Adds a track and describes the result for the whole channel.
+    ///
+    /// Both callers announce the same thing, because a URL played outright and a
+    /// search result chosen from a picker are the same event to everyone else in
+    /// the room.
     async fn enqueue_track(
         &self,
-        authorization: Authorization,
+        authorization: &Authorization,
         voice_channel_id: u64,
         track: TrackMetadata,
-    ) -> Result<InteractionReply> {
+    ) -> Result<String> {
         let item = QueueItem::new(
             track.clone(),
             authorization.user_id,
@@ -682,16 +795,23 @@ impl BotRuntime {
             .player
             .enqueue(item, voice_channel_id)
             .await?;
+        let requester = mention(authorization.user_id);
+        let title = single_line(&track.title, 150);
+        let duration = format_duration(track.duration);
+        if matches!(transition.directive, PlaybackDirective::Play(_)) {
+            return Ok(format!(
+                "{requester} started playing **{title}** ({duration})."
+            ));
+        }
         let position = transition
             .snapshot
             .pending
             .iter()
             .position(|queued| queued.queue_id == queue_id)
             .map_or(1, |index| index + 2);
-        Ok(InteractionReply::message(format!(
-            "Queued **{}** at position {position}.",
-            single_line(&track.title, 150)
-        )))
+        Ok(format!(
+            "{requester} queued **{title}** ({duration}) at position {position}."
+        ))
     }
 
     async fn queue(&self, authorization: Authorization) -> Result<InteractionReply> {
@@ -717,25 +837,28 @@ impl BotRuntime {
 
     async fn skip(&self, ctx: &Context, authorization: Authorization) -> Result<InteractionReply> {
         self.require_same_voice(ctx, &authorization).await?;
-        let transition = authorization.session.player.skip().await?;
-        let content = transition.snapshot.current.as_ref().map_or_else(
-            || "Skipped the final track and disconnected.".to_owned(),
-            |item| {
-                format!(
-                    "Skipped. Next: **{}**.",
-                    single_line(&item.track.title, 150)
-                )
-            },
+        let outcome = authorization.session.player.skip().await?;
+        // Nothing changed, so this is the requester's mistake to hear about and
+        // not an event worth announcing to the channel.
+        let skipped = outcome.skipped.context("nothing is playing to skip")?;
+        let requester = mention(authorization.user_id);
+        let title = single_line(&skipped.track.title, 150);
+        let next = outcome.transition.snapshot.current.as_ref().map_or_else(
+            || format!("Nothing else is queued; leaving in {}.", self.idle_hold()),
+            |item| format!("Now playing **{}**.", single_line(&item.track.title, 150)),
         );
-        Ok(InteractionReply::message(content))
+        Ok(InteractionReply::message(format!(
+            "{requester} skipped **{title}**. {next}"
+        )))
     }
 
     async fn stop(&self, ctx: &Context, authorization: Authorization) -> Result<InteractionReply> {
         self.require_same_voice(ctx, &authorization).await?;
         authorization.session.player.stop().await?;
-        Ok(InteractionReply::message(
-            "Stopped playback, cleared the queue, and disconnected.",
-        ))
+        Ok(InteractionReply::message(format!(
+            "{} stopped playback, cleared the queue, and disconnected.",
+            mention(authorization.user_id)
+        )))
     }
 
     async fn shuffle(
@@ -746,9 +869,17 @@ impl BotRuntime {
         self.require_same_voice(ctx, &authorization).await?;
         let transition = authorization.session.player.shuffle().await?;
         Ok(InteractionReply::message(format!(
-            "Shuffled {} waiting track(s).",
+            "{} shuffled {} waiting track(s).",
+            mention(authorization.user_id),
             transition.snapshot.pending.len()
         )))
+    }
+
+    /// Describes how long an emptied queue keeps its voice channel.
+    fn idle_hold(&self) -> String {
+        format_hold(Duration::from_secs(
+            self.config.playback.idle_timeout_seconds,
+        ))
     }
 
     async fn require_same_voice(
@@ -776,6 +907,7 @@ impl BotRuntime {
             tracing::warn!(%error, custom_id = %component.data.custom_id, "component interaction failed");
             InteractionReply::message(format!("Unable to use that selection: {error}"))
         });
+        let announcement = reply.announcement;
         let response = component
             .create_response(
                 &ctx.http,
@@ -788,6 +920,18 @@ impl BotRuntime {
             .record_interaction(succeeded && response.is_ok());
         if let Err(error) = response {
             tracing::warn!(%error, "failed to acknowledge component interaction");
+        }
+
+        // The picker this replaced was private, so telling the channel what was
+        // chosen takes a second message. Losing it costs the announcement only;
+        // the track is already queued either way.
+        if let Some(announcement) = announcement {
+            if let Err(error) = component
+                .create_followup(&ctx.http, followup_message(announcement))
+                .await
+            {
+                tracing::warn!(%error, "failed to announce a search selection");
+            }
         }
     }
 
@@ -819,8 +963,14 @@ impl BotRuntime {
             .get(index)
             .cloned()
             .context("the selected result does not exist")?;
-        self.enqueue_track(authorization, pending.voice_channel_id, track)
-            .await
+        let title = single_line(&track.title, 150);
+        let announcement = self
+            .enqueue_track(&authorization, pending.voice_channel_id, track)
+            .await?;
+        Ok(
+            InteractionReply::message(format!("Sent **{title}** to the queue."))
+                .announcing(announcement),
+        )
     }
 
     async fn shutdown(&self) {
@@ -862,6 +1012,53 @@ struct Authorization {
     session: GuildSession,
 }
 
+/// Decides who a command's answer is for, before Discord is told anything.
+///
+/// Commands that change what the room hears are announced to the room. Ones that
+/// only look something up, and a search whose answer is a list of candidates
+/// nobody has chosen between yet, stay with the person who ran them.
+fn command_audience(command: &CommandInteraction) -> Audience {
+    audience_for(&command.data.name, query_option(command))
+}
+
+fn audience_for(command: &str, query: Option<&str>) -> Audience {
+    match command {
+        // A URL is played outright, so the answer is the track. Search terms
+        // are answered with candidates, and the choice announces itself once it
+        // is made.
+        "play" if query.is_some_and(|query| Url::parse(query).is_ok()) => Audience::Channel,
+        "skip" | "stop" | "shuffle" => Audience::Channel,
+        _ => Audience::Requester,
+    }
+}
+
+fn query_option(command: &CommandInteraction) -> Option<&str> {
+    command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == "query")
+        .and_then(|option| match &option.value {
+            CommandDataOptionValue::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+}
+
+/// Renders a requester as a mention, which [`no_mentions`] keeps from pinging.
+fn mention(user_id: u64) -> String {
+    format!("<@{user_id}>")
+}
+
+/// Renders an idle timeout the way someone waiting through it would say it.
+fn format_hold(hold: Duration) -> String {
+    let minutes = hold.as_secs() / 60;
+    match minutes {
+        0 => "under a minute".to_owned(),
+        1 => "1 minute".to_owned(),
+        _ => format!("{minutes} minutes"),
+    }
+}
+
 fn identity_is_authorized(guild: &GuildConfig, user_id: u64, role_ids: &[u64]) -> bool {
     if guild.authorized_user_ids.is_empty() && guild.authorized_role_ids.is_empty() {
         return true;
@@ -882,6 +1079,59 @@ fn requester_voice_channel(ctx: &Context, guild_id: u64, user_id: UserId) -> Opt
                 .and_then(|state| state.channel_id)
         })
         .map(ChannelId::get)
+}
+
+/// One occupant of a voice channel, reduced to what deciding to leave needs.
+///
+/// Reading the cache and judging it are separated so the judgement can be
+/// tested without standing up a gateway, a cache, and a guild.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VoiceOccupant {
+    user_id: u64,
+    channel_id: Option<u64>,
+    is_bot: bool,
+}
+
+/// Returns the voice channel Auxide should leave because nobody is left in it.
+///
+/// The cache is authoritative here rather than the player's own record of the
+/// channel, so an administrator dragging Auxide elsewhere moves the question to
+/// the channel it actually sits in. Returning `None` while a join is still in
+/// flight is what keeps that race from reading as an empty channel.
+fn abandoned_voice_channel(ctx: &Context, guild_id: GuildId) -> Option<ChannelId> {
+    let bot_user_id = ctx.cache.current_user().id.get();
+    let guild = ctx.cache.guild(guild_id)?;
+    let occupants = guild
+        .voice_states
+        .values()
+        .map(|state| VoiceOccupant {
+            user_id: state.user_id.get(),
+            channel_id: state.channel_id.map(ChannelId::get),
+            // A member reaches the cache with every voice state update, so this
+            // is known for everyone who has moved since startup. Anyone
+            // unaccounted for counts as a listener, which errs towards staying.
+            is_bot: guild
+                .members
+                .get(&state.user_id)
+                .or(state.member.as_ref())
+                .is_some_and(|member| member.user.bot),
+        })
+        .collect::<Vec<_>>();
+    abandoned_channel(&occupants, bot_user_id).map(ChannelId::new)
+}
+
+/// Returns the channel Auxide occupies when no listener is left in it.
+fn abandoned_channel(occupants: &[VoiceOccupant], bot_user_id: u64) -> Option<u64> {
+    let channel_id = occupants
+        .iter()
+        .find(|occupant| occupant.user_id == bot_user_id)
+        .and_then(|occupant| occupant.channel_id)?;
+    let listening = occupants.iter().any(|occupant| {
+        occupant.channel_id == Some(channel_id)
+            && occupant.user_id != bot_user_id
+            && !occupant.is_bot
+    });
+    (!listening).then_some(channel_id)
 }
 
 async fn playback_worker(
@@ -912,6 +1162,11 @@ async fn playback_worker(
 
         match transition.directive {
             PlaybackDirective::None => {}
+            PlaybackDirective::Stop => {
+                if let Some(handle) = active.take() {
+                    let _ = handle.stop();
+                }
+            }
             PlaybackDirective::StopAndDisconnect | PlaybackDirective::Disconnect => {
                 if let Some(handle) = active.take() {
                     let _ = handle.stop();
@@ -1186,6 +1441,16 @@ fn update_message(content: impl Into<String>) -> CreateInteractionResponseMessag
         .allowed_mentions(no_mentions())
 }
 
+/// Builds a follow-up message, which is channel-visible unless made ephemeral.
+///
+/// Follow-ups travel on the interaction's own token, so they reach the channel
+/// without Auxide holding permission to post there of its own accord.
+fn followup_message(content: impl Into<String>) -> CreateInteractionResponseFollowup {
+    CreateInteractionResponseFollowup::new()
+        .content(bounded_message(content.into()))
+        .allowed_mentions(no_mentions())
+}
+
 #[cfg(unix)]
 async fn shutdown_signal() -> &'static str {
     use tokio::signal::unix::{SignalKind, signal};
@@ -1278,6 +1543,69 @@ mod tests {
     fn formats_track_durations() {
         assert_eq!(format_duration(Duration::from_secs(65)), "1:05");
         assert_eq!(format_duration(Duration::from_secs(3_665)), "1:01:05");
+    }
+
+    #[test]
+    fn formats_the_idle_hold_in_whole_minutes() {
+        assert_eq!(format_hold(Duration::from_secs(900)), "15 minutes");
+        assert_eq!(format_hold(Duration::from_secs(60)), "1 minute");
+        assert_eq!(format_hold(Duration::from_secs(30)), "under a minute");
+    }
+
+    #[test]
+    fn only_the_room_facing_commands_answer_the_room() {
+        assert_eq!(
+            audience_for("play", Some("https://www.youtube.com/watch?v=id")),
+            Audience::Channel
+        );
+        // The picker has to stay private, or every search would paste five
+        // candidates into the channel and only one of them gets played.
+        assert_eq!(
+            audience_for("play", Some("artist and track")),
+            Audience::Requester
+        );
+        assert_eq!(audience_for("skip", None), Audience::Channel);
+        assert_eq!(audience_for("stop", None), Audience::Channel);
+        assert_eq!(audience_for("shuffle", None), Audience::Channel);
+        assert_eq!(audience_for("queue", None), Audience::Requester);
+        assert_eq!(audience_for("now-playing", None), Audience::Requester);
+    }
+
+    fn occupant(user_id: u64, channel_id: Option<u64>, is_bot: bool) -> VoiceOccupant {
+        VoiceOccupant {
+            user_id,
+            channel_id,
+            is_bot,
+        }
+    }
+
+    #[test]
+    fn a_channel_is_abandoned_once_its_last_listener_leaves() {
+        let bot = 1;
+        let alone = [occupant(bot, Some(10), true)];
+        assert_eq!(abandoned_channel(&alone, bot), Some(10));
+
+        let attended = [occupant(bot, Some(10), true), occupant(2, Some(10), false)];
+        assert_eq!(abandoned_channel(&attended, bot), None);
+
+        // Someone listening somewhere else in the same server is not listening
+        // here, and other music bots are not an audience either.
+        let elsewhere = [
+            occupant(bot, Some(10), true),
+            occupant(2, Some(11), false),
+            occupant(3, Some(10), true),
+        ];
+        assert_eq!(abandoned_channel(&elsewhere, bot), Some(10));
+    }
+
+    #[test]
+    fn a_disconnected_bot_has_no_channel_to_abandon() {
+        let bot = 1;
+        assert_eq!(abandoned_channel(&[], bot), None);
+        assert_eq!(
+            abandoned_channel(&[occupant(2, Some(10), false)], bot),
+            None
+        );
     }
 
     #[test]

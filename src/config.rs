@@ -84,6 +84,13 @@ pub struct GuildConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlaybackConfig {
+    /// How long Auxide holds a voice channel after its queue runs dry.
+    ///
+    /// An empty queue is a pause, not a departure: people talk between songs
+    /// and queue the next one a minute later, and rejoining costs another voice
+    /// handshake and another few seconds of silence. Every track that starts
+    /// playing cancels the countdown, so this is only ever reached by a channel
+    /// nobody has queued anything in.
     pub idle_timeout_seconds: u64,
     pub max_track_duration_seconds: u64,
     pub max_queue_length: usize,
@@ -105,7 +112,7 @@ pub struct PlaybackConfig {
 impl Default for PlaybackConfig {
     fn default() -> Self {
         Self {
-            idle_timeout_seconds: 10 * 60,
+            idle_timeout_seconds: 15 * 60,
             max_track_duration_seconds: 4 * 60 * 60,
             max_queue_length: 100,
             actor_mailbox_capacity: 128,
