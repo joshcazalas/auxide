@@ -43,8 +43,8 @@ use crate::{
     config::{Config, GuildConfig, MAX_VOLUME_PERCENT},
     observability::{ObservabilityServer, ObservabilityState, start_observability},
     player::{
-        GuildPlayerHandle, PlaybackDirective, PlayerSnapshot, PlayerTransition, QueueItem,
-        RepeatMode, ShuffleChange, SkipVerdict, spawn_guild_player,
+        GuildPlayerHandle, Hold, PlaybackDirective, PlayerSnapshot, PlayerTransition, QueueItem,
+        Release, RepeatMode, ShuffleChange, SkipVerdict, spawn_guild_player,
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
     suggest::Suggestions,
@@ -433,6 +433,9 @@ fn queue_commands() -> Vec<CreateCommand> {
                 )
                 .required(true),
             ),
+        CreateCommand::new("join")
+            .description("Come into your voice channel, and pick up any queue"),
+        CreateCommand::new("leave").description("Leave the voice channel, and keep the queue"),
         CreateCommand::new("stop").description("Clear the queue and disconnect"),
         CreateCommand::new("shuffle")
             .description("Play the queue in random order, or reorder it once")
@@ -822,33 +825,49 @@ impl BotRuntime {
         let Some(session) = self.existing_session(guild_id.get()).await else {
             return;
         };
-        let Some(channel_id) = abandoned_voice_channel(ctx, guild_id) else {
+        let Some(seen) = occupied_voice_channel(ctx, guild_id) else {
             return;
         };
 
-        tracing::info!(
-            guild_id = guild_id.get(),
-            channel_id = channel_id.get(),
-            "left an empty voice channel"
-        );
-        // Read the origin channel before stopping, because stopping is what
-        // ends the session that knows it.
+        if seen.listeners > 0 {
+            // Somebody walked back in. This lifts only a hold the room emptying
+            // put there, so a pause anybody asked for survives being alone.
+            match session.player.release(Release::OnlyAbandoned).await {
+                Ok(transition) if transition.directive == PlaybackDirective::Resume => {
+                    tracing::info!(guild_id = guild_id.get(), "somebody came back");
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Nobody is listening. Holding rather than stopping keeps a queue
+        // somebody spent an evening on through a trip to the kitchen, and the
+        // countdown it starts is what ends a room nobody comes back to.
         let origin = session
             .player
             .snapshot()
             .await
             .ok()
             .and_then(|snapshot| snapshot.text_channel_id);
-        if let Err(error) = session.player.stop().await {
-            tracing::debug!(%error, guild_id = guild_id.get(), "guild player already stopped");
+        if session.player.hold(Hold::Abandoned).await.is_err() {
+            // Nothing was playing to hold, so the countdown an emptied queue
+            // already started is what ends this.
+            return;
         }
+        tracing::info!(
+            guild_id = guild_id.get(),
+            channel_id = seen.channel_id,
+            "paused an empty voice channel"
+        );
         self.announcer(&ctx.http)
             .announce(
                 guild_id.get(),
                 origin,
-                Announcement::text(
-                    "Everyone left the voice channel, so I stopped playing and disconnected.",
-                ),
+                Announcement::text(format!(
+                    "Everyone left, so I have paused. I will carry on if somebody comes back, and leave in {} if nobody does.",
+                    idle_hold(&self.config)
+                )),
             )
             .await;
     }
@@ -985,6 +1004,8 @@ impl BotRuntime {
             "import" => self.import(ctx, command, authorization).await,
             "remove" => self.remove(ctx, command, authorization).await,
             "skip" => self.skip(ctx, command, authorization).await,
+            "join" => self.join(authorization).await,
+            "leave" => self.leave(ctx, authorization).await,
             "stop" => self.stop(ctx, authorization).await,
             "shuffle" => self.shuffle(ctx, command, authorization).await,
             "repeat" => self.repeat(ctx, command, authorization).await,
@@ -1521,11 +1542,12 @@ impl BotRuntime {
 
     async fn now_playing(&self, authorization: Authorization) -> Result<InteractionReply> {
         let snapshot = authorization.session.player.snapshot().await?;
+        let heading = playback_heading(snapshot.paused());
         let Some(item) = snapshot.current else {
             return Ok(InteractionReply::message("Nothing is playing."));
         };
         Ok(InteractionReply::from(Announcement::card(track_embed(
-            playback_heading(snapshot.paused),
+            heading,
             &item.track,
             item.requested_by,
             None,
@@ -1611,7 +1633,15 @@ impl BotRuntime {
         paused: bool,
     ) -> Result<InteractionReply> {
         self.require_same_voice(ctx, &authorization).await?;
-        let transition = authorization.session.player.set_paused(paused).await?;
+        let transition = if paused {
+            authorization.session.player.hold(Hold::Requested).await?
+        } else {
+            authorization
+                .session
+                .player
+                .release(Release::Anything)
+                .await?
+        };
         let title = transition.snapshot.current.as_ref().map_or_else(
             || "the current track".to_owned(),
             |item| format!("**{}**", single_line(&item.track.title, 150)),
@@ -1647,6 +1677,42 @@ impl BotRuntime {
             mention(authorization.user_id),
             transition.snapshot.volume_percent
         )))
+    }
+
+    /// Comes into the requester's channel, picking a parked queue back up.
+    async fn join(&self, authorization: Authorization) -> Result<InteractionReply> {
+        let voice_channel_id = authorization
+            .voice_channel_id
+            .context("join a voice channel first, so Auxide knows where to go")?;
+        let transition = authorization.session.player.join(voice_channel_id).await?;
+        let requester = mention(authorization.user_id);
+        Ok(InteractionReply::message(
+            transition.snapshot.current.as_ref().map_or_else(
+                || format!("{requester} brought Auxide in. Queue something with `/play`."),
+                |item| {
+                    format!(
+                        "{requester} brought Auxide back. Starting **{}** again.",
+                        single_line(&item.track.title, 150)
+                    )
+                },
+            ),
+        ))
+    }
+
+    /// Gives up the channel, and keeps the queue for coming back to.
+    async fn leave(&self, ctx: &Context, authorization: Authorization) -> Result<InteractionReply> {
+        self.require_same_voice(ctx, &authorization).await?;
+        let transition = authorization.session.player.park().await?;
+        let waiting = transition.snapshot.len();
+        let requester = mention(authorization.user_id);
+        Ok(InteractionReply::message(if waiting == 0 {
+            format!("{requester} sent Auxide away.")
+        } else {
+            format!(
+                "{requester} sent Auxide away. {waiting} track(s) are kept for {}; bring it back with `/join`.",
+                idle_hold(&self.config)
+            )
+        }))
     }
 
     async fn stop(&self, ctx: &Context, authorization: Authorization) -> Result<InteractionReply> {
@@ -1909,7 +1975,9 @@ fn audience_for(command: &str, argument: Option<&str>) -> Audience {
         // Queueing a whole file does; asking what already played, or saving it,
         // does not.
         "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" | "clear" | "remove"
-        | "import" | "seek" | "forward" | "rewind" | "restart" => Audience::Channel,
+        | "import" | "seek" | "forward" | "rewind" | "restart" | "join" | "leave" => {
+            Audience::Channel
+        }
         _ => Audience::Requester,
     }
 }
@@ -2143,13 +2211,13 @@ struct VoiceOccupant {
     is_bot: bool,
 }
 
-/// Returns the voice channel Auxide should leave because nobody is left in it.
+/// What Auxide's own voice channel looks like right now.
 ///
 /// The cache is authoritative here rather than the player's own record of the
 /// channel, so an administrator dragging Auxide elsewhere moves the question to
 /// the channel it actually sits in. Returning `None` while a join is still in
 /// flight is what keeps that race from reading as an empty channel.
-fn abandoned_voice_channel(ctx: &Context, guild_id: GuildId) -> Option<ChannelId> {
+fn occupied_voice_channel(ctx: &Context, guild_id: GuildId) -> Option<Occupancy> {
     let bot_user_id = ctx.cache.current_user().id.get();
     let guild = ctx.cache.guild(guild_id)?;
     let occupants = guild
@@ -2168,53 +2236,40 @@ fn abandoned_voice_channel(ctx: &Context, guild_id: GuildId) -> Option<ChannelId
                 .is_some_and(|member| member.user.bot),
         })
         .collect::<Vec<_>>();
-    abandoned_channel(&occupants, bot_user_id).map(ChannelId::new)
+    occupancy(&occupants, bot_user_id)
 }
 
 /// Counts the people who would hear a track being cut short.
-///
-/// The same scan the empty-channel disconnect uses, asking a different question
-/// of it: not whether anybody is left, but how many.
 fn listener_count(ctx: &Context, guild_id: GuildId) -> usize {
-    let bot_user_id = ctx.cache.current_user().id.get();
-    let Some(guild) = ctx.cache.guild(guild_id) else {
-        return 1;
-    };
-    let Some(channel_id) = guild
-        .voice_states
-        .get(&UserId::new(bot_user_id))
-        .and_then(|state| state.channel_id)
-    else {
-        return 1;
-    };
-    guild
-        .voice_states
-        .values()
-        .filter(|state| state.channel_id == Some(channel_id))
-        .filter(|state| state.user_id.get() != bot_user_id)
-        .filter(|state| {
-            !guild
-                .members
-                .get(&state.user_id)
-                .or(state.member.as_ref())
-                .is_some_and(|member| member.user.bot)
-        })
-        .count()
-        .max(1)
+    occupied_voice_channel(ctx, guild_id).map_or(1, |seen| seen.listeners.max(1))
 }
 
-/// Returns the channel Auxide occupies when no listener is left in it.
-fn abandoned_channel(occupants: &[VoiceOccupant], bot_user_id: u64) -> Option<u64> {
+/// Auxide's channel, and how many people are in it with it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Occupancy {
+    channel_id: u64,
+    /// People in it, not counting Auxide or any other bot.
+    listeners: usize,
+}
+
+/// Counts the people in whichever channel Auxide occupies.
+fn occupancy(occupants: &[VoiceOccupant], bot_user_id: u64) -> Option<Occupancy> {
     let channel_id = occupants
         .iter()
         .find(|occupant| occupant.user_id == bot_user_id)
         .and_then(|occupant| occupant.channel_id)?;
-    let listening = occupants.iter().any(|occupant| {
-        occupant.channel_id == Some(channel_id)
-            && occupant.user_id != bot_user_id
-            && !occupant.is_bot
-    });
-    (!listening).then_some(channel_id)
+    let listeners = occupants
+        .iter()
+        .filter(|occupant| {
+            occupant.channel_id == Some(channel_id)
+                && occupant.user_id != bot_user_id
+                && !occupant.is_bot
+        })
+        .count();
+    Some(Occupancy {
+        channel_id,
+        listeners,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2250,6 +2305,11 @@ async fn playback_worker(
         match transition.directive {
             PlaybackDirective::None => {}
             PlaybackDirective::Stop => voice.stop().await,
+            PlaybackDirective::Join(channel_id) => {
+                if let Err(error) = voice.join(channel_id).await {
+                    tracing::warn!(%error, guild_id, channel_id, "failed to take a voice channel");
+                }
+            }
             PlaybackDirective::Pause => voice.pause().await,
             PlaybackDirective::Resume => voice.resume().await,
             PlaybackDirective::SetVolume => voice.set_volume(volume).await,
@@ -2484,7 +2544,7 @@ fn format_queue(snapshot: &PlayerSnapshot, page: usize) -> Option<QueuePage> {
     let page = page.clamp(1, pages);
     let mut description = format!(
         "**{}**\n{} ({}) — {}\n",
-        playback_heading(snapshot.paused),
+        playback_heading(snapshot.paused()),
         single_line(&current.track.title, 120),
         format_duration(current.track.duration),
         mention(current.requested_by)
@@ -2635,7 +2695,7 @@ mod playback_tests {
     use crate::{
         config::Config,
         observability::ObservabilityState,
-        player::{QueueItem, RepeatMode, spawn_guild_player},
+        player::{Hold, QueueItem, Release, RepeatMode, spawn_guild_player},
         source::TrackMetadata,
         voice::fake::{FakeVoice, VoiceAction},
     };
@@ -2805,9 +2865,9 @@ idle_timeout_seconds = 900
             .unwrap();
         session.voice.settle(2).await;
 
-        session.player.set_paused(true).await.unwrap();
+        session.player.hold(Hold::Requested).await.unwrap();
         session.voice.settle(3).await;
-        session.player.set_paused(false).await.unwrap();
+        session.player.release(Release::Anything).await.unwrap();
         session.voice.settle(4).await;
         session.player.set_volume(30).await.unwrap();
         session.voice.settle(5).await;
@@ -3026,6 +3086,36 @@ idle_timeout_seconds = 900
             [VoiceAction::Sought(SeekTo::Forward(Duration::from_secs(
                 30
             )))]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn an_empty_room_pauses_and_a_return_continues() {
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+
+        // Everyone left: the track is held rather than the session ended, so
+        // the queue survives a trip to the kitchen.
+        session.player.hold(Hold::Abandoned).await.unwrap();
+        session.voice.settle(3).await;
+        assert_eq!(session.voice.actions()[2..], [VoiceAction::Paused]);
+
+        session
+            .player
+            .release(Release::OnlyAbandoned)
+            .await
+            .unwrap();
+        session.voice.settle(4).await;
+        assert_eq!(session.voice.actions()[3..], [VoiceAction::Resumed]);
+        assert!(
+            !session.voice.actions().contains(&VoiceAction::Left),
+            "an empty room gave up the channel instead of waiting"
         );
         session.finish().await;
     }
@@ -3326,13 +3416,19 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_is_abandoned_once_its_last_listener_leaves() {
+    fn occupancy_counts_only_the_people_who_could_be_listening() {
         let bot = 1;
         let alone = [occupant(bot, Some(10), true)];
-        assert_eq!(abandoned_channel(&alone, bot), Some(10));
+        assert_eq!(
+            occupancy(&alone, bot),
+            Some(Occupancy {
+                channel_id: 10,
+                listeners: 0
+            })
+        );
 
         let attended = [occupant(bot, Some(10), true), occupant(2, Some(10), false)];
-        assert_eq!(abandoned_channel(&attended, bot), None);
+        assert_eq!(occupancy(&attended, bot).unwrap().listeners, 1);
 
         // Someone listening somewhere else in the same server is not listening
         // here, and other music bots are not an audience either.
@@ -3341,17 +3437,7 @@ mod tests {
             occupant(2, Some(11), false),
             occupant(3, Some(10), true),
         ];
-        assert_eq!(abandoned_channel(&elsewhere, bot), Some(10));
-    }
-
-    #[test]
-    fn a_disconnected_bot_has_no_channel_to_abandon() {
-        let bot = 1;
-        assert_eq!(abandoned_channel(&[], bot), None);
-        assert_eq!(
-            abandoned_channel(&[occupant(2, Some(10), false)], bot),
-            None
-        );
+        assert_eq!(occupancy(&elsewhere, bot).unwrap().listeners, 0);
     }
 
     #[test]

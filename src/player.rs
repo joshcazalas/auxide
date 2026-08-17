@@ -47,7 +47,8 @@ pub struct PlayerSnapshot {
     /// channel everyone left — are precisely the ones with no item left to ask.
     pub text_channel_id: Option<u64>,
 
-    pub paused: bool,
+    /// Why the session is not playing, if it is not.
+    pub hold: Option<Hold>,
     pub repeat: RepeatMode,
 
     /// Pick the next track at random instead of in order.
@@ -64,6 +65,11 @@ pub struct PlayerSnapshot {
 }
 
 impl PlayerSnapshot {
+    #[must_use]
+    pub const fn paused(&self) -> bool {
+        self.hold.is_some()
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         usize::from(self.current.is_some()) + self.pending.len()
@@ -87,6 +93,8 @@ pub enum PlaybackDirective {
     /// until the idle timer expires, so the next request joins an already
     /// connected bot instead of waiting through another handshake.
     Stop,
+    /// Take a voice channel without playing anything through it yet.
+    Join(u64),
     /// Hold the current track where it is.
     Pause,
     /// Continue a held track.
@@ -110,6 +118,27 @@ pub enum PlaybackDirective {
 pub struct PlayerTransition {
     pub directive: PlaybackDirective,
     pub snapshot: PlayerSnapshot,
+}
+
+/// Why a session is not playing.
+///
+/// Telling these apart is what lets somebody coming back resume a session the
+/// room emptying paused, without also undoing a pause somebody asked for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Hold {
+    /// Somebody asked for it, and only somebody can undo it.
+    Requested,
+    /// Everybody left, so it lifts when anybody comes back.
+    Abandoned,
+}
+
+/// Which holds a release applies to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Release {
+    /// Continue whatever the reason it stopped.
+    Anything,
+    /// Continue only what the room emptying paused.
+    OnlyAbandoned,
 }
 
 /// What a queue does when a track ends.
@@ -362,7 +391,7 @@ impl GuildPlayerHandle {
             .await?
     }
 
-    /// Holds the current track, or continues a held one.
+    /// Stops the current track where it is, for the given reason.
     ///
     /// Holding starts the idle countdown. A held session is playing nothing to
     /// people who may well have wandered off, which is the same situation an
@@ -371,12 +400,53 @@ impl GuildPlayerHandle {
     /// # Errors
     ///
     /// Returns [`PlayerError::NothingPlaying`] when there is no current track,
-    /// [`PlayerError::AlreadyPaused`] or [`PlayerError::NotPaused`] when the
-    /// session is already in the requested state, or a channel error if the
-    /// actor has stopped.
-    pub async fn set_paused(&self, paused: bool) -> Result<PlayerTransition, PlayerError> {
-        self.request(|reply| PlayerCommand::SetPaused { paused, reply })
+    /// [`PlayerError::AlreadyPaused`] when it is already held, or a channel
+    /// error if the actor has stopped.
+    pub async fn hold(&self, reason: Hold) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::Hold { reason, reply })
             .await?
+    }
+
+    /// Continues a held track.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::NotPaused`] when a [`Release::Anything`] finds
+    /// nothing held, or a channel error if the actor has stopped. A narrower
+    /// release finding nothing of its kind is not an error — somebody walking
+    /// back in should not fail because nobody had left.
+    pub async fn release(&self, scope: Release) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::Release { scope, reply })
+            .await?
+    }
+
+    /// Gives up the voice channel while keeping the queue.
+    ///
+    /// The difference from [`GuildPlayerHandle::stop`] is what makes leaving
+    /// worth saying separately: coming back finds the queue as it was. The
+    /// current track restarts rather than resuming, because the connection it
+    /// was playing through is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::NotConnected`] when there is no channel to give
+    /// up, or a channel error if the actor has stopped.
+    pub async fn park(&self) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::Park { reply }).await?
+    }
+
+    /// Takes a voice channel, and picks a parked queue back up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::VoiceChannelConflict`] when a session is already
+    /// running elsewhere, or a channel error if the actor has stopped.
+    pub async fn join(&self, voice_channel_id: u64) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::Join {
+            voice_channel_id,
+            reply,
+        })
+        .await?
     }
 
     /// Sets the level every track in this session plays at.
@@ -504,7 +574,7 @@ pub fn spawn_guild_player(
         pending: VecDeque::new(),
         voice_channel_id: None,
         text_channel_id: None,
-        paused: false,
+        hold: None,
         votes: BTreeSet::new(),
         history: VecDeque::new(),
         repeat: RepeatMode::Off,
@@ -563,8 +633,19 @@ enum PlayerCommand {
         voice_channel_id: u64,
         reply: oneshot::Sender<Result<BulkEnqueue, PlayerError>>,
     },
-    SetPaused {
-        paused: bool,
+    Hold {
+        reason: Hold,
+        reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
+    },
+    Release {
+        scope: Release,
+        reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
+    },
+    Park {
+        reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
+    },
+    Join {
+        voice_channel_id: u64,
         reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
     },
     SetVolume {
@@ -601,7 +682,7 @@ struct GuildPlayer {
     pending: VecDeque<QueueItem>,
     voice_channel_id: Option<u64>,
     text_channel_id: Option<u64>,
-    paused: bool,
+    hold: Option<Hold>,
     /// Who has asked to cut the current track short.
     votes: BTreeSet<u64>,
     /// What has already played, oldest first.
@@ -720,8 +801,32 @@ impl GuildPlayer {
     /// Applies the commands about what is playing, rather than what is queued.
     async fn handle_playback(&mut self, command: PlayerCommand) -> bool {
         match command {
-            PlayerCommand::SetPaused { paused, reply } => {
-                let result = self.set_paused(paused);
+            PlayerCommand::Hold { reason, reply } => {
+                let result = self.hold(reason);
+                if let Ok(transition) = &result {
+                    self.emit(transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::Release { scope, reply } => {
+                let result = self.release(scope);
+                if let Ok(transition) = &result {
+                    self.emit(transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::Park { reply } => {
+                let result = self.park();
+                if let Ok(transition) = &result {
+                    self.emit(transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::Join {
+                voice_channel_id,
+                reply,
+            } => {
+                let result = self.join(voice_channel_id);
                 if let Ok(transition) = &result {
                     self.emit(transition.clone()).await;
                 }
@@ -886,7 +991,7 @@ impl GuildPlayer {
         self.pending.clear();
         self.voice_channel_id = None;
         self.idle_deadline = None;
-        self.paused = false;
+        self.hold = None;
         self.votes.clear();
         self.repeat = RepeatMode::Off;
         self.shuffle = false;
@@ -970,28 +1075,67 @@ impl GuildPlayer {
         }
     }
 
-    fn set_paused(&mut self, paused: bool) -> Result<PlayerTransition, PlayerError> {
+    fn hold(&mut self, reason: Hold) -> Result<PlayerTransition, PlayerError> {
         if self.current.is_none() {
             return Err(PlayerError::NothingPlaying);
         }
-        if self.paused == paused {
-            return Err(if paused {
-                PlayerError::AlreadyPaused
-            } else {
-                PlayerError::NotPaused
-            });
+        if self.hold.is_some() {
+            return Err(PlayerError::AlreadyPaused);
         }
-        self.paused = paused;
+        self.hold = Some(reason);
         // A held session is playing nothing to a channel people may have left,
         // which is the position an exhausted queue is in. Counting it down is
-        // what keeps a forgotten pause from holding the channel all night; the
-        // hold is long enough that a pause anybody comes back from survives it.
-        self.idle_deadline = paused.then(|| Instant::now() + self.idle_timeout);
-        Ok(self.transition(if paused {
-            PlaybackDirective::Pause
-        } else {
-            PlaybackDirective::Resume
-        }))
+        // what keeps a forgotten pause, or a room nobody came back to, from
+        // holding the channel all night; the hold is long enough that anything
+        // somebody returns from survives it.
+        self.idle_deadline = Some(Instant::now() + self.idle_timeout);
+        Ok(self.transition(PlaybackDirective::Pause))
+    }
+
+    fn release(&mut self, scope: Release) -> Result<PlayerTransition, PlayerError> {
+        match (self.hold, scope) {
+            (Some(_), Release::Anything) | (Some(Hold::Abandoned), Release::OnlyAbandoned) => {}
+            // Walking back into a room where nobody had left, or where somebody
+            // deliberately paused, is not a failure — it just changes nothing.
+            (Some(Hold::Requested) | None, Release::OnlyAbandoned) => {
+                return Ok(self.transition(PlaybackDirective::None));
+            }
+            (None, Release::Anything) => return Err(PlayerError::NotPaused),
+        }
+        self.hold = None;
+        self.idle_deadline = None;
+        Ok(self.transition(PlaybackDirective::Resume))
+    }
+
+    /// Gives up the channel and keeps everything queued for it.
+    fn park(&mut self) -> Result<PlayerTransition, PlayerError> {
+        if self.voice_channel_id.take().is_none() {
+            return Err(PlayerError::NotConnected);
+        }
+        // Held rather than merely stopped, so coming back knows to start the
+        // current track again rather than treating it as already playing.
+        if self.current.is_some() {
+            self.hold = Some(Hold::Requested);
+        }
+        self.idle_deadline = Some(Instant::now() + self.idle_timeout);
+        Ok(self.transition(PlaybackDirective::Disconnect))
+    }
+
+    /// Takes a channel, and starts a parked queue playing again.
+    fn join(&mut self, voice_channel_id: u64) -> Result<PlayerTransition, PlayerError> {
+        self.check_voice_channel(voice_channel_id)?;
+        self.voice_channel_id = Some(voice_channel_id);
+        let Some(current) = self.current.clone() else {
+            // Nothing to play, so this is somebody asking Auxide to be present.
+            // It waits exactly as long as an exhausted queue would.
+            self.idle_deadline = Some(Instant::now() + self.idle_timeout);
+            return Ok(self.transition(PlaybackDirective::Join(voice_channel_id)));
+        };
+        // The connection the track was playing through is gone, so it starts
+        // again rather than resuming — there is no position left to resume to.
+        self.hold = None;
+        self.idle_deadline = None;
+        Ok(self.transition(PlaybackDirective::Play(current)))
     }
 
     fn set_volume(&mut self, percent: u16) -> Result<PlayerTransition, PlayerError> {
@@ -1026,7 +1170,7 @@ impl GuildPlayer {
     fn advance(&mut self, left: Option<QueueItem>, reason: Departure) -> Option<QueueItem> {
         // A hold, and the votes to cut a track short, both belong to the track
         // they were placed on rather than to the session.
-        self.paused = false;
+        self.hold = None;
         self.votes.clear();
         if let Some(left) = &left {
             self.remember(left.clone());
@@ -1114,7 +1258,7 @@ impl GuildPlayer {
             pending: self.pending.iter().cloned().collect(),
             voice_channel_id: self.voice_channel_id,
             text_channel_id: self.text_channel_id,
-            paused: self.paused,
+            hold: self.hold,
             repeat: self.repeat,
             shuffle: self.shuffle,
             volume_percent: self.volume_percent,
@@ -1146,6 +1290,8 @@ pub enum PlayerError {
     AlreadyPaused,
     #[error("playback is not paused")]
     NotPaused,
+    #[error("Auxide is not in a voice channel")]
+    NotConnected,
     #[error("volume must be between 1 and {max_percent}")]
     VolumeOutOfRange { max_percent: u16 },
     #[error("there is no track waiting at position {position}; {waiting} are queued")]
@@ -1511,6 +1657,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leaving_gives_up_the_channel_and_keeps_the_queue() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        let parked = player.park().await.unwrap();
+        assert_eq!(parked.directive, PlaybackDirective::Disconnect);
+        // The whole difference from stopping: the queue is still there.
+        assert_eq!(parked.snapshot.len(), 2);
+        assert_eq!(parked.snapshot.voice_channel_id, None);
+        assert!(parked.snapshot.paused());
+        assert_eq!(transitions.recv().await.unwrap(), parked);
+
+        // Coming back starts the current track again rather than resuming it:
+        // the connection it was playing through is gone, so there is no
+        // position left to resume to.
+        let rejoined = player.join(11).await.unwrap();
+        assert_eq!(rejoined.directive, PlaybackDirective::Play(item(1)));
+        assert_eq!(rejoined.snapshot.voice_channel_id, Some(11));
+        assert!(!rejoined.snapshot.paused());
+
+        assert_eq!(player.park().await.unwrap().snapshot.len(), 2);
+        assert_eq!(player.park().await, Err(PlayerError::NotConnected));
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn joining_with_nothing_queued_waits_like_an_emptied_queue() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_millis(80), 50);
+
+        let joined = player.join(10).await.unwrap();
+        assert_eq!(joined.directive, PlaybackDirective::Join(10));
+        assert_eq!(transitions.recv().await.unwrap(), joined);
+
+        // Being asked to be present is not a reason to stay for ever.
+        let idle = time::timeout(Duration::from_secs(1), transitions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(idle.directive, PlaybackDirective::IdleDisconnect);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn somebody_returning_lifts_only_the_hold_the_empty_room_put_there() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+
+        // The room emptied, so anybody walking back in continues it.
+        player.hold(Hold::Abandoned).await.unwrap();
+        let returned = player.release(Release::OnlyAbandoned).await.unwrap();
+        assert_eq!(returned.directive, PlaybackDirective::Resume);
+        assert!(!returned.snapshot.paused());
+
+        // A pause somebody asked for survives being alone and coming back: it
+        // is theirs to undo, not the room's.
+        player.hold(Hold::Requested).await.unwrap();
+        let ignored = player.release(Release::OnlyAbandoned).await.unwrap();
+        assert_eq!(ignored.directive, PlaybackDirective::None);
+        assert!(
+            ignored.snapshot.paused(),
+            "somebody walking in undid a pause"
+        );
+        assert_eq!(
+            player.release(Release::Anything).await.unwrap().directive,
+            PlaybackDirective::Resume
+        );
+
+        // And walking into a room nobody had left changes nothing at all.
+        assert_eq!(
+            player
+                .release(Release::OnlyAbandoned)
+                .await
+                .unwrap()
+                .directive,
+            PlaybackDirective::None
+        );
+        assert_eq!(
+            player.release(Release::Anything).await,
+            Err(PlayerError::NotPaused)
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejects_tracks_at_the_total_queue_bound() {
         let (player, _transitions, task) =
             spawn_guild_player(7, 2, 8, 1, Duration::from_secs(30), 50);
@@ -1796,14 +2037,14 @@ mod tests {
 
         // Holding a track leaves nothing playing to a channel people may have
         // walked out of, so it has to be counted down like an empty queue.
-        let paused = player.set_paused(true).await.unwrap();
+        let paused = player.hold(Hold::Requested).await.unwrap();
         assert_eq!(paused.directive, PlaybackDirective::Pause);
-        assert!(paused.snapshot.paused);
+        assert!(paused.snapshot.paused());
         assert_eq!(transitions.recv().await.unwrap(), paused);
 
-        let resumed = player.set_paused(false).await.unwrap();
+        let resumed = player.release(Release::Anything).await.unwrap();
         assert_eq!(resumed.directive, PlaybackDirective::Resume);
-        assert!(!resumed.snapshot.paused);
+        assert!(!resumed.snapshot.paused());
         assert_eq!(transitions.recv().await.unwrap(), resumed);
         assert!(
             time::timeout(idle_timeout * 2, transitions.recv())
@@ -1823,7 +2064,7 @@ mod tests {
         let current = item(1);
         player.enqueue(current.clone(), 10).await.unwrap();
         transitions.recv().await.unwrap();
-        player.set_paused(true).await.unwrap();
+        player.hold(Hold::Requested).await.unwrap();
         transitions.recv().await.unwrap();
 
         let idle = time::timeout(Duration::from_secs(1), transitions.recv())
@@ -1834,7 +2075,7 @@ mod tests {
         // Leaving with a track still held would keep a current track and a
         // paused flag for a session with no voice channel to play them in.
         assert!(idle.snapshot.is_empty());
-        assert!(!idle.snapshot.paused);
+        assert!(!idle.snapshot.paused());
         assert_eq!(idle.snapshot.voice_channel_id, None);
 
         player.shutdown().await.unwrap();
@@ -1846,10 +2087,10 @@ mod tests {
         let (player, _transitions, task) =
             spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         player.enqueue(item(1), 10).await.unwrap();
-        player.set_paused(true).await.unwrap();
+        player.hold(Hold::Requested).await.unwrap();
 
         let queued = player.enqueue(item(2), 10).await.unwrap();
-        assert!(queued.snapshot.paused, "adding to a queue resumed it");
+        assert!(queued.snapshot.paused(), "adding to a queue resumed it");
         assert_eq!(queued.snapshot.pending.len(), 1);
 
         player.shutdown().await.unwrap();
@@ -1862,10 +2103,10 @@ mod tests {
             spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         player.enqueue(item(1), 10).await.unwrap();
         player.enqueue(item(2), 10).await.unwrap();
-        player.set_paused(true).await.unwrap();
+        player.hold(Hold::Requested).await.unwrap();
 
         let skipped = player.skip().await.unwrap();
-        assert!(!skipped.transition.snapshot.paused);
+        assert!(!skipped.transition.snapshot.paused());
         assert_eq!(skipped.transition.snapshot.current, Some(item(2)));
 
         player.shutdown().await.unwrap();
@@ -1877,14 +2118,17 @@ mod tests {
         let (player, _transitions, task) =
             spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         assert_eq!(
-            player.set_paused(true).await,
+            player.hold(Hold::Requested).await,
             Err(PlayerError::NothingPlaying)
         );
         player.enqueue(item(1), 10).await.unwrap();
-        assert_eq!(player.set_paused(false).await, Err(PlayerError::NotPaused));
-        player.set_paused(true).await.unwrap();
         assert_eq!(
-            player.set_paused(true).await,
+            player.release(Release::Anything).await,
+            Err(PlayerError::NotPaused)
+        );
+        player.hold(Hold::Requested).await.unwrap();
+        assert_eq!(
+            player.hold(Hold::Requested).await,
             Err(PlayerError::AlreadyPaused)
         );
 
