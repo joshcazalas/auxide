@@ -9,7 +9,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::source::TrackMetadata;
+use crate::{config::MAX_VOLUME_PERCENT, source::TrackMetadata};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueueItem {
@@ -43,6 +43,14 @@ pub struct PlayerSnapshot {
     /// the events that most need somewhere to speak — a queue that ran out, a
     /// channel everyone left — are precisely the ones with no item left to ask.
     pub text_channel_id: Option<u64>,
+
+    pub paused: bool,
+
+    /// Playback level as whole percent of the source's own.
+    ///
+    /// Percent rather than the configuration's float so that a transition stays
+    /// exactly comparable, which is what every test in this module relies on.
+    pub volume_percent: u16,
 }
 
 impl PlayerSnapshot {
@@ -69,6 +77,15 @@ pub enum PlaybackDirective {
     /// until the idle timer expires, so the next request joins an already
     /// connected bot instead of waiting through another handshake.
     Stop,
+    /// Hold the current track where it is.
+    Pause,
+    /// Continue a held track.
+    Resume,
+    /// Apply [`PlayerSnapshot::volume_percent`] to what is playing now.
+    ///
+    /// The level itself travels on the snapshot, as session state rather than
+    /// as a property of one message, so a track starting later plays at it too.
+    SetVolume,
     StopAndDisconnect,
     Disconnect,
     /// Leave because the idle hold expired with nothing queued.
@@ -149,6 +166,34 @@ impl GuildPlayerHandle {
         self.request(|reply| PlayerCommand::Stop { reply }).await
     }
 
+    /// Holds the current track, or continues a held one.
+    ///
+    /// Holding starts the idle countdown. A held session is playing nothing to
+    /// people who may well have wandered off, which is the same situation an
+    /// exhausted queue is in, and it should end the same way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::NothingPlaying`] when there is no current track,
+    /// [`PlayerError::AlreadyPaused`] or [`PlayerError::NotPaused`] when the
+    /// session is already in the requested state, or a channel error if the
+    /// actor has stopped.
+    pub async fn set_paused(&self, paused: bool) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::SetPaused { paused, reply })
+            .await?
+    }
+
+    /// Sets the level every track in this session plays at.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::VolumeOutOfRange`] outside 1..=100, or a channel
+    /// error if the actor has stopped.
+    pub async fn set_volume(&self, percent: u16) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::SetVolume { percent, reply })
+            .await?
+    }
+
     /// Randomizes only the pending queue using the actor's private random-number generator.
     ///
     /// # Errors
@@ -219,6 +264,7 @@ pub fn spawn_guild_player(
     mailbox_capacity: usize,
     shuffle_seed: u64,
     idle_timeout: Duration,
+    volume_percent: u16,
 ) -> (
     GuildPlayerHandle,
     mpsc::Receiver<PlayerTransition>,
@@ -235,6 +281,8 @@ pub fn spawn_guild_player(
         pending: VecDeque::new(),
         voice_channel_id: None,
         text_channel_id: None,
+        paused: false,
+        volume_percent,
         idle_deadline: None,
         idle_timeout,
         random: StdRng::seed_from_u64(shuffle_seed),
@@ -262,6 +310,14 @@ enum PlayerCommand {
     Stop {
         reply: oneshot::Sender<PlayerTransition>,
     },
+    SetPaused {
+        paused: bool,
+        reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
+    },
+    SetVolume {
+        percent: u16,
+        reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
+    },
     Shuffle {
         reply: oneshot::Sender<PlayerTransition>,
     },
@@ -284,6 +340,8 @@ struct GuildPlayer {
     pending: VecDeque<QueueItem>,
     voice_channel_id: Option<u64>,
     text_channel_id: Option<u64>,
+    paused: bool,
+    volume_percent: u16,
     idle_deadline: Option<Instant>,
     idle_timeout: Duration,
     random: StdRng,
@@ -298,8 +356,11 @@ impl GuildPlayer {
                 tokio::select! {
                     command = self.receiver.recv() => command,
                     () = time::sleep_until(deadline) => {
-                        self.idle_deadline = None;
-                        self.voice_channel_id = None;
+                        // A full clear, because the hold can now be reached with
+                        // a track still held: leaving with one paused would keep
+                        // a current track and a paused flag for a session that
+                        // no longer has a voice channel to play them in.
+                        self.clear();
                         if !self.emit(self.transition(PlaybackDirective::IdleDisconnect)).await {
                             break;
                         }
@@ -334,6 +395,20 @@ impl GuildPlayer {
                     let transition = self.stop();
                     self.emit(transition.clone()).await;
                     let _ = reply.send(transition);
+                }
+                PlayerCommand::SetPaused { paused, reply } => {
+                    let result = self.set_paused(paused);
+                    if let Ok(transition) = &result {
+                        self.emit(transition.clone()).await;
+                    }
+                    let _ = reply.send(result);
+                }
+                PlayerCommand::SetVolume { percent, reply } => {
+                    let result = self.set_volume(percent);
+                    if let Ok(transition) = &result {
+                        self.emit(transition.clone()).await;
+                    }
+                    let _ = reply.send(result);
                 }
                 PlayerCommand::Shuffle { reply } => {
                     self.pending.make_contiguous().shuffle(&mut self.random);
@@ -383,9 +458,12 @@ impl GuildPlayer {
                 channel_id: self.voice_channel_id.expect("checked above"),
             });
         }
-        self.idle_deadline = None;
         self.text_channel_id = Some(item.response_channel_id);
         if self.current.is_none() {
+            // Only a track that actually starts cancels the countdown. Adding
+            // to a queue that is paused leaves the held session held, and its
+            // hold running.
+            self.idle_deadline = None;
             self.voice_channel_id = Some(voice_channel_id);
             self.current = Some(item.clone());
             Ok(self.transition(PlaybackDirective::Play(item)))
@@ -417,16 +495,59 @@ impl GuildPlayer {
 
     fn stop(&mut self) -> PlayerTransition {
         let had_tracks = !self.is_empty();
-        self.current = None;
-        self.pending.clear();
-        self.voice_channel_id = None;
-        self.idle_deadline = None;
+        self.clear();
         let directive = if had_tracks {
             PlaybackDirective::StopAndDisconnect
         } else {
             PlaybackDirective::Disconnect
         };
         self.transition(directive)
+    }
+
+    /// Drops everything about a session but the level it was playing at.
+    ///
+    /// Volume is the one piece of state a server sets once and means for the
+    /// evening rather than for a track, so ending a session keeps it.
+    fn clear(&mut self) {
+        self.current = None;
+        self.pending.clear();
+        self.voice_channel_id = None;
+        self.idle_deadline = None;
+        self.paused = false;
+    }
+
+    fn set_paused(&mut self, paused: bool) -> Result<PlayerTransition, PlayerError> {
+        if self.current.is_none() {
+            return Err(PlayerError::NothingPlaying);
+        }
+        if self.paused == paused {
+            return Err(if paused {
+                PlayerError::AlreadyPaused
+            } else {
+                PlayerError::NotPaused
+            });
+        }
+        self.paused = paused;
+        // A held session is playing nothing to a channel people may have left,
+        // which is the position an exhausted queue is in. Counting it down is
+        // what keeps a forgotten pause from holding the channel all night; the
+        // hold is long enough that a pause anybody comes back from survives it.
+        self.idle_deadline = paused.then(|| Instant::now() + self.idle_timeout);
+        Ok(self.transition(if paused {
+            PlaybackDirective::Pause
+        } else {
+            PlaybackDirective::Resume
+        }))
+    }
+
+    fn set_volume(&mut self, percent: u16) -> Result<PlayerTransition, PlayerError> {
+        if percent == 0 || percent > MAX_VOLUME_PERCENT {
+            return Err(PlayerError::VolumeOutOfRange {
+                max_percent: MAX_VOLUME_PERCENT,
+            });
+        }
+        self.volume_percent = percent;
+        Ok(self.transition(PlaybackDirective::SetVolume))
     }
 
     fn track_finished(&mut self, queue_id: Uuid) -> PlayerTransition {
@@ -446,6 +567,9 @@ impl GuildPlayer {
     /// countdown, so a queue kept fed never reaches it.
     fn advance(&mut self) -> Option<QueueItem> {
         self.current = self.pending.pop_front();
+        // A hold belongs to the track it was placed on, so moving off that
+        // track releases it rather than carrying it to the next one.
+        self.paused = false;
         self.idle_deadline = if self.current.is_some() {
             None
         } else {
@@ -467,6 +591,8 @@ impl GuildPlayer {
             pending: self.pending.iter().cloned().collect(),
             voice_channel_id: self.voice_channel_id,
             text_channel_id: self.text_channel_id,
+            paused: self.paused,
+            volume_percent: self.volume_percent,
         }
     }
 
@@ -489,6 +615,14 @@ pub enum PlayerError {
     ResponseDropped,
     #[error("guild player is already active in voice channel {channel_id}")]
     VoiceChannelConflict { channel_id: u64 },
+    #[error("nothing is playing")]
+    NothingPlaying,
+    #[error("playback is already paused")]
+    AlreadyPaused,
+    #[error("playback is not paused")]
+    NotPaused,
+    #[error("volume must be between 1 and {max_percent}")]
+    VolumeOutOfRange { max_percent: u16 },
 }
 
 #[cfg(test)]
@@ -518,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn serializes_enqueue_and_advancement() {
         let (player, mut transitions, task) =
-            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30));
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         let first = item(1);
         let second = item(2);
 
@@ -549,7 +683,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_tracks_at_the_total_queue_bound() {
-        let (player, _transitions, task) = spawn_guild_player(7, 2, 8, 1, Duration::from_secs(30));
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 2, 8, 1, Duration::from_secs(30), 50);
         player.enqueue(item(1), 10).await.unwrap();
         player.enqueue(item(2), 10).await.unwrap();
         assert_eq!(
@@ -562,7 +697,8 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_stale_track_completion_after_skip() {
-        let (player, _transitions, task) = spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30));
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         let first = item(1);
         let second = item(2);
         player.enqueue(first.clone(), 10).await.unwrap();
@@ -584,7 +720,8 @@ mod tests {
 
     #[tokio::test]
     async fn shuffle_never_moves_the_current_track() {
-        let (player, _transitions, task) = spawn_guild_player(7, 6, 8, 9, Duration::from_secs(30));
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 6, 8, 9, Duration::from_secs(30), 50);
         let current = item(1);
         player.enqueue(current.clone(), 10).await.unwrap();
         for id in 2..=6 {
@@ -608,7 +745,8 @@ mod tests {
 
     #[tokio::test]
     async fn stop_clears_everything_atomically() {
-        let (player, _transitions, task) = spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30));
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         player.enqueue(item(1), 10).await.unwrap();
         player.enqueue(item(2), 10).await.unwrap();
         let transition = player.stop().await.unwrap();
@@ -622,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn an_exhausted_queue_holds_the_channel_until_the_idle_deadline() {
         let (player, mut transitions, task) =
-            spawn_guild_player(7, 2, 8, 1, Duration::from_millis(20));
+            spawn_guild_player(7, 2, 8, 1, Duration::from_millis(20), 50);
         let first = item(1);
         player.enqueue(first.clone(), 10).await.unwrap();
         assert!(matches!(
@@ -649,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn every_played_track_restarts_the_idle_countdown() {
         let idle_timeout = Duration::from_millis(200);
-        let (player, mut transitions, task) = spawn_guild_player(7, 3, 8, 1, idle_timeout);
+        let (player, mut transitions, task) = spawn_guild_player(7, 3, 8, 1, idle_timeout, 50);
         let first = item(1);
         player.enqueue(first.clone(), 10).await.unwrap();
         transitions.recv().await.unwrap();
@@ -689,7 +827,7 @@ mod tests {
     #[tokio::test]
     async fn skipping_the_last_track_holds_the_channel() {
         let (player, mut transitions, task) =
-            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30));
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         let current = item(1);
         player.enqueue(current.clone(), 10).await.unwrap();
         assert!(matches!(
@@ -708,9 +846,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_track_counts_down_and_a_resumed_one_stops_counting() {
+        let idle_timeout = Duration::from_millis(200);
+        let (player, mut transitions, task) = spawn_guild_player(7, 3, 8, 1, idle_timeout, 50);
+        let current = item(1);
+        player.enqueue(current.clone(), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        // Holding a track leaves nothing playing to a channel people may have
+        // walked out of, so it has to be counted down like an empty queue.
+        let paused = player.set_paused(true).await.unwrap();
+        assert_eq!(paused.directive, PlaybackDirective::Pause);
+        assert!(paused.snapshot.paused);
+        assert_eq!(transitions.recv().await.unwrap(), paused);
+
+        let resumed = player.set_paused(false).await.unwrap();
+        assert_eq!(resumed.directive, PlaybackDirective::Resume);
+        assert!(!resumed.snapshot.paused);
+        assert_eq!(transitions.recv().await.unwrap(), resumed);
+        assert!(
+            time::timeout(idle_timeout * 2, transitions.recv())
+                .await
+                .is_err(),
+            "the countdown armed by the pause outlived the resume"
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_pause_ends_the_session() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_millis(50), 50);
+        let current = item(1);
+        player.enqueue(current.clone(), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.set_paused(true).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        let idle = time::timeout(Duration::from_secs(1), transitions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(idle.directive, PlaybackDirective::IdleDisconnect);
+        // Leaving with a track still held would keep a current track and a
+        // paused flag for a session with no voice channel to play them in.
+        assert!(idle.snapshot.is_empty());
+        assert!(!idle.snapshot.paused);
+        assert_eq!(idle.snapshot.voice_channel_id, None);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queueing_beside_a_held_track_leaves_it_held() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.set_paused(true).await.unwrap();
+
+        let queued = player.enqueue(item(2), 10).await.unwrap();
+        assert!(queued.snapshot.paused, "adding to a queue resumed it");
+        assert_eq!(queued.snapshot.pending.len(), 1);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_hold_belongs_to_the_track_it_was_placed_on() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+        player.set_paused(true).await.unwrap();
+
+        let skipped = player.skip().await.unwrap();
+        assert!(!skipped.transition.snapshot.paused);
+        assert_eq!(skipped.transition.snapshot.current, Some(item(2)));
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pausing_refuses_the_states_it_is_already_in() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
+        assert_eq!(
+            player.set_paused(true).await,
+            Err(PlayerError::NothingPlaying)
+        );
+        player.enqueue(item(1), 10).await.unwrap();
+        assert_eq!(player.set_paused(false).await, Err(PlayerError::NotPaused));
+        player.set_paused(true).await.unwrap();
+        assert_eq!(
+            player.set_paused(true).await,
+            Err(PlayerError::AlreadyPaused)
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn volume_is_bounded_and_outlives_the_session_that_set_it() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
+        assert_eq!(player.snapshot().await.unwrap().volume_percent, 50);
+        for level in [0, MAX_VOLUME_PERCENT + 1] {
+            assert_eq!(
+                player.set_volume(level).await,
+                Err(PlayerError::VolumeOutOfRange {
+                    max_percent: MAX_VOLUME_PERCENT
+                })
+            );
+        }
+
+        let set = player.set_volume(30).await.unwrap();
+        assert_eq!(set.directive, PlaybackDirective::SetVolume);
+        assert_eq!(set.snapshot.volume_percent, 30);
+        // A level is set once and meant for the evening, so ending a session
+        // does not take it back to the configured default.
+        player.stop().await.unwrap();
+        assert_eq!(player.snapshot().await.unwrap().volume_percent, 30);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn skipping_an_idle_session_changes_nothing() {
         let (player, mut transitions, task) =
-            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30));
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
         let current = item(1);
         player.enqueue(current.clone(), 10).await.unwrap();
         transitions.recv().await.unwrap();
@@ -728,7 +998,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_cross_channel_enqueue_while_active() {
-        let (player, _transitions, task) = spawn_guild_player(7, 2, 8, 1, Duration::from_secs(30));
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 2, 8, 1, Duration::from_secs(30), 50);
         player.enqueue(item(1), 10).await.unwrap();
         assert_eq!(
             player.enqueue(item(2), 11).await,

@@ -7,7 +7,8 @@ Spotify is deliberately out of scope.
 
 The production path now includes:
 
-- `/play`, `/queue`, `/skip`, `/stop`, `/shuffle`, and `/now-playing` guild commands;
+- `/play`, `/queue`, `/skip`, `/stop`, `/shuffle`, `/now-playing`, `/pause`, `/resume`, and
+  `/volume` guild commands;
 - channel-visible results for what was queued, skipped, or stopped, with private search
   pickers and private refusals;
 - track cards carrying artwork, uploader, duration, and who asked for it;
