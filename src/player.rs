@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, time::Duration};
 
-use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
+use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use thiserror::Error;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -45,6 +45,13 @@ pub struct PlayerSnapshot {
     pub text_channel_id: Option<u64>,
 
     pub paused: bool,
+    pub repeat: RepeatMode,
+
+    /// Pick the next track at random instead of in order.
+    ///
+    /// Distinct from the one-shot reorder, which rearranges what is waiting
+    /// once and leaves anything queued afterwards to land in order behind it.
+    pub shuffle: bool,
 
     /// Playback level as whole percent of the source's own.
     ///
@@ -100,6 +107,49 @@ pub enum PlaybackDirective {
 pub struct PlayerTransition {
     pub directive: PlaybackDirective,
     pub snapshot: PlayerSnapshot,
+}
+
+/// What a queue does when a track ends.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RepeatMode {
+    /// Move on, and stop when nothing is left.
+    #[default]
+    Off,
+    /// Play the same track again.
+    Single,
+    /// Send each finished track to the back, so the queue cycles.
+    All,
+}
+
+impl RepeatMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Single => "single",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Why a track is being moved off.
+///
+/// Repeat modes have to tell these apart: a track that ended may be owed
+/// another play, and a track somebody skipped past may not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Departure {
+    Finished,
+    Skipped,
+}
+
+/// What a shuffle request asks for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShuffleChange {
+    Enable,
+    Disable,
+    Toggle,
+    /// Rearrange what is waiting, without changing how the next is chosen.
+    Reorder,
 }
 
 /// The result of a [`GuildPlayerHandle::enqueue_all`].
@@ -230,13 +280,27 @@ impl GuildPlayerHandle {
             .await?
     }
 
-    /// Randomizes only the pending queue using the actor's private random-number generator.
+    /// Turns shuffle on or off, or reorders the waiting tracks once.
+    ///
+    /// Both use the actor's private random-number generator, so a run is
+    /// reproducible from the seed it was started with.
     ///
     /// # Errors
     ///
     /// Returns an error if the actor has stopped.
-    pub async fn shuffle(&self) -> Result<PlayerTransition, PlayerError> {
-        self.request(|reply| PlayerCommand::Shuffle { reply }).await
+    pub async fn shuffle(&self, change: ShuffleChange) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::Shuffle { change, reply })
+            .await
+    }
+
+    /// Sets what the queue does when a track ends.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped.
+    pub async fn set_repeat(&self, repeat: RepeatMode) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::SetRepeat { repeat, reply })
+            .await
     }
 
     /// Returns an immutable copy of the current guild state.
@@ -318,6 +382,8 @@ pub fn spawn_guild_player(
         voice_channel_id: None,
         text_channel_id: None,
         paused: false,
+        repeat: RepeatMode::Off,
+        shuffle: false,
         volume_percent,
         idle_deadline: None,
         idle_timeout,
@@ -360,6 +426,11 @@ enum PlayerCommand {
         reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
     },
     Shuffle {
+        change: ShuffleChange,
+        reply: oneshot::Sender<PlayerTransition>,
+    },
+    SetRepeat {
+        repeat: RepeatMode,
         reply: oneshot::Sender<PlayerTransition>,
     },
     Snapshot {
@@ -382,6 +453,8 @@ struct GuildPlayer {
     voice_channel_id: Option<u64>,
     text_channel_id: Option<u64>,
     paused: bool,
+    repeat: RepeatMode,
+    shuffle: bool,
     volume_percent: u16,
     idle_deadline: Option<Instant>,
     idle_timeout: Duration,
@@ -462,9 +535,11 @@ impl GuildPlayer {
                     }
                     let _ = reply.send(result);
                 }
-                PlayerCommand::Shuffle { reply } => {
-                    self.pending.make_contiguous().shuffle(&mut self.random);
-                    let _ = reply.send(self.transition(PlaybackDirective::None));
+                PlayerCommand::Shuffle { change, reply } => {
+                    let _ = reply.send(self.change_shuffle(change));
+                }
+                PlayerCommand::SetRepeat { repeat, reply } => {
+                    let _ = reply.send(self.set_repeat(repeat));
                 }
                 PlayerCommand::Snapshot { reply } => {
                     let _ = reply.send(self.snapshot());
@@ -580,7 +655,7 @@ impl GuildPlayer {
             };
         };
         let directive = self
-            .advance()
+            .advance(Some(skipped.clone()), Departure::Skipped)
             .map_or(PlaybackDirective::Stop, PlaybackDirective::Replace);
         SkipOutcome {
             skipped: Some(skipped),
@@ -601,14 +676,16 @@ impl GuildPlayer {
 
     /// Drops everything about a session but the level it was playing at.
     ///
-    /// Volume is the one piece of state a server sets once and means for the
-    /// evening rather than for a track, so ending a session keeps it.
+    /// Volume is about the room's ears and survives; repeat and shuffle are
+    /// about a particular queue, and that queue is what this throws away.
     fn clear(&mut self) {
         self.current = None;
         self.pending.clear();
         self.voice_channel_id = None;
         self.idle_deadline = None;
         self.paused = false;
+        self.repeat = RepeatMode::Off;
+        self.shuffle = false;
     }
 
     fn set_paused(&mut self, paused: bool) -> Result<PlayerTransition, PlayerError> {
@@ -649,8 +726,9 @@ impl GuildPlayer {
         if self.current.as_ref().map(|item| item.queue_id) != Some(queue_id) {
             return self.transition(PlaybackDirective::None);
         }
+        let finished = self.current.take();
         let directive = self
-            .advance()
+            .advance(finished, Departure::Finished)
             .map_or(PlaybackDirective::Stop, PlaybackDirective::Play);
         self.transition(directive)
     }
@@ -659,18 +737,68 @@ impl GuildPlayer {
     ///
     /// Running out of tracks is not a reason to leave: the channel is held for
     /// the whole idle timeout, and each track that begins playing cancels the
-    /// countdown, so a queue kept fed never reaches it.
-    fn advance(&mut self) -> Option<QueueItem> {
-        self.current = self.pending.pop_front();
+    /// countdown, so a queue kept fed never reaches it. A repeating queue never
+    /// runs out at all, so it never reaches the countdown either.
+    ///
+    /// `left` is the track being moved off, which a repeat mode may put back.
+    fn advance(&mut self, left: Option<QueueItem>, reason: Departure) -> Option<QueueItem> {
         // A hold belongs to the track it was placed on, so moving off that
         // track releases it rather than carrying it to the next one.
         self.paused = false;
+        if let Some(left) = left {
+            match (self.repeat, reason) {
+                // Asking to move on has to move on. Replaying the same track
+                // would make the skip do nothing, which is a worse answer than
+                // ignoring the mode for one command.
+                (RepeatMode::Single, Departure::Finished) => {
+                    self.current = Some(left);
+                    self.idle_deadline = None;
+                    return self.current.clone();
+                }
+                // Repeating everything means the rotation survives a skip too,
+                // so a skipped track comes round again rather than being lost.
+                (RepeatMode::All, _) => self.pending.push_back(left),
+                _ => {}
+            }
+        }
+
+        self.current = if self.shuffle {
+            self.take_random()
+        } else {
+            self.pending.pop_front()
+        };
         self.idle_deadline = if self.current.is_some() {
             None
         } else {
             Some(Instant::now() + self.idle_timeout)
         };
         self.current.clone()
+    }
+
+    fn take_random(&mut self) -> Option<QueueItem> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let index = self.random.random_range(0..self.pending.len());
+        self.pending.remove(index)
+    }
+
+    fn set_repeat(&mut self, repeat: RepeatMode) -> PlayerTransition {
+        self.repeat = repeat;
+        self.transition(PlaybackDirective::None)
+    }
+
+    /// Applies a shuffle request, and reports whether the mode ended up on.
+    fn change_shuffle(&mut self, change: ShuffleChange) -> PlayerTransition {
+        match change {
+            ShuffleChange::Enable => self.shuffle = true,
+            ShuffleChange::Disable => self.shuffle = false,
+            ShuffleChange::Toggle => self.shuffle = !self.shuffle,
+            // The one-shot reorder, which rearranges what is already waiting
+            // and leaves how the next track gets chosen alone.
+            ShuffleChange::Reorder => self.pending.make_contiguous().shuffle(&mut self.random),
+        }
+        self.transition(PlaybackDirective::None)
     }
 
     fn transition(&self, directive: PlaybackDirective) -> PlayerTransition {
@@ -687,6 +815,8 @@ impl GuildPlayer {
             voice_channel_id: self.voice_channel_id,
             text_channel_id: self.text_channel_id,
             paused: self.paused,
+            repeat: self.repeat,
+            shuffle: self.shuffle,
             volume_percent: self.volume_percent,
         }
     }
@@ -872,7 +1002,11 @@ mod tests {
             player.enqueue(item(id), 10).await.unwrap();
         }
 
-        let shuffled = player.shuffle().await.unwrap().snapshot;
+        let shuffled = player
+            .shuffle(ShuffleChange::Reorder)
+            .await
+            .unwrap()
+            .snapshot;
         assert_eq!(shuffled.current, Some(current));
         assert_eq!(shuffled.pending.len(), 5);
         let mut ids = shuffled
@@ -882,6 +1016,114 @@ mod tests {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         assert_eq!(ids, (2..=6).map(Uuid::from_u128).collect::<Vec<_>>());
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeating_one_track_replays_it_but_never_blocks_a_skip() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+        player.set_repeat(RepeatMode::Single).await.unwrap();
+
+        let replayed = player.track_finished(item(1).queue_id).await.unwrap();
+        assert_eq!(replayed.directive, PlaybackDirective::Play(item(1)));
+        assert_eq!(replayed.snapshot.pending.len(), 1);
+
+        // Asking to move on has to move on, or the command would do nothing at
+        // all for as long as the mode is set.
+        let skipped = player.skip().await.unwrap();
+        assert_eq!(
+            skipped.transition.directive,
+            PlaybackDirective::Replace(item(2))
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeating_everything_cycles_and_never_runs_dry() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_millis(50), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.set_repeat(RepeatMode::All).await.unwrap();
+
+        let second = player.track_finished(item(1).queue_id).await.unwrap();
+        assert_eq!(second.directive, PlaybackDirective::Play(item(2)));
+        let first_again = player.track_finished(item(2).queue_id).await.unwrap();
+        assert_eq!(first_again.directive, PlaybackDirective::Play(item(1)));
+        assert_eq!(first_again.snapshot.len(), 2);
+
+        // A cycling queue never empties, so the idle countdown that an emptied
+        // one arms is never reached.
+        assert!(
+            time::timeout(Duration::from_millis(200), transitions.recv())
+                .await
+                .unwrap()
+                .is_some_and(|transition| transition.directive
+                    != PlaybackDirective::IdleDisconnect)
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shuffle_mode_outlives_the_tracks_it_reorders() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 6, 8, 9, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        let enabled = player.shuffle(ShuffleChange::Enable).await.unwrap();
+        assert!(enabled.snapshot.shuffle);
+
+        for id in 2..=5 {
+            player.enqueue(item(id), 10).await.unwrap();
+        }
+        // The one-shot reorder rearranges what is waiting; the mode decides how
+        // the next track is picked, so anything queued later is still shuffled.
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let ending = player.snapshot().await.unwrap().current.unwrap().queue_id;
+            let next = player.track_finished(ending).await.unwrap();
+            seen.push(next.snapshot.current.unwrap().queue_id);
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (2..=5).map(Uuid::from_u128).collect::<Vec<_>>());
+
+        assert!(
+            !player
+                .shuffle(ShuffleChange::Toggle)
+                .await
+                .unwrap()
+                .snapshot
+                .shuffle
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_forgets_how_that_queue_was_being_played() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.set_repeat(RepeatMode::All).await.unwrap();
+        player.shuffle(ShuffleChange::Enable).await.unwrap();
+        player.set_volume(30).await.unwrap();
+
+        let stopped = player.stop().await.unwrap();
+        assert_eq!(stopped.snapshot.repeat, RepeatMode::Off);
+        assert!(!stopped.snapshot.shuffle);
+        // Volume is about the room's ears rather than about this queue, so it
+        // is the one setting that survives.
+        assert_eq!(stopped.snapshot.volume_percent, 30);
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

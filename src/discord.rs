@@ -43,7 +43,7 @@ use crate::{
     observability::{ObservabilityServer, ObservabilityState, start_observability},
     player::{
         GuildPlayerHandle, PlaybackDirective, PlayerSnapshot, PlayerTransition, QueueItem,
-        spawn_guild_player,
+        RepeatMode, ShuffleChange, spawn_guild_player,
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
     voice::{SongbirdGateway, TrackEnded, VoiceGateway},
@@ -259,7 +259,28 @@ fn command_definitions() -> Vec<CreateCommand> {
         CreateCommand::new("queue").description("Show the current queue"),
         CreateCommand::new("skip").description("Skip the current track"),
         CreateCommand::new("stop").description("Clear the queue and disconnect"),
-        CreateCommand::new("shuffle").description("Shuffle tracks waiting in the queue"),
+        CreateCommand::new("shuffle")
+            .description("Play the queue in random order, or reorder it once")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "mode",
+                    "Omit to turn shuffle on or off",
+                )
+                .required(false)
+                .add_string_choice("on", "on")
+                .add_string_choice("off", "off")
+                .add_string_choice("once", "once"),
+            ),
+        CreateCommand::new("repeat")
+            .description("Choose what happens when a track ends")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "mode", "What to repeat")
+                    .required(true)
+                    .add_string_choice("off", "off")
+                    .add_string_choice("single", "single")
+                    .add_string_choice("all", "all"),
+            ),
         CreateCommand::new("now-playing").description("Show the current track"),
         CreateCommand::new("pause").description("Hold the current track where it is"),
         CreateCommand::new("resume").description("Continue a held track"),
@@ -754,7 +775,8 @@ impl BotRuntime {
             "queue" => self.queue(authorization).await,
             "skip" => self.skip(ctx, authorization).await,
             "stop" => self.stop(ctx, authorization).await,
-            "shuffle" => self.shuffle(ctx, authorization).await,
+            "shuffle" => self.shuffle(ctx, command, authorization).await,
+            "repeat" => self.repeat(ctx, command, authorization).await,
             "now-playing" => self.now_playing(authorization).await,
             "pause" => self.set_paused(ctx, authorization, true).await,
             "resume" => self.set_paused(ctx, authorization, false).await,
@@ -1043,12 +1065,20 @@ impl BotRuntime {
         // An embed description holds twice what a message does, which is the
         // difference between listing twenty of a hundred queued tracks and
         // listing most of them.
-        Ok(InteractionReply::from(Announcement::card(
-            CreateEmbed::new()
-                .author(CreateEmbedAuthor::new("Queue"))
-                .description(description)
-                .colour(EMBED_COLOUR),
-        )))
+        let mut embed = CreateEmbed::new()
+            .author(CreateEmbedAuthor::new("Queue"))
+            .description(description)
+            .colour(EMBED_COLOUR);
+        // A queue that is repeating or picking at random does not play in the
+        // order it is printed in, so saying so belongs beside the list.
+        if snapshot.repeat != RepeatMode::Off || snapshot.shuffle {
+            embed = embed.footer(CreateEmbedFooter::new(format!(
+                "Repeat: {} · Shuffle: {}",
+                snapshot.repeat.as_str(),
+                if snapshot.shuffle { "on" } else { "off" }
+            )));
+        }
+        Ok(InteractionReply::from(Announcement::card(embed)))
     }
 
     async fn now_playing(&self, authorization: Authorization) -> Result<InteractionReply> {
@@ -1140,17 +1170,57 @@ impl BotRuntime {
         )))
     }
 
-    async fn shuffle(
+    async fn repeat(
         &self,
         ctx: &Context,
+        command: &CommandInteraction,
         authorization: Authorization,
     ) -> Result<InteractionReply> {
         self.require_same_voice(ctx, &authorization).await?;
-        let transition = authorization.session.player.shuffle().await?;
+        let repeat = match mode_option(command) {
+            Some("single") => RepeatMode::Single,
+            Some("all") => RepeatMode::All,
+            Some("off") => RepeatMode::Off,
+            _ => bail!("choose one of off, single, or all"),
+        };
+        authorization.session.player.set_repeat(repeat).await?;
+        let requester = mention(authorization.user_id);
+        Ok(InteractionReply::message(match repeat {
+            RepeatMode::Off => format!("{requester} turned repeat off."),
+            RepeatMode::Single => format!("{requester} set the current track to repeat."),
+            RepeatMode::All => format!("{requester} set the queue to repeat."),
+        }))
+    }
+
+    async fn shuffle(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
+        self.require_same_voice(ctx, &authorization).await?;
+        let change = match mode_option(command) {
+            Some("on") => ShuffleChange::Enable,
+            Some("off") => ShuffleChange::Disable,
+            Some("once") => ShuffleChange::Reorder,
+            None => ShuffleChange::Toggle,
+            Some(_) => bail!("choose one of on, off, or once"),
+        };
+        let transition = authorization.session.player.shuffle(change).await?;
+        let requester = mention(authorization.user_id);
+        if change == ShuffleChange::Reorder {
+            return Ok(InteractionReply::message(format!(
+                "{requester} reordered {} waiting track(s).",
+                transition.snapshot.pending.len()
+            )));
+        }
         Ok(InteractionReply::message(format!(
-            "{} shuffled {} waiting track(s).",
-            mention(authorization.user_id),
-            transition.snapshot.pending.len()
+            "{requester} turned shuffle {}.",
+            if transition.snapshot.shuffle {
+                "on"
+            } else {
+                "off"
+            }
         )))
     }
 
@@ -1301,6 +1371,18 @@ fn command_audience(command: &CommandInteraction) -> Audience {
     audience_for(&command.data.name, argument)
 }
 
+fn mode_option(command: &CommandInteraction) -> Option<&str> {
+    command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == "mode")
+        .and_then(|option| match &option.value {
+            CommandDataOptionValue::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+}
+
 fn volume_option(command: &CommandInteraction) -> Option<u16> {
     command
         .data
@@ -1322,7 +1404,7 @@ fn audience_for(command: &str, argument: Option<&str>) -> Audience {
         // Setting the level changes what the room hears; asking what it is does
         // not.
         "volume" if argument.is_some() => Audience::Channel,
-        "skip" | "stop" | "shuffle" | "pause" | "resume" => Audience::Channel,
+        "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" => Audience::Channel,
         _ => Audience::Requester,
     }
 }
