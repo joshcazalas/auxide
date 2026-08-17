@@ -88,6 +88,31 @@ it is installed in. Add a `[[discord.guilds]]` block only to narrow one particul
 leaves every other server on the permissive defaults; set `allow_all_guilds = false` to make those
 blocks the complete allowlist instead.
 
+### Who may run which command
+
+There are two layers here, and they answer different questions. Using the wrong one is the usual
+reason somebody cannot work out why a command was refused.
+
+**Discord decides who in a server may run what.** In **Server Settings → Integrations → Auxide**,
+a server administrator can restrict any command to particular roles, particular members, or
+particular channels — `/stop` to a DJ role, everything to one channel, whatever suits that
+server. This needs nothing from you: Auxide registers its commands open precisely so that this
+editor is the thing that narrows them. It takes effect immediately, it is per command, and
+Discord keeps the audit log.
+
+**This file decides which servers and which people may drive the bot at all.** It is the host
+owner's boundary, not the server's, and it is deliberately blunt: `authorized_role_ids` and
+`authorized_user_ids` gate *every* command at once, and changing them needs a root edit and
+`systemctl restart auxide.service`.
+
+So in almost every case, leave `authorized_role_ids` and `authorized_user_ids` empty and let each
+server narrow itself. Reach for them only when you want a limit a server administrator cannot lift
+— which is also why a refusal from this layer says so explicitly, rather than leaving somebody
+looking for a Discord setting that was never involved.
+
+The same applies to `command_channel_ids`. Discord can already restrict a command to a channel;
+this exists for the case where you want that guaranteed from outside the server.
+
 Editing this file has no effect on a running service. `LoadCredential=` copies it into the unit's
 credential directory at start, so a change needs `sudo systemctl restart auxide.service`.
 
@@ -211,5 +236,8 @@ concurrently, and run every control command. Acceptance requires:
 16. `/help` lists every command Discord was given, grouped, with the rules a newcomer would
     otherwise have to discover — who sees which answer, that an emptied queue waits, and that
     skipping somebody else's track needs agreement; and
-17. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+17. restricting a command to a role in **Server Settings → Integrations** takes effect without a
+    restart, a refusal from the host's own allowlist says that Discord was not involved, and no
+    command is offered in direct messages; and
+18. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.
