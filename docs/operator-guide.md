@@ -185,6 +185,9 @@ concurrently, and run every control command. Acceptance requires:
    changes the level of what is playing and of everything queued behind it;
 8. a playlist link queues its tracks in one step and one message, stops at
    `playback.max_queue_length`, says how many it left out, and a `watch?v=…&list=…` link still
-   queues only the one video; and
-9. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+   queues only the one video;
+9. `/repeat single` replays a track but still lets `/skip` move on, `/repeat all` cycles without
+   ever reaching the idle hold, `/shuffle` picks at random from then on while `/shuffle once`
+   only reorders what is waiting, and `/stop` forgets both; and
+10. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.
