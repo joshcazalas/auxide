@@ -1,25 +1,27 @@
 # Auxide
 
-Auxide is a self-hosted Discord music bot for explicitly allowlisted servers. It is being
-rebuilt in Rust with Serenity for Discord interactions and Songbird for current encrypted voice.
+Auxide is a self-hosted Discord music bot for explicitly allowlisted servers. It is written in
+Rust with Serenity for Discord interactions and Songbird for current encrypted voice.
 Its first real source is public, unauthenticated YouTube audio resolved just in time with yt-dlp;
 Spotify is deliberately out of scope.
 
 The production path now includes:
 
 - `/play`, `/queue`, `/skip`, `/stop`, `/shuffle`, and `/now-playing` guild commands;
-- ephemeral, single-ack interaction responses and user-bound search-result buttons;
+- channel-visible results for what was queued, skipped, or stopped, with private search
+  pickers and private refusals;
 - one bounded actor/state machine per guild with stale-completion protection;
 - requester, role, guild, command-channel, and voice-channel authorization;
 - bounded yt-dlp/Deno subprocesses and fresh audio URL resolution before playback;
 - Songbird voice joining, playback, reconnect/session handling, and DAVE support;
-- idle disconnect plus coordinated SIGINT/SIGTERM shutdown;
+- a fifteen-minute hold on an emptied queue, an immediate departure from an emptied voice
+  channel, and coordinated SIGINT/SIGTERM shutdown;
 - structured logs and loopback-only liveness, readiness, and Prometheus endpoints;
 - a pinned `x86_64-linux` Nix build, hardened NixOS service, and unprivileged OCI image.
 
-The obsolete Go prototype remains as behavioral history until the Rust voice stack passes in a
-private test guild. See [ADR 0001](docs/adr/0001-rust-serenity-songbird.md) for the decision and
-[the operator guide](docs/operator-guide.md) for setup and deployment.
+The Go prototype this replaced was deleted once the Rust voice stack played in a private test
+guild; `git log` still has it. See [ADR 0001](docs/adr/0001-rust-serenity-songbird.md) for the
+decision and [the operator guide](docs/operator-guide.md) for setup and deployment.
 
 ## Source policy
 
@@ -72,10 +74,10 @@ port. Observability defaults to `127.0.0.1:9090`.
 
 ## Current validation boundary
 
-Unit tests and Nix/OCI builds can be completed without the application token. The remaining
-environment-dependent acceptance gate is a private-guild test proving real Discord voice and real
-YouTube playback. That test should happen before deleting the Go implementation or treating the
-first release as production-ready. The exact procedure is in the operator guide.
+Unit tests and Nix/OCI builds can be completed without the application token. Everything that
+depends on a real gateway, real voice, and real YouTube is proven in a private test guild
+instead; the exact procedure is in the operator guide, and it is what a release should be cut
+against.
 
 ## License
 
