@@ -42,6 +42,12 @@ enum Command {
     /// Exercise public YouTube search without joining Discord.
     #[command(name = "youtube-search")]
     YouTubeSearch { query: String },
+    /// Expand a public YouTube playlist without joining Discord.
+    #[command(name = "youtube-playlist")]
+    YouTubePlaylist {
+        #[arg(value_parser = parse_url)]
+        url: Url,
+    },
     /// Join an existing voice channel and play one source without registering commands.
     VoiceSpike {
         #[arg(long)]
@@ -96,6 +102,27 @@ async fn main() -> Result<()> {
         Command::YouTubeSearch { query } => {
             let resolver = YouTubeResolver::new(config.youtube.clone(), &config.playback);
             for track in resolver.search(&query).await? {
+                println!(
+                    "{}\t{}\t{}",
+                    track.source_id,
+                    track.duration.as_secs(),
+                    track.title
+                );
+            }
+        }
+        Command::YouTubePlaylist { url } => {
+            let resolver = YouTubeResolver::new(config.youtube.clone(), &config.playback);
+            let playlist = resolver
+                .playlist(&url)
+                .await?
+                .context("that URL is not a playlist")?;
+            println!(
+                "{}\t{} of {} playable",
+                playlist.title.as_deref().unwrap_or("(untitled)"),
+                playlist.tracks.len(),
+                playlist.total
+            );
+            for track in playlist.tracks {
                 println!(
                     "{}\t{}\t{}",
                     track.source_id,

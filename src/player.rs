@@ -102,6 +102,18 @@ pub struct PlayerTransition {
     pub snapshot: PlayerSnapshot,
 }
 
+/// The result of a [`GuildPlayerHandle::enqueue_all`].
+///
+/// A bulk addition can be partly refused where a single one can only be
+/// accepted or rejected, so the answer has to say how much of it landed.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BulkEnqueue {
+    pub accepted: usize,
+    /// Items the queue had no room for.
+    pub refused: usize,
+    pub transition: PlayerTransition,
+}
+
 /// The result of a [`GuildPlayerHandle::skip`], carrying what was interrupted.
 ///
 /// The transition alone describes only what plays next, and announcing a skip
@@ -139,6 +151,30 @@ impl GuildPlayerHandle {
     ) -> Result<PlayerTransition, PlayerError> {
         self.request(|reply| PlayerCommand::Enqueue {
             item: Box::new(item),
+            voice_channel_id,
+            reply,
+        })
+        .await?
+    }
+
+    /// Adds as many items as the queue has room for, in one step.
+    ///
+    /// A playlist is one request, so it takes one pass through the actor rather
+    /// than one per track: nobody else's addition can land in the middle of it,
+    /// and it produces one answer rather than fifty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::QueueFull`] only when there was no room for even
+    /// one item, [`PlayerError::VoiceChannelConflict`] when a session is already
+    /// running elsewhere, or a channel error if the actor has stopped.
+    pub async fn enqueue_all(
+        &self,
+        items: Vec<QueueItem>,
+        voice_channel_id: u64,
+    ) -> Result<BulkEnqueue, PlayerError> {
+        self.request(|reply| PlayerCommand::EnqueueAll {
+            items,
             voice_channel_id,
             reply,
         })
@@ -310,6 +346,11 @@ enum PlayerCommand {
     Stop {
         reply: oneshot::Sender<PlayerTransition>,
     },
+    EnqueueAll {
+        items: Vec<QueueItem>,
+        voice_channel_id: u64,
+        reply: oneshot::Sender<Result<BulkEnqueue, PlayerError>>,
+    },
     SetPaused {
         paused: bool,
         reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
@@ -396,6 +437,17 @@ impl GuildPlayer {
                     self.emit(transition.clone()).await;
                     let _ = reply.send(transition);
                 }
+                PlayerCommand::EnqueueAll {
+                    items,
+                    voice_channel_id,
+                    reply,
+                } => {
+                    let result = self.enqueue_all(items, voice_channel_id);
+                    if let Ok(bulk) = &result {
+                        self.emit(bulk.transition.clone()).await;
+                    }
+                    let _ = reply.send(result);
+                }
                 PlayerCommand::SetPaused { paused, reply } => {
                     let result = self.set_paused(paused);
                     if let Ok(transition) = &result {
@@ -449,15 +501,7 @@ impl GuildPlayer {
                 max_tracks: self.max_tracks,
             });
         }
-        if self.current.is_some()
-            && self
-                .voice_channel_id
-                .is_some_and(|current| current != voice_channel_id)
-        {
-            return Err(PlayerError::VoiceChannelConflict {
-                channel_id: self.voice_channel_id.expect("checked above"),
-            });
-        }
+        self.check_voice_channel(voice_channel_id)?;
         self.text_channel_id = Some(item.response_channel_id);
         if self.current.is_none() {
             // Only a track that actually starts cancels the countdown. Adding
@@ -471,6 +515,57 @@ impl GuildPlayer {
             self.pending.push_back(item);
             Ok(self.transition(PlaybackDirective::None))
         }
+    }
+
+    fn enqueue_all(
+        &mut self,
+        items: Vec<QueueItem>,
+        voice_channel_id: u64,
+    ) -> Result<BulkEnqueue, PlayerError> {
+        let offered = items.len();
+        let room = self.max_tracks.saturating_sub(self.len());
+        if room == 0 {
+            return Err(PlayerError::QueueFull {
+                max_tracks: self.max_tracks,
+            });
+        }
+        self.check_voice_channel(voice_channel_id)?;
+
+        let mut items = items;
+        items.truncate(room);
+        let accepted = items.len();
+        let mut directive = PlaybackDirective::None;
+        for item in items {
+            // Reusing the single-item path keeps one description of what
+            // enqueueing means, including which addition starts playback and
+            // what that does to the idle countdown.
+            let transition = self.enqueue(item, voice_channel_id)?;
+            // Only the first item of a batch can start playback; every one
+            // after it joins a queue that is no longer empty. Pairing that
+            // directive with the snapshot taken after the whole batch is what
+            // makes this one addition rather than fifty.
+            if directive == PlaybackDirective::None {
+                directive = transition.directive;
+            }
+        }
+        Ok(BulkEnqueue {
+            accepted,
+            refused: offered - accepted,
+            transition: self.transition(directive),
+        })
+    }
+
+    fn check_voice_channel(&self, voice_channel_id: u64) -> Result<(), PlayerError> {
+        if self.current.is_some()
+            && self
+                .voice_channel_id
+                .is_some_and(|current| current != voice_channel_id)
+        {
+            return Err(PlayerError::VoiceChannelConflict {
+                channel_id: self.voice_channel_id.expect("checked above"),
+            });
+        }
+        Ok(())
     }
 
     fn skip(&mut self) -> SkipOutcome {
@@ -676,6 +771,55 @@ mod tests {
         );
         assert_eq!(transition.snapshot.current, Some(second));
         assert_eq!(transitions.recv().await.unwrap(), transition);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_batch_starts_playing_and_lands_as_one_addition() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        let items = (1..=3).map(item).collect::<Vec<_>>();
+
+        let bulk = player.enqueue_all(items, 10).await.unwrap();
+        assert_eq!(bulk.accepted, 3);
+        assert_eq!(bulk.refused, 0);
+        // Only the first of a batch can start playback, and the snapshot beside
+        // it has to describe the whole batch rather than the moment that one
+        // item landed.
+        assert_eq!(bulk.transition.directive, PlaybackDirective::Play(item(1)));
+        assert_eq!(bulk.transition.snapshot.len(), 3);
+        assert_eq!(transitions.recv().await.unwrap(), bulk.transition);
+        assert!(
+            time::timeout(Duration::from_millis(50), transitions.recv())
+                .await
+                .is_err(),
+            "a batch produced more than one directive"
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_batch_takes_what_fits_and_reports_the_rest() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 2, 8, 1, Duration::from_secs(30), 50);
+        let bulk = player
+            .enqueue_all((1..=5).map(item).collect(), 10)
+            .await
+            .unwrap();
+        assert_eq!(bulk.accepted, 2);
+        assert_eq!(bulk.refused, 3);
+        assert_eq!(bulk.transition.snapshot.len(), 2);
+
+        // With no room at all there is nothing partial to report, so this is
+        // the same refusal a single track gets.
+        assert_eq!(
+            player.enqueue_all(vec![item(9)], 10).await,
+            Err(PlayerError::QueueFull { max_tracks: 2 })
+        );
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

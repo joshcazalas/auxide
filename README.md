@@ -12,6 +12,7 @@ The production path now includes:
 - channel-visible results for what was queued, skipped, or stopped, with private search
   pickers and private refusals;
 - track cards carrying artwork, uploader, duration, and who asked for it;
+- playlist links expanded into the queue in one step, bounded by its track limit;
 - unprompted notices for the events nobody asked for — a track that could not be played, and
   why Auxide left a voice channel — plus optional per-track announcements;
 - one bounded actor/state machine per guild with stale-completion protection;
@@ -57,6 +58,8 @@ cargo run -- --config config.toml check-config
 cargo run -- --config config.toml youtube-search "artist and track"
 cargo run -- --config config.toml youtube-inspect \
   'https://www.youtube.com/watch?v=VIDEO_ID'
+cargo run -- --config config.toml youtube-playlist \
+  'https://www.youtube.com/playlist?list=PLAYLIST_ID'
 ```
 
 ## Runtime model

@@ -626,6 +626,12 @@ mod tests {
         async fn resolve(&self, _track: &TrackMetadata) -> Result<ResolvedAudio, SourceError> {
             panic!("a chunk the origin went on to serve must not cost a fresh media URL")
         }
+        async fn playlist(
+            &self,
+            _url: &Url,
+        ) -> Result<Option<crate::source::Playlist>, SourceError> {
+            unreachable!()
+        }
     }
 
     fn request(url: &str) -> ChunkedHttpRequest {
