@@ -358,13 +358,46 @@ impl ChunkedHttpRequest {
     /// worse than useless: a one-byte range is accepted even by a URL that
     /// refuses every real chunk, so it reported success and left the failure to
     /// surface later as a container that would not parse.
-    fn open(&self, offset: u64) -> ChunkedHttpStream {
+    fn open(&self, offset: u64, total: Option<u64>) -> ChunkedHttpStream {
         ChunkedHttpStream {
             stream: Box::pin(StreamReader::new(self.body(offset))),
             request: self.clone(),
             start: offset,
+            position: offset,
+            total,
+            pending_seek: None,
             refreshes: 0,
         }
+    }
+
+    /// Asks the origin how long the resource is, before reading any of it.
+    ///
+    /// One byte is enough: a ranged response states the total in its
+    /// `Content-Range` regardless of how little was asked for. An origin that
+    /// answers `200` ignored the range and is telling us it cannot serve parts
+    /// of the file, which is the same thing as saying it cannot be seeked in.
+    ///
+    /// Returning `None` is not a failure. It costs seeking and nothing else,
+    /// which is exactly the behaviour every version before this one had.
+    async fn probe_length(&self) -> Option<u64> {
+        let response = self
+            .client
+            .get(&self.url)
+            .headers(self.headers.clone())
+            .header(RANGE, "bytes=0-0")
+            .timeout(CHUNK_TIMEOUT)
+            .send()
+            .await
+            .ok()?;
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            tracing::debug!(status = %response.status(), "origin ignored a range request; seeking is off");
+            return None;
+        }
+        let total = content_range_total(response.headers());
+        if total.is_none() {
+            tracing::debug!("origin stated no length; seeking is off");
+        }
+        total
     }
 }
 
@@ -396,6 +429,16 @@ struct ChunkedHttpStream {
     request: ChunkedHttpRequest,
     /// Offset in the resource this stream was opened at.
     start: u64,
+    /// Where reading has reached, counted from the start of the resource.
+    position: u64,
+    /// The resource's length, when the origin was willing to state one.
+    ///
+    /// Its presence is what makes the stream seekable: Symphonia turns a
+    /// timestamp into a byte offset, and it cannot do that without knowing how
+    /// many bytes there are.
+    total: Option<u64>,
+    /// Where a seek asked to go, until [`AsyncSeek::poll_complete`] takes it.
+    pending_seek: Option<u64>,
     refreshes: u32,
 }
 
@@ -405,28 +448,88 @@ impl AsyncRead for ChunkedHttpStream {
         context: &mut TaskContext<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        AsyncRead::poll_read(self.stream.as_mut(), context, buffer)
+        let before = buffer.filled().len();
+        let polled = AsyncRead::poll_read(self.stream.as_mut(), context, buffer);
+        if polled.is_ready() {
+            let read = buffer.filled().len().saturating_sub(before) as u64;
+            self.position = self.position.saturating_add(read);
+        }
+        polled
     }
 }
 
 impl AsyncSeek for ChunkedHttpStream {
-    fn start_seek(self: Pin<&mut Self>, _position: SeekFrom) -> IoResult<()> {
-        Err(IoErrorKind::Unsupported.into())
+    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
+        let target = match position {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::Current(delta) => offset_by(self.position, delta)?,
+            SeekFrom::End(delta) => {
+                let total = self
+                    .total
+                    .ok_or_else(|| IoError::from(IoErrorKind::Unsupported))?;
+                offset_by(total, delta)?
+            }
+        };
+        if let Some(total) = self.total {
+            if target > total {
+                return Err(IoError::new(
+                    IoErrorKind::InvalidInput,
+                    "seek past the end of the media",
+                ));
+            }
+        }
+        self.pending_seek = Some(target);
+        Ok(())
     }
 
-    fn poll_complete(self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<IoResult<u64>> {
-        Poll::Ready(Err(IoErrorKind::Unsupported.into()))
+    /// Reopens the resource at the requested offset.
+    ///
+    /// Nothing is fetched here: the body is a lazy stream of ranged requests,
+    /// so replacing it costs only the request the next read will make. That is
+    /// what lets a seek complete synchronously.
+    fn poll_complete(
+        mut self: Pin<&mut Self>,
+        _context: &mut TaskContext<'_>,
+    ) -> Poll<IoResult<u64>> {
+        if let Some(target) = self.pending_seek.take() {
+            self.stream = Box::pin(StreamReader::new(self.request.body(target)));
+            self.position = target;
+            // A seek is not a stream that faltered, so what it delivers from
+            // here counts as progress from here rather than from wherever the
+            // stream happened to open.
+            self.start = target;
+        }
+        Poll::Ready(Ok(self.position))
     }
+}
+
+/// Applies a signed delta to an offset, refusing to go before the start.
+fn offset_by(from: u64, delta: i64) -> IoResult<u64> {
+    let target = i64::try_from(from)
+        .ok()
+        .and_then(|from| from.checked_add(delta))
+        .ok_or_else(|| IoError::new(IoErrorKind::InvalidInput, "seek offset overflowed"))?;
+    u64::try_from(target).map_err(|_| {
+        IoError::new(
+            IoErrorKind::InvalidInput,
+            "seek before the start of the media",
+        )
+    })
 }
 
 #[async_trait]
 impl AsyncMediaSource for ChunkedHttpStream {
+    /// Reports whether the origin gave enough to seek within.
+    ///
+    /// Read once when the stream is adapted rather than per seek, so it has to
+    /// be right before anything has been read — which is why the length is
+    /// probed when the request is created rather than learned on the way past.
     fn is_seekable(&self) -> bool {
-        false
+        self.total.is_some()
     }
 
     async fn byte_len(&self) -> Option<u64> {
-        None
+        self.total
     }
 
     /// Continues the track after a read error, on a freshly resolved URL.
@@ -480,7 +583,7 @@ impl AsyncMediaSource for ChunkedHttpStream {
         request.url = audio.stream_url.to_string();
         request.headers = convert_headers(&audio.headers)
             .map_err(|error| AudioStreamError::Fail(error.into()))?;
-        let mut resumed = request.open(offset);
+        let mut resumed = request.open(offset, self.total);
         resumed.refreshes = refreshes;
         Ok(Box::new(resumed) as Box<dyn AsyncMediaSource>)
     }
@@ -495,7 +598,10 @@ impl Compose for ChunkedHttpRequest {
     async fn create_async(
         &mut self,
     ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-        let stream = self.open(0);
+        // Asked for before the stream is adapted, because the adapter reads
+        // seekability once and keeps the answer.
+        let total = self.probe_length().await;
+        let stream = self.open(0, total);
         Ok(AudioStream {
             input: Box::new(AsyncAdapterStream::new(Box::new(stream), READ_AHEAD))
                 as Box<dyn MediaSource>,
@@ -524,7 +630,7 @@ mod tests {
     use std::sync::Mutex;
 
     use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
         net::TcpListener,
     };
     use url::Url;
@@ -667,14 +773,98 @@ mod tests {
         )
     }
 
+    /// An origin that answers `200` and sends the whole file, range or not.
+    async fn origin_ignoring_ranges(body: Arc<Vec<u8>>) -> Origin {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/media", listener.local_addr().unwrap());
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let body = Arc::clone(&body);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        Origin { url, ranges }
+    }
+
     async fn play(request: &ChunkedHttpRequest) -> Vec<u8> {
         let mut played = Vec::new();
         request
-            .open(0)
+            .open(0, None)
             .read_to_end(&mut played)
             .await
             .expect("the stream must reach the end of the resource");
         played
+    }
+
+    /// Seeking hangs entirely on whether the origin will state a length, and
+    /// the answer is read once before anything is played — so getting it wrong
+    /// is silent in both directions.
+    #[tokio::test]
+    async fn a_stated_length_is_what_makes_a_stream_seekable() {
+        let body = media(8192);
+        let origin = origin(Arc::clone(&body), vec![Reply::Full; 2]).await;
+        let request = request(&origin.url);
+
+        let total = request.probe_length().await;
+        assert_eq!(total, Some(8192));
+        let stream = request.open(0, total);
+        assert!(stream.is_seekable());
+        assert_eq!(stream.byte_len().await, Some(8192));
+
+        // A probe costs one request, and it asks for a single byte rather than
+        // pulling the resource down to find out how long it is.
+        assert_eq!(origin.ranges.lock().unwrap()[0], (0, 0));
+    }
+
+    /// An origin that ignores ranges is telling us it cannot serve parts of the
+    /// file, which is the same thing as saying it cannot be seeked in.
+    #[tokio::test]
+    async fn an_origin_that_ignores_ranges_is_not_seekable() {
+        let body = media(4096);
+        let origin = origin_ignoring_ranges(Arc::clone(&body)).await;
+        let request = request(&origin.url);
+
+        assert_eq!(request.probe_length().await, None);
+        let stream = request.open(0, None);
+        assert!(!stream.is_seekable());
+        assert_eq!(stream.byte_len().await, None);
+    }
+
+    #[tokio::test]
+    async fn seeking_reopens_the_resource_where_it_was_asked_to() {
+        let body = media(8192);
+        let origin = origin(Arc::clone(&body), vec![Reply::Full; 4]).await;
+        let request = request(&origin.url);
+        let mut stream = request.open(0, Some(8192));
+
+        let mut opening = vec![0_u8; 16];
+        stream.read_exact(&mut opening).await.unwrap();
+        assert_eq!(opening, body[..16]);
+
+        // Nothing is fetched by the seek itself; the request it needs is made
+        // by the read that follows it.
+        let landed = stream.seek(SeekFrom::Start(4096)).await.unwrap();
+        assert_eq!(landed, 4096);
+        let mut after = vec![0_u8; 16];
+        stream.read_exact(&mut after).await.unwrap();
+        assert_eq!(after, body[4096..4112]);
+
+        // Relative seeks count from where reading has actually reached.
+        assert_eq!(stream.seek(SeekFrom::Current(-112)).await.unwrap(), 4000);
+        assert_eq!(stream.seek(SeekFrom::End(-96)).await.unwrap(), 8096);
+        assert!(stream.seek(SeekFrom::Start(9000)).await.is_err());
+        assert!(stream.seek(SeekFrom::Current(-99_999)).await.is_err());
     }
 
     /// The point of chunking at all: a resource larger than one request comes
