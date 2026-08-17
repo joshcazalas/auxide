@@ -27,10 +27,7 @@ use serenity::{
     model::id::{ChannelId, GuildId, UserId},
     model::voice::VoiceState,
 };
-use songbird::{
-    Event, EventContext, EventHandler as VoiceEventHandler, SerenityInit, Songbird, TrackEvent,
-    tracks::{PlayMode, TrackHandle},
-};
+use songbird::{SerenityInit, Songbird};
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -49,6 +46,7 @@ use crate::{
         spawn_guild_player,
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
+    voice::{SongbirdGateway, TrackEnded, VoiceGateway},
 };
 
 const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
@@ -546,8 +544,11 @@ impl BotRuntime {
             guild_id,
             player.clone(),
             transitions,
-            Arc::clone(&self.voice),
-            self.pipeline.clone(),
+            Arc::new(SongbirdGateway::new(
+                Arc::clone(&self.voice),
+                self.pipeline.clone(),
+                guild_id,
+            )),
             self.announcer(http),
             self.observability.clone(),
             self.cancellation.child_token(),
@@ -1496,17 +1497,15 @@ fn abandoned_channel(occupants: &[VoiceOccupant], bot_user_id: u64) -> Option<u6
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn playback_worker(
+async fn playback_worker<V: VoiceGateway>(
     guild_id: u64,
     player: GuildPlayerHandle,
     mut transitions: mpsc::Receiver<PlayerTransition>,
-    voice: Arc<Songbird>,
-    pipeline: AudioPipeline,
+    voice: Arc<V>,
     announcer: Announcer,
     observability: ObservabilityState,
     cancellation: CancellationToken,
 ) {
-    let mut active: Option<TrackHandle> = None;
     let mut deferred: Option<PlayerTransition> = None;
 
     loop {
@@ -1529,27 +1528,15 @@ async fn playback_worker(
 
         match transition.directive {
             PlaybackDirective::None => {}
-            PlaybackDirective::Stop => {
-                if let Some(handle) = active.take() {
-                    let _ = handle.stop();
-                }
-            }
-            directive @ (PlaybackDirective::Pause
-            | PlaybackDirective::Resume
-            | PlaybackDirective::SetVolume) => {
-                adjust_track(guild_id, active.as_ref(), &directive, volume);
-            }
+            PlaybackDirective::Stop => voice.stop().await,
+            PlaybackDirective::Pause => voice.pause().await,
+            PlaybackDirective::Resume => voice.resume().await,
+            PlaybackDirective::SetVolume => voice.set_volume(volume).await,
             PlaybackDirective::StopAndDisconnect | PlaybackDirective::Disconnect => {
-                if let Some(handle) = active.take() {
-                    let _ = handle.stop();
-                }
-                remove_voice(&voice, guild_id).await;
+                voice.leave().await;
             }
             PlaybackDirective::IdleDisconnect => {
-                if let Some(handle) = active.take() {
-                    let _ = handle.stop();
-                }
-                remove_voice(&voice, guild_id).await;
+                voice.leave().await;
                 // The only departure nobody asked for, so the only one that has
                 // to explain itself.
                 announcer
@@ -1564,9 +1551,7 @@ async fn playback_worker(
                     .await;
             }
             PlaybackDirective::Play(item) | PlaybackDirective::Replace(item) => {
-                if let Some(handle) = active.take() {
-                    let _ = handle.stop();
-                }
+                voice.stop().await;
                 let Some(channel_id) = transition.snapshot.voice_channel_id else {
                     tracing::warn!(guild_id, queue_id = %item.queue_id, "play directive had no voice channel");
                     continue;
@@ -1576,8 +1561,7 @@ async fn playback_worker(
                     channel_id,
                     &player,
                     &mut transitions,
-                    &voice,
-                    &pipeline,
+                    voice.as_ref(),
                     &announcer,
                     &observability,
                     &cancellation,
@@ -1586,43 +1570,40 @@ async fn playback_worker(
                 )
                 .await
                 {
-                    StartTrackOutcome::Active(handle) => active = Some(handle),
+                    StartTrackOutcome::Started | StartTrackOutcome::Failed => {}
                     StartTrackOutcome::Superseded(next) => deferred = Some(*next),
-                    StartTrackOutcome::Failed => {}
                     StartTrackOutcome::Shutdown => break,
                 }
             }
         }
     }
 
-    if let Some(handle) = active {
-        let _ = handle.stop();
-    }
-    remove_voice(&voice, guild_id).await;
+    voice.leave().await;
 }
 
 enum StartTrackOutcome {
-    Active(TrackHandle),
+    Started,
     Superseded(Box<PlayerTransition>),
     Failed,
     Shutdown,
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start_track(
+async fn start_track<V: VoiceGateway>(
     guild_id: u64,
     channel_id: u64,
     player: &GuildPlayerHandle,
     transitions: &mut mpsc::Receiver<PlayerTransition>,
-    voice: &Songbird,
-    pipeline: &AudioPipeline,
+    voice: &V,
     announcer: &Announcer,
     observability: &ObservabilityState,
     cancellation: &CancellationToken,
     item: QueueItem,
     volume: f32,
 ) -> StartTrackOutcome {
-    let preparation = pipeline.prepare(&item.track);
+    // Preparing reaches the network and takes seconds, so a skip arriving in
+    // the middle of it has to be able to supersede the track being prepared.
+    let preparation = voice.prepare(&item.track);
     tokio::pin!(preparation);
     let prepared = tokio::select! {
         biased;
@@ -1635,8 +1616,8 @@ async fn start_track(
         result = &mut preparation => result,
     };
     observability.record_source_resolution(prepared.is_ok());
-    let input = match prepared {
-        Ok(input) => input,
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -1677,29 +1658,13 @@ async fn start_track(
         return StartTrackOutcome::Failed;
     }
 
-    let call = match voice
-        .join(GuildId::new(guild_id), ChannelId::new(channel_id))
-        .await
-    {
-        Ok(call) => call,
-        Err(error) => {
-            tracing::warn!(%error, guild_id, channel_id, "failed to join voice; advancing");
-            let _ = player.track_finished(item.queue_id).await;
-            return StartTrackOutcome::Failed;
-        }
-    };
-    let handle = call.lock().await.play_only_input(input);
-    if let Err(error) = handle.set_volume(volume) {
-        tracing::warn!(%error, guild_id, "failed to set playback volume");
-    }
-    let event = RuntimeTrackFinished {
+    let ended = Arc::new(RuntimeTrackFinished {
         player: player.clone(),
         guild_id,
         queue_id: item.queue_id,
-    };
-    if let Err(error) = handle.add_event(Event::Track(TrackEvent::End), event) {
-        tracing::warn!(%error, guild_id, "failed to subscribe to track completion");
-        let _ = handle.stop();
+    });
+    if let Err(error) = voice.play(channel_id, prepared, volume, ended).await {
+        tracing::warn!(%error, guild_id, channel_id, "failed to start playback; advancing");
         let _ = player.track_finished(item.queue_id).await;
         return StartTrackOutcome::Failed;
     }
@@ -1725,38 +1690,7 @@ async fn start_track(
             )
             .await;
     }
-    StartTrackOutcome::Active(handle)
-}
-
-/// Applies a session-level change to the track that is already playing.
-///
-/// Doing nothing is the right answer when there is no track: the actor refuses
-/// to hold a session with nothing in it, and a level set while the queue is
-/// empty rides the snapshot to whatever starts next.
-fn adjust_track(
-    guild_id: u64,
-    active: Option<&TrackHandle>,
-    directive: &PlaybackDirective,
-    volume: f32,
-) {
-    let Some(handle) = active else {
-        return;
-    };
-    let adjusted = match directive {
-        PlaybackDirective::Pause => handle.pause(),
-        PlaybackDirective::Resume => handle.play(),
-        PlaybackDirective::SetVolume => handle.set_volume(volume),
-        _ => return,
-    };
-    if let Err(error) = adjusted {
-        tracing::warn!(%error, guild_id, ?directive, "failed to adjust the current track");
-    }
-}
-
-async fn remove_voice(voice: &Songbird, guild_id: u64) {
-    if let Err(error) = voice.remove(GuildId::new(guild_id)).await {
-        tracing::debug!(%error, guild_id, "voice session was already absent");
-    }
+    StartTrackOutcome::Started
 }
 
 struct RuntimeTrackFinished {
@@ -1766,17 +1700,11 @@ struct RuntimeTrackFinished {
 }
 
 #[async_trait]
-impl VoiceEventHandler for RuntimeTrackFinished {
-    async fn act(&self, context: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::Track([(state, _)]) = context {
-            if let PlayMode::Errored(error) = &state.playing {
-                tracing::warn!(%error, guild_id = self.guild_id, queue_id = %self.queue_id, "track ended with an error");
-            }
-        }
+impl TrackEnded for RuntimeTrackFinished {
+    async fn ended(&self) {
         if let Err(error) = self.player.track_finished(self.queue_id).await {
             tracing::debug!(%error, guild_id = self.guild_id, queue_id = %self.queue_id, "track completion arrived after shutdown");
         }
-        Some(Event::Cancel)
     }
 }
 
@@ -1926,6 +1854,319 @@ async fn shutdown_signal() -> &'static str {
         .await
         .expect("interrupt handler is available");
     "interrupt"
+}
+
+/// End-to-end tests of a real player driving a real worker, with a fake voice
+/// channel on the far side.
+///
+/// Everything here was unprovable before the gateway became a trait: each test
+/// asserts on the sequence of things that reached voice, which is the step
+/// between a queue deciding something and anybody hearing it.
+#[cfg(test)]
+mod playback_tests {
+    use std::time::Duration;
+
+    use tokio::time;
+    use url::Url;
+
+    use super::{Announcer, playback_worker};
+    use crate::{
+        config::Config,
+        observability::ObservabilityState,
+        player::{QueueItem, spawn_guild_player},
+        source::TrackMetadata,
+        voice::fake::{FakeVoice, VoiceAction},
+    };
+    use serenity::http::Http;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+
+    const GUILD: u64 = 7;
+    const VOICE_CHANNEL: u64 = 10;
+
+    fn config() -> Arc<Config> {
+        Arc::new(
+            toml::from_str(
+                r#"
+[discord]
+token_file = "/dev/null"
+
+[playback]
+idle_timeout_seconds = 900
+"#,
+            )
+            .expect("the test configuration parses"),
+        )
+    }
+
+    fn item(id: u128) -> QueueItem {
+        QueueItem {
+            queue_id: uuid::Uuid::from_u128(id),
+            track: TrackMetadata {
+                source_id: format!("source-{id}"),
+                canonical_url: Url::parse(&format!("https://www.youtube.com/watch?v=id{id}"))
+                    .unwrap(),
+                title: format!("Track {id}"),
+                channel: None,
+                duration: Duration::from_secs(60),
+                thumbnail_url: None,
+            },
+            requested_by: 42,
+            response_channel_id: 99,
+        }
+    }
+
+    /// A player, a worker, and a fake voice channel, wired as production wires
+    /// them.
+    struct Session {
+        player: crate::player::GuildPlayerHandle,
+        voice: FakeVoice,
+        cancellation: CancellationToken,
+        worker: tokio::task::JoinHandle<()>,
+    }
+
+    impl Session {
+        fn start(idle_timeout: Duration) -> Self {
+            let (player, transitions, _actor) =
+                spawn_guild_player(GUILD, 100, 128, 1, idle_timeout, 50);
+            let voice = FakeVoice::new();
+            let cancellation = CancellationToken::new();
+            // No announcement channel is configured and no request has been
+            // answered, so the announcer stays silent and never reaches Discord.
+            let announcer = Announcer {
+                http: Arc::new(Http::new("not-a-real-token")),
+                config: config(),
+            };
+            let worker = tokio::spawn(playback_worker(
+                GUILD,
+                player.clone(),
+                transitions,
+                Arc::new(voice.clone()),
+                announcer,
+                ObservabilityState::default(),
+                cancellation.child_token(),
+            ));
+            Self {
+                player,
+                voice,
+                cancellation,
+                worker,
+            }
+        }
+
+        async fn finish(self) {
+            self.cancellation.cancel();
+            let _ = time::timeout(Duration::from_secs(2), self.worker).await;
+        }
+    }
+
+    fn played(id: u128, volume_percent: u16) -> VoiceAction {
+        VoiceAction::Played {
+            channel_id: VOICE_CHANNEL,
+            source_id: format!("source-{id}"),
+            volume_percent,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queued_track_reaches_the_voice_channel_at_the_session_level() {
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+
+        // Stopped first: starting a track replaces whatever was playing, and
+        // doing that in the other order would cut off the track it started.
+        assert_eq!(
+            session.voice.actions(),
+            [VoiceAction::Stopped, played(1, 50)]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_whole_playlist_produces_one_join_and_one_play() {
+        let session = Session::start(Duration::from_secs(900));
+        let items = (1..=5).map(item).collect::<Vec<_>>();
+        let bulk = session
+            .player
+            .enqueue_all(items, VOICE_CHANNEL)
+            .await
+            .unwrap();
+        assert_eq!(bulk.accepted, 5);
+        session.voice.settle(2).await;
+
+        // The bug this pins: returning the last transition of a batch rather
+        // than the first meaningful one told the worker to play nothing, so a
+        // playlist queued silently and never started.
+        assert_eq!(
+            session.voice.actions(),
+            [VoiceAction::Stopped, played(1, 50)]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_track_that_cannot_be_prepared_is_skipped_rather_than_stalling() {
+        let session = Session::start(Duration::from_secs(900));
+        session.voice.refuse("source-1");
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session
+            .player
+            .enqueue(item(2), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(3).await;
+
+        // The first never plays, and the queue moves past it on its own.
+        assert_eq!(
+            session.voice.actions(),
+            [VoiceAction::Stopped, VoiceAction::Stopped, played(2, 50)]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn holding_and_continuing_reach_the_track_that_is_playing() {
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+
+        session.player.set_paused(true).await.unwrap();
+        session.voice.settle(3).await;
+        session.player.set_paused(false).await.unwrap();
+        session.voice.settle(4).await;
+        session.player.set_volume(30).await.unwrap();
+        session.voice.settle(5).await;
+
+        assert_eq!(
+            session.voice.actions()[2..],
+            [
+                VoiceAction::Paused,
+                VoiceAction::Resumed,
+                VoiceAction::VolumeSet(30)
+            ]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_level_set_mid_session_applies_to_the_next_track_too() {
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session
+            .player
+            .enqueue(item(2), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+        session.player.set_volume(20).await.unwrap();
+        session.voice.settle(3).await;
+
+        session.voice.finish_track().await;
+        session.voice.settle(5).await;
+        assert_eq!(
+            session.voice.actions()[3..],
+            [VoiceAction::Stopped, played(2, 20)]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_queue_stops_playing_but_keeps_the_channel() {
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+
+        session.voice.finish_track().await;
+        session.voice.settle(3).await;
+        // Stopped, not Left: the channel is held for the whole idle timeout so
+        // the next request joins a bot that is already connected.
+        assert_eq!(session.voice.actions()[2..], [VoiceAction::Stopped]);
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn an_expired_idle_hold_gives_up_the_channel() {
+        let session = Session::start(Duration::from_millis(80));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+        session.voice.finish_track().await;
+
+        time::timeout(Duration::from_secs(2), session.voice.settle(4))
+            .await
+            .expect("the idle hold expired without leaving");
+        assert_eq!(
+            session.voice.actions()[2..],
+            [VoiceAction::Stopped, VoiceAction::Left]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_track_queued_inside_the_idle_window_keeps_the_channel() {
+        let session = Session::start(Duration::from_millis(200));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+        session.voice.finish_track().await;
+        session.voice.settle(3).await;
+
+        session
+            .player
+            .enqueue(item(2), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(5).await;
+        time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !session.voice.actions().contains(&VoiceAction::Left),
+            "the disconnect armed by the first track survived the second"
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn stopping_gives_up_the_channel_where_an_empty_queue_does_not() {
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+
+        session.player.stop().await.unwrap();
+        session.voice.settle(3).await;
+        assert_eq!(session.voice.actions()[2..], [VoiceAction::Left]);
+        session.finish().await;
+    }
 }
 
 #[cfg(test)]
