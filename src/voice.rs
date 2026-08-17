@@ -41,6 +41,9 @@ pub trait VoiceGateway: Send + Sync + 'static {
     /// Resolves a track into something playable, without playing it.
     async fn prepare(&self, track: &TrackMetadata) -> Result<Prepared, VoiceError>;
 
+    /// Takes a voice channel without playing anything through it.
+    async fn join(&self, channel_id: u64) -> Result<(), VoiceError>;
+
     /// Joins `channel_id` if needed and plays, replacing anything already playing.
     async fn play(
         &self,
@@ -216,6 +219,14 @@ impl VoiceGateway for SongbirdGateway {
             .map_err(|error| VoiceError::Prepare(error.to_string()))
     }
 
+    async fn join(&self, channel_id: u64) -> Result<(), VoiceError> {
+        self.songbird
+            .join(GuildId::new(self.guild_id), ChannelId::new(channel_id))
+            .await
+            .map(|_| ())
+            .map_err(|error| VoiceError::Join(error.to_string()))
+    }
+
     async fn play(
         &self,
         channel_id: u64,
@@ -345,6 +356,7 @@ pub mod fake {
     /// One thing that happened to a voice channel.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub enum VoiceAction {
+        Joined(u64),
         Played {
             channel_id: u64,
             source_id: String,
@@ -452,6 +464,11 @@ pub mod fake {
                 ));
             }
             Ok(Prepared::new(track.source_id.clone()))
+        }
+
+        async fn join(&self, channel_id: u64) -> Result<(), VoiceError> {
+            self.record(VoiceAction::Joined(channel_id));
+            Ok(())
         }
 
         async fn play(

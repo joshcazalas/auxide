@@ -179,8 +179,8 @@ concurrently, and run every control command. Acceptance requires:
    interrupting playback;
 6. an emptied queue holds the voice channel for `playback.idle_timeout_seconds` and any track
    queued inside that window cancels the pending disconnect, while `/stop` and the departure of
-   the last person in the voice channel disconnect immediately, and each of the two departures
-   Auxide decides on for itself says why in the channel;
+   the last person leaving pauses rather than ending the session — lifting when anybody comes
+   back, and expiring into a departure that says why if nobody does;
 7. `/pause` holds a track and starts the same countdown, `/resume` cancels it, and `/volume`
    changes the level of what is playing and of everything queued behind it;
 8. a playlist link queues its tracks in one step and one message, stops at
@@ -205,5 +205,8 @@ concurrently, and run every control command. Acceptance requires:
 14. typing into `/play` offers suggestions without ever making a keystroke wait, choosing one
     queues it as a link rather than a fresh search, and a burst of typing never leaves a track
     waiting behind it; and
-15. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+15. `/join` brings Auxide in and picks a parked queue back up, restarting its current track
+    because the connection it was playing through is gone, and `/leave` gives up the channel
+    while keeping the queue for the length of the idle hold; and
+16. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.

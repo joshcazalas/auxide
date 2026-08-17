@@ -7,8 +7,8 @@ Spotify is deliberately out of scope.
 
 The production path now includes:
 
-- `/play`, `/queue`, `/clear`, `/remove`, `/skip`, `/stop`, `/shuffle`, `/repeat`,
-  `/now-playing`, `/pause`, `/resume`, and `/volume` guild commands;
+- `/play`, `/queue`, `/clear`, `/remove`, `/skip`, `/stop`, `/join`, `/leave`, `/shuffle`,
+  `/repeat`, `/now-playing`, `/pause`, `/resume`, and `/volume` guild commands;
 - vote-to-skip for the current track, and bulk removal of waiting ones by position or requester;
 - a bounded history of what already played, and a queue that survives a restart as a file;
 - seeking within a track, where the origin will serve ranges and state a length;
@@ -23,8 +23,8 @@ The production path now includes:
 - requester, role, guild, command-channel, and voice-channel authorization;
 - bounded yt-dlp/Deno subprocesses and fresh audio URL resolution before playback;
 - Songbird voice joining, playback, reconnect/session handling, and DAVE support;
-- a fifteen-minute hold on an emptied queue, an immediate departure from an emptied voice
-  channel, and coordinated SIGINT/SIGTERM shutdown;
+- a fifteen-minute hold on an emptied queue, a pause when the room empties that lifts when
+  somebody comes back, and coordinated SIGINT/SIGTERM shutdown;
 - structured logs and loopback-only liveness, readiness, and Prometheus endpoints;
 - a pinned `x86_64-linux` Nix build, hardened NixOS service, and unprivileged OCI image.
 
