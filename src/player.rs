@@ -36,6 +36,13 @@ pub struct PlayerSnapshot {
     pub current: Option<QueueItem>,
     pub pending: Vec<QueueItem>,
     pub voice_channel_id: Option<u64>,
+
+    /// Where the most recent request came from.
+    ///
+    /// Carried on the snapshot rather than read off the current item because
+    /// the events that most need somewhere to speak — a queue that ran out, a
+    /// channel everyone left — are precisely the ones with no item left to ask.
+    pub text_channel_id: Option<u64>,
 }
 
 impl PlayerSnapshot {
@@ -64,6 +71,12 @@ pub enum PlaybackDirective {
     Stop,
     StopAndDisconnect,
     Disconnect,
+    /// Leave because the idle hold expired with nothing queued.
+    ///
+    /// Separate from [`PlaybackDirective::Disconnect`] only so the departure can
+    /// be explained. Every other way of leaving was asked for by somebody who
+    /// therefore already knows why it happened.
+    IdleDisconnect,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -221,6 +234,7 @@ pub fn spawn_guild_player(
         current: None,
         pending: VecDeque::new(),
         voice_channel_id: None,
+        text_channel_id: None,
         idle_deadline: None,
         idle_timeout,
         random: StdRng::seed_from_u64(shuffle_seed),
@@ -269,6 +283,7 @@ struct GuildPlayer {
     current: Option<QueueItem>,
     pending: VecDeque<QueueItem>,
     voice_channel_id: Option<u64>,
+    text_channel_id: Option<u64>,
     idle_deadline: Option<Instant>,
     idle_timeout: Duration,
     random: StdRng,
@@ -285,7 +300,7 @@ impl GuildPlayer {
                     () = time::sleep_until(deadline) => {
                         self.idle_deadline = None;
                         self.voice_channel_id = None;
-                        if !self.emit(self.transition(PlaybackDirective::Disconnect)).await {
+                        if !self.emit(self.transition(PlaybackDirective::IdleDisconnect)).await {
                             break;
                         }
                         continue;
@@ -369,6 +384,7 @@ impl GuildPlayer {
             });
         }
         self.idle_deadline = None;
+        self.text_channel_id = Some(item.response_channel_id);
         if self.current.is_none() {
             self.voice_channel_id = Some(voice_channel_id);
             self.current = Some(item.clone());
@@ -450,6 +466,7 @@ impl GuildPlayer {
             current: self.current.clone(),
             pending: self.pending.iter().cloned().collect(),
             voice_channel_id: self.voice_channel_id,
+            text_channel_id: self.text_channel_id,
         }
     }
 
@@ -622,7 +639,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(idle.directive, PlaybackDirective::Disconnect);
+        assert_eq!(idle.directive, PlaybackDirective::IdleDisconnect);
         assert_eq!(idle.snapshot.voice_channel_id, None);
 
         player.shutdown().await.unwrap();
@@ -663,7 +680,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(idle.directive, PlaybackDirective::Disconnect);
+        assert_eq!(idle.directive, PlaybackDirective::IdleDisconnect);
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

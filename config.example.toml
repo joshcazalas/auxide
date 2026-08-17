@@ -25,6 +25,15 @@ max_guilds = 50
 # # When both lists are empty, any member in the requester's voice channel is authorized.
 # authorized_role_ids = []
 # authorized_user_ids = []
+# # Where Auxide posts the things nobody asked it for: a track it had to skip,
+# # and why it left a voice channel. Without this it uses whichever channel the
+# # request that started the session came from, which is usually the same place.
+# # Auxide needs Send Messages in whichever channel it ends up using.
+# announce_channel_id = 234567890123456789
+# # Name each track as it starts playing. Off by default: queueing a track
+# # already tells the channel what is coming, so on a queue people are filling
+# # live this says everything twice.
+# announce_tracks = false
 
 [playback]
 # How long Auxide waits in a voice channel after its queue runs dry. Every track

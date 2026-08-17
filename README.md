@@ -10,6 +10,8 @@ The production path now includes:
 - `/play`, `/queue`, `/skip`, `/stop`, `/shuffle`, and `/now-playing` guild commands;
 - channel-visible results for what was queued, skipped, or stopped, with private search
   pickers and private refusals;
+- unprompted notices for the events nobody asked for — a track that could not be played, and
+  why Auxide left a voice channel — plus optional per-track announcements;
 - one bounded actor/state machine per guild with stale-completion protection;
 - requester, role, guild, command-channel, and voice-channel authorization;
 - bounded yt-dlp/Deno subprocesses and fresh audio URL resolution before playback;
