@@ -18,7 +18,13 @@ then:
    with it on, anyone could add Auxide and drive it. Auxide refuses to start in that combination
    rather than let the two settings drift apart, so this is a requirement and not advice.
 4. On **Installation**, enable **Guild Install**. Include the `applications.commands` and `bot`
-   scopes and grant only **View Channels**, **Connect**, and **Speak** in the intended voice channel.
+   scopes and grant only **View Channels**, **Connect**, and **Speak** in the intended voice
+   channel, plus **Send Messages** in the text channel Auxide should post to.
+
+   **Send Messages** is the only one of the four that is optional. Replies to commands travel on
+   the interaction's own token and never need it; it covers the messages nobody asked for — a
+   track Auxide had to skip, and why it left a voice channel. Without it those events are visible
+   only in the journal, which is how every version before this one behaved.
 5. Use the generated installation link while logged into Discord and select the private test
    server. Do not create a public installation or paste the token into chat, Git, TOML, shell
    history, or the Nix store.
@@ -167,8 +173,12 @@ concurrently, and run every control command. Acceptance requires:
    interaction receives one response;
 4. what was queued, skipped, stopped, or shuffled is visible to the whole channel, while search
    results and refusals reach only the person who asked;
-5. an emptied queue holds the voice channel for `playback.idle_timeout_seconds` and any track
+5. a track that cannot be resolved names itself and its reason in the channel rather than only in
+   the journal, and revoking **Send Messages** degrades that to a logged warning without
+   interrupting playback;
+6. an emptied queue holds the voice channel for `playback.idle_timeout_seconds` and any track
    queued inside that window cancels the pending disconnect, while `/stop` and the departure of
-   the last person in the voice channel disconnect immediately; and
-6. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+   the last person in the voice channel disconnect immediately, and each of the two departures
+   Auxide decides on for itself says why in the channel; and
+7. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.

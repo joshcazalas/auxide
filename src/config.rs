@@ -79,6 +79,25 @@ pub struct GuildConfig {
     pub authorized_role_ids: BTreeSet<u64>,
     #[serde(default)]
     pub authorized_user_ids: BTreeSet<u64>,
+
+    /// Where Auxide posts the things nobody asked it for.
+    ///
+    /// A failed track and an abandoned channel are events, not answers, so
+    /// there is no interaction to reply to and no channel implied by one.
+    /// Leaving this unset falls back to whichever channel the request that
+    /// started the session came from, which is right often enough that most
+    /// servers never need to set it.
+    #[serde(default)]
+    pub announce_channel_id: Option<u64>,
+
+    /// Announce each track as it starts playing.
+    ///
+    /// Off by default. Queueing a track already tells the channel what is
+    /// coming, so on a queue people are filling live this says everything
+    /// twice; on a long queue playing through unattended it is the only signal
+    /// there is. Which of those a server is decides this.
+    #[serde(default)]
+    pub announce_tracks: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -224,6 +243,7 @@ impl Config {
             if guild.command_channel_ids.contains(&0)
                 || guild.authorized_role_ids.contains(&0)
                 || guild.authorized_user_ids.contains(&0)
+                || guild.announce_channel_id == Some(0)
             {
                 return Err(ConfigError::Validation(format!(
                     "guild {} contains a zero-valued Discord ID",

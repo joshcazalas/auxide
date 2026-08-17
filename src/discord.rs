@@ -13,7 +13,7 @@ use serenity::{
     builder::{
         CreateActionRow, CreateAllowedMentions, CreateAutocompleteResponse, CreateButton,
         CreateCommand, CreateCommandOption, CreateInteractionResponse,
-        CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+        CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage,
         EditInteractionResponse,
     },
     client::{Context, EventHandler},
@@ -318,6 +318,61 @@ struct GuildSession {
     player: GuildPlayerHandle,
 }
 
+/// Posts the things nobody asked for.
+///
+/// A track that failed and a channel everyone left are events, not answers:
+/// there is no interaction to reply to, so these are ordinary messages and need
+/// a channel to send them to and permission to send them there. Both can be
+/// absent, and both being absent is a supported way to run Auxide — it is the
+/// behaviour every version before this one had.
+#[derive(Clone)]
+struct Announcer {
+    http: Arc<Http>,
+    config: Arc<Config>,
+}
+
+impl Announcer {
+    /// Reports whether this server wants each track named as it starts.
+    fn announces_tracks(&self, guild_id: u64) -> bool {
+        self.config
+            .guild(guild_id)
+            .is_some_and(|guild| guild.announce_tracks)
+    }
+
+    /// Describes how long an emptied queue keeps its voice channel.
+    fn idle_hold(&self) -> String {
+        idle_hold(&self.config)
+    }
+
+    /// Posts to a server's announcement channel, if it has one.
+    ///
+    /// `origin` is where the request that started the session came from, used
+    /// when no channel is configured. Failure is logged and never propagated:
+    /// every caller is in the middle of something that matters more than the
+    /// message, and a server that has not granted **Send Messages** should keep
+    /// playing music rather than fail.
+    async fn announce(&self, guild_id: u64, origin: Option<u64>, content: String) {
+        let Some(channel_id) = announcement_channel(self.config.guild(guild_id), origin) else {
+            tracing::debug!(guild_id, "no announcement channel for this server");
+            return;
+        };
+        let message = CreateMessage::new()
+            .content(bounded_message(content))
+            .allowed_mentions(no_mentions());
+        if let Err(error) = ChannelId::new(channel_id)
+            .send_message(&self.http, message)
+            .await
+        {
+            tracing::warn!(
+                %error,
+                guild_id,
+                channel_id,
+                "failed to announce; check that Auxide may send messages there"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingSearch {
     created_at: Instant,
@@ -404,7 +459,7 @@ impl BotRuntime {
     /// per-request refusal, so servers already being served keep working.
     ///
     /// [`DiscordConfig::max_guilds`]: crate::config::DiscordConfig::max_guilds
-    async fn session(&self, guild_id: u64) -> Result<GuildSession> {
+    async fn session(&self, guild_id: u64, http: &Arc<Http>) -> Result<GuildSession> {
         let mut sessions = self.sessions.lock().await;
         if let Some(session) = sessions.get(&guild_id) {
             return Ok(session.clone());
@@ -426,6 +481,7 @@ impl BotRuntime {
             transitions,
             Arc::clone(&self.voice),
             self.pipeline.clone(),
+            self.announcer(http),
             self.observability.clone(),
             self.cancellation.child_token(),
         ));
@@ -441,6 +497,13 @@ impl BotRuntime {
             .set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
         tracing::info!(guild_id, servers = sessions.len(), "started a guild player");
         Ok(session)
+    }
+
+    fn announcer(&self, http: &Arc<Http>) -> Announcer {
+        Announcer {
+            http: Arc::clone(http),
+            config: Arc::clone(&self.config),
+        }
     }
 
     /// Returns a server's player only if it already has one.
@@ -470,9 +533,25 @@ impl BotRuntime {
             channel_id = channel_id.get(),
             "left an empty voice channel"
         );
+        // Read the origin channel before stopping, because stopping is what
+        // ends the session that knows it.
+        let origin = session
+            .player
+            .snapshot()
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.text_channel_id);
         if let Err(error) = session.player.stop().await {
             tracing::debug!(%error, guild_id = guild_id.get(), "guild player already stopped");
         }
+        self.announcer(&ctx.http)
+            .announce(
+                guild_id.get(),
+                origin,
+                "Everyone left the voice channel, so I stopped playing and disconnected."
+                    .to_owned(),
+            )
+            .await;
     }
 
     async fn handle_interaction(&self, ctx: &Context, interaction: Interaction) {
@@ -687,7 +766,7 @@ impl BotRuntime {
                 bail!("you are not authorized to control Auxide");
             }
         }
-        let session = self.session(guild_id).await?;
+        let session = self.session(guild_id, &ctx.http).await?;
         let voice_channel_id = requester_voice_channel(ctx, guild_id, user_id);
         Ok(Authorization {
             guild_id,
@@ -844,7 +923,12 @@ impl BotRuntime {
         let requester = mention(authorization.user_id);
         let title = single_line(&skipped.track.title, 150);
         let next = outcome.transition.snapshot.current.as_ref().map_or_else(
-            || format!("Nothing else is queued; leaving in {}.", self.idle_hold()),
+            || {
+                format!(
+                    "Nothing else is queued; leaving in {}.",
+                    idle_hold(&self.config)
+                )
+            },
             |item| format!("Now playing **{}**.", single_line(&item.track.title, 150)),
         );
         Ok(InteractionReply::message(format!(
@@ -873,13 +957,6 @@ impl BotRuntime {
             mention(authorization.user_id),
             transition.snapshot.pending.len()
         )))
-    }
-
-    /// Describes how long an emptied queue keeps its voice channel.
-    fn idle_hold(&self) -> String {
-        format_hold(Duration::from_secs(
-            self.config.playback.idle_timeout_seconds,
-        ))
     }
 
     async fn require_same_voice(
@@ -1049,6 +1126,19 @@ fn mention(user_id: u64) -> String {
     format!("<@{user_id}>")
 }
 
+/// Chooses where an unprompted message goes.
+///
+/// A configured channel is a decision and beats the fallback. Without one, the
+/// channel the session was started from is where the people who care about the
+/// answer already are.
+fn announcement_channel(guild: Option<&GuildConfig>, origin: Option<u64>) -> Option<u64> {
+    guild.and_then(|guild| guild.announce_channel_id).or(origin)
+}
+
+fn idle_hold(config: &Config) -> String {
+    format_hold(Duration::from_secs(config.playback.idle_timeout_seconds))
+}
+
 /// Renders an idle timeout the way someone waiting through it would say it.
 fn format_hold(hold: Duration) -> String {
     let minutes = hold.as_secs() / 60;
@@ -1134,12 +1224,14 @@ fn abandoned_channel(occupants: &[VoiceOccupant], bot_user_id: u64) -> Option<u6
     (!listening).then_some(channel_id)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn playback_worker(
     guild_id: u64,
     player: GuildPlayerHandle,
     mut transitions: mpsc::Receiver<PlayerTransition>,
     voice: Arc<Songbird>,
     pipeline: AudioPipeline,
+    announcer: Announcer,
     observability: ObservabilityState,
     cancellation: CancellationToken,
 ) {
@@ -1173,6 +1265,24 @@ async fn playback_worker(
                 }
                 remove_voice(&voice, guild_id).await;
             }
+            PlaybackDirective::IdleDisconnect => {
+                if let Some(handle) = active.take() {
+                    let _ = handle.stop();
+                }
+                remove_voice(&voice, guild_id).await;
+                // The only departure nobody asked for, so the only one that has
+                // to explain itself.
+                announcer
+                    .announce(
+                        guild_id,
+                        transition.snapshot.text_channel_id,
+                        format!(
+                            "Nothing has been queued for {}, so I have left the voice channel.",
+                            announcer.idle_hold()
+                        ),
+                    )
+                    .await;
+            }
             PlaybackDirective::Play(item) | PlaybackDirective::Replace(item) => {
                 if let Some(handle) = active.take() {
                     let _ = handle.stop();
@@ -1188,6 +1298,7 @@ async fn playback_worker(
                     &mut transitions,
                     &voice,
                     &pipeline,
+                    &announcer,
                     &observability,
                     &cancellation,
                     item,
@@ -1224,6 +1335,7 @@ async fn start_track(
     transitions: &mut mpsc::Receiver<PlayerTransition>,
     voice: &Songbird,
     pipeline: &AudioPipeline,
+    announcer: &Announcer,
     observability: &ObservabilityState,
     cancellation: &CancellationToken,
     item: QueueItem,
@@ -1251,6 +1363,22 @@ async fn start_track(
                 source_id = %item.track.source_id,
                 "failed to prepare queued source; advancing"
             );
+            // Without this the track simply is not there any more, and nothing
+            // in Discord distinguishes a video that went private from a bot
+            // that dropped the request. The reason is bounded and stripped of
+            // line breaks because it comes from a resolver reporting on input
+            // nobody here controls.
+            announcer
+                .announce(
+                    guild_id,
+                    Some(item.response_channel_id),
+                    format!(
+                        "Skipping **{}** — {}.",
+                        single_line(&item.track.title, 150),
+                        single_line(&error.to_string(), 200)
+                    ),
+                )
+                .await;
             let _ = player.track_finished(item.queue_id).await;
             return StartTrackOutcome::Failed;
         }
@@ -1301,6 +1429,20 @@ async fn start_track(
         title = %single_line(&item.track.title, 200),
         "playback started"
     );
+    if announcer.announces_tracks(guild_id) {
+        announcer
+            .announce(
+                guild_id,
+                Some(item.response_channel_id),
+                format!(
+                    "Now playing **{}** ({}), queued by {}.",
+                    single_line(&item.track.title, 150),
+                    format_duration(item.track.duration),
+                    mention(item.requested_by)
+                ),
+            )
+            .await;
+    }
     StartTrackOutcome::Active(handle)
 }
 
@@ -1488,6 +1630,8 @@ mod tests {
             command_channel_ids: BTreeSet::new(),
             authorized_role_ids: BTreeSet::new(),
             authorized_user_ids: BTreeSet::new(),
+            announce_channel_id: None,
+            announce_tracks: false,
         }
     }
 
@@ -1535,6 +1679,7 @@ mod tests {
             current: Some(item.clone()),
             pending: vec![item; 100],
             voice_channel_id: Some(3),
+            text_channel_id: Some(2),
         };
         assert!(format_queue(&snapshot).chars().count() < 2_000);
     }
@@ -1543,6 +1688,24 @@ mod tests {
     fn formats_track_durations() {
         assert_eq!(format_duration(Duration::from_secs(65)), "1:05");
         assert_eq!(format_duration(Duration::from_secs(3_665)), "1:01:05");
+    }
+
+    #[test]
+    fn an_unprompted_message_prefers_a_configured_channel_over_the_request_it_came_from() {
+        let mut config = guild();
+        assert_eq!(announcement_channel(Some(&config), Some(50)), Some(50));
+        config.announce_channel_id = Some(60);
+        assert_eq!(announcement_channel(Some(&config), Some(50)), Some(60));
+        assert_eq!(announcement_channel(Some(&config), None), Some(60));
+    }
+
+    #[test]
+    fn a_server_with_no_entry_and_no_request_channel_stays_silent() {
+        // Staying silent is the supported outcome, not a failure: it is how
+        // every version before announcements behaved.
+        assert_eq!(announcement_channel(None, None), None);
+        assert_eq!(announcement_channel(Some(&guild()), None), None);
+        assert_eq!(announcement_channel(None, Some(50)), Some(50));
     }
 
     #[test]
