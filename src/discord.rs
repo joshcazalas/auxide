@@ -309,7 +309,93 @@ fn command_definitions() -> Vec<CreateCommand> {
     playing_commands()
         .into_iter()
         .chain(queue_commands())
+        .chain([
+            CreateCommand::new("help").description("What Auxide can do, and who sees each answer")
+        ])
         .collect()
+}
+
+/// How `/help` groups commands, by name.
+///
+/// Only the grouping lives here; every description is read back from the
+/// command as it will be registered. A command missing from this table still
+/// appears in help under the last heading, so adding one can leave it in the
+/// wrong place but never make it disappear.
+const HELP_GROUPS: [(&str, &[&str]); 4] = [
+    (
+        "Playing",
+        &[
+            "play",
+            "now-playing",
+            "skip",
+            "pause",
+            "resume",
+            "volume",
+            "seek",
+            "forward",
+            "rewind",
+            "restart",
+        ],
+    ),
+    (
+        "The queue",
+        &[
+            "queue", "clear", "remove", "shuffle", "repeat", "history", "export", "import",
+        ],
+    ),
+    ("The voice channel", &["join", "leave", "stop"]),
+    ("About Auxide", &["help"]),
+];
+
+/// Reads back a command's name and description as it will be registered.
+///
+/// Serenity keeps a builder's fields private, so the payload it produces is the
+/// only place to read them from. Going through that rather than keeping a
+/// second list of descriptions is what stops help from ever describing a
+/// command that is not there, or wording one differently from Discord's own
+/// command picker.
+fn described(command: &CreateCommand) -> Option<(String, String)> {
+    let payload = serde_json::to_value(command).ok()?;
+    let name = payload.get("name")?.as_str()?.to_owned();
+    let description = payload.get("description")?.as_str()?.to_owned();
+    Some((name, description))
+}
+
+/// Renders every registered command, grouped, plus the rules worth knowing.
+fn help_text() -> String {
+    let commands = command_definitions();
+    let described = commands.iter().filter_map(described).collect::<Vec<_>>();
+    let mut listed = BTreeSet::new();
+    let mut text = String::new();
+
+    for (heading, names) in HELP_GROUPS {
+        let mut group = String::new();
+        for name in names {
+            if let Some((name, description)) =
+                described.iter().find(|(candidate, _)| candidate == name)
+            {
+                listed.insert(name.clone());
+                let _ = writeln!(group, "`/{name}` — {description}");
+            }
+        }
+        if !group.is_empty() {
+            let _ = write!(text, "**{heading}**\n{group}\n");
+        }
+    }
+    // A command nobody thought to group is still a command somebody can run.
+    for (name, description) in described.iter().filter(|(name, _)| !listed.contains(name)) {
+        let _ = writeln!(text, "`/{name}` — {description}");
+    }
+
+    text.push_str(
+        "**Worth knowing**\n\
+         Search results and refusals reach only you; what you queued, skipped, or stopped \
+         reaches the channel.\n\
+         An empty queue is not a departure — Auxide waits, and every track that plays resets \
+         that wait.\n\
+         Skipping somebody else's track needs half the channel to agree. Your own never does.",
+    );
+    text
 }
 
 /// Commands about what is playing now.
@@ -1004,6 +1090,7 @@ impl BotRuntime {
             "import" => self.import(ctx, command, authorization).await,
             "remove" => self.remove(ctx, command, authorization).await,
             "skip" => self.skip(ctx, command, authorization).await,
+            "help" => Ok(Self::help()),
             "join" => self.join(authorization).await,
             "leave" => self.leave(ctx, authorization).await,
             "stop" => self.stop(ctx, authorization).await,
@@ -1677,6 +1764,16 @@ impl BotRuntime {
             mention(authorization.user_id),
             transition.snapshot.volume_percent
         )))
+    }
+
+    /// Describes every command, from the same list Discord is given.
+    fn help() -> InteractionReply {
+        InteractionReply::from(Announcement::card(
+            CreateEmbed::new()
+                .author(CreateEmbedAuthor::new("Auxide"))
+                .description(bounded_embed(help_text()))
+                .colour(EMBED_COLOUR),
+        ))
     }
 
     /// Comes into the requester's channel, picking a parked queue back up.
@@ -2616,6 +2713,19 @@ fn single_line(value: &str, max_chars: usize) -> String {
     }
 }
 
+/// Trims a string to what an embed description will hold.
+fn bounded_embed(value: String) -> String {
+    if value.chars().count() <= EMBED_DESCRIPTION_CHARS {
+        value
+    } else {
+        value
+            .chars()
+            .take(EMBED_DESCRIPTION_CHARS - 1)
+            .collect::<String>()
+            + "…"
+    }
+}
+
 fn bounded_message(value: String) -> String {
     if value.chars().count() <= 1_950 {
         value
@@ -3356,6 +3466,52 @@ mod tests {
 
         for bad in ["0", "0-3", "7-3", "", "three", "3-", "-3", "3-4-5"] {
             assert!(parse_track_range(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn help_describes_every_command_that_is_registered() {
+        let text = help_text();
+        for command in command_definitions() {
+            let (name, description) =
+                described(&command).expect("a registered command has a name and a description");
+            assert!(
+                text.contains(&format!("`/{name}` — {description}")),
+                "/{name} is registered but missing from help"
+            );
+        }
+        // Including itself, which is the command somebody runs to find the
+        // others.
+        assert!(text.contains("`/help`"));
+    }
+
+    #[test]
+    fn help_stays_inside_what_an_embed_will_hold() {
+        assert!(bounded_embed(help_text()).chars().count() <= EMBED_DESCRIPTION_CHARS);
+        assert_eq!(
+            bounded_embed("x".repeat(EMBED_DESCRIPTION_CHARS + 100))
+                .chars()
+                .count(),
+            EMBED_DESCRIPTION_CHARS
+        );
+    }
+
+    #[test]
+    fn a_command_nobody_grouped_still_appears() {
+        // Every name in the grouping table has to be a command that exists, or
+        // the heading it sits under is describing something imaginary.
+        let registered = command_definitions()
+            .iter()
+            .filter_map(described)
+            .map(|(name, _)| name)
+            .collect::<BTreeSet<_>>();
+        for (heading, names) in HELP_GROUPS {
+            for name in names {
+                assert!(
+                    registered.contains(*name),
+                    "help groups /{name} under {heading}, but nothing registers it"
+                );
+            }
         }
     }
 
