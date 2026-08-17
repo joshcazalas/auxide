@@ -10,12 +10,12 @@
 //! because a worker is per guild too — it removes the guild id from every
 //! method and gives the implementation somewhere to keep the track it started.
 
-use std::{any::Any, sync::Arc, time::Duration};
+use std::{any::Any, fmt::Write as _, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serenity::model::id::{ChannelId, GuildId};
 use songbird::{
-    Event, EventContext, EventHandler as VoiceEventHandler, Songbird, TrackEvent,
+    Call, Event, EventContext, EventHandler as VoiceEventHandler, Songbird, TrackEvent,
     input::Input,
     tracks::{PlayMode, TrackHandle},
 };
@@ -133,6 +133,27 @@ pub enum VoiceError {
     NotSeekable,
 }
 
+/// Everything an error has to say, not only its outermost sentence.
+///
+/// Songbird reports every failed voice connection as `establishing connection
+/// failed` and keeps the reason — a close code from Discord, a refused socket,
+/// a crypto mode the server would not offer — behind [`Error::source`]. Logging
+/// the error on its own therefore records only that something went wrong, which
+/// is the one thing the journal already knew, and leaves an operator with no
+/// way to tell a revoked permission apart from a blocked port.
+///
+/// [`Error::source`]: std::error::Error::source
+fn full_cause(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        // Writing into a String cannot fail, so there is nothing to report.
+        let _ = write!(message, ": {next}");
+        cause = next.source();
+    }
+    message
+}
+
 /// Makes a gateway for a guild, the first time that guild needs one.
 ///
 /// A session's gateway cannot be built before the session exists, so the
@@ -189,6 +210,35 @@ impl SongbirdGateway {
         }
     }
 
+    /// Takes the voice channel, and leaves nothing behind if it cannot.
+    ///
+    /// A driver failure leaves Songbird still holding the endpoint, token, and
+    /// session Discord issued for the attempt, with the gateway half of the
+    /// handshake marked complete. The next join sees a finished handshake for
+    /// the same channel, skips the gateway entirely, and retries the driver
+    /// against those same details — so once one attempt fails, every later one
+    /// fails identically until the process restarts. Songbird's own guidance is
+    /// to leave the server on the gateway before re-attempting, so that is done
+    /// here on the way out of the failure: the next `/play` then starts a fresh
+    /// handshake instead of replaying the broken one.
+    async fn connect(&self, channel_id: u64) -> Result<Arc<Mutex<Call>>, VoiceError> {
+        let guild = GuildId::new(self.guild_id);
+        match self.songbird.join(guild, ChannelId::new(channel_id)).await {
+            Ok(call) => Ok(call),
+            Err(error) => {
+                let reason = full_cause(&error);
+                if let Err(error) = self.songbird.remove(guild).await {
+                    tracing::debug!(
+                        %error,
+                        guild_id = self.guild_id,
+                        "could not discard the failed voice session"
+                    );
+                }
+                Err(VoiceError::Join(reason))
+            }
+        }
+    }
+
     /// Applies something to the current track, if there is one.
     ///
     /// Every one of these is a no-op with nothing playing, which is the right
@@ -220,11 +270,7 @@ impl VoiceGateway for SongbirdGateway {
     }
 
     async fn join(&self, channel_id: u64) -> Result<(), VoiceError> {
-        self.songbird
-            .join(GuildId::new(self.guild_id), ChannelId::new(channel_id))
-            .await
-            .map(|_| ())
-            .map_err(|error| VoiceError::Join(error.to_string()))
+        self.connect(channel_id).await.map(|_| ())
     }
 
     async fn play(
@@ -235,11 +281,7 @@ impl VoiceGateway for SongbirdGateway {
         ended: Arc<dyn TrackEnded>,
     ) -> Result<(), VoiceError> {
         let prepared: Input = prepared.take();
-        let call = self
-            .songbird
-            .join(GuildId::new(self.guild_id), ChannelId::new(channel_id))
-            .await
-            .map_err(|error| VoiceError::Join(error.to_string()))?;
+        let call = self.connect(channel_id).await?;
         let handle = call.lock().await.play_only_input(prepared);
         if let Err(error) = handle.set_volume(volume) {
             tracing::warn!(%error, guild_id = self.guild_id, "failed to set playback volume");
@@ -252,7 +294,7 @@ impl VoiceGateway for SongbirdGateway {
             },
         ) {
             let _ = handle.stop();
-            return Err(VoiceError::Play(error.to_string()));
+            return Err(VoiceError::Play(full_cause(&error)));
         }
         *self.active.lock().await = Some(handle);
         Ok(())
@@ -328,6 +370,32 @@ impl VoiceEventHandler for EndedEvent {
         }
         self.ended.ended().await;
         Some(Event::Cancel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use songbird::error::{ConnectionError, JoinError};
+
+    use super::full_cause;
+
+    #[test]
+    fn a_failed_join_reports_the_reason_and_not_only_the_summary() {
+        // Every driver failure Songbird can have — a close code from Discord, a
+        // refused socket, a crypto mode the server would not offer — displays
+        // as the same sentence, and only the cause behind it tells them apart.
+        // Written against the real error so that a Songbird upgrade which stops
+        // carrying the cause fails here rather than in a journal months later.
+        let error = JoinError::Driver(ConnectionError::CryptoModeUnavailable);
+        assert_eq!(
+            error.to_string(),
+            "failed to join voice channel: establishing connection failed"
+        );
+        assert_eq!(
+            full_cause(&error),
+            "failed to join voice channel: establishing connection failed: failed to connect to \
+             Discord RTP server: server did not offer chosen encryption mode"
+        );
     }
 }
 
