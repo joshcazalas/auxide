@@ -12,9 +12,9 @@ use serenity::{
     Client, async_trait,
     builder::{
         CreateActionRow, CreateAllowedMentions, CreateAutocompleteResponse, CreateButton,
-        CreateCommand, CreateCommandOption, CreateInteractionResponse,
-        CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage,
-        EditInteractionResponse,
+        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
+        CreateInteractionResponse, CreateInteractionResponseFollowup,
+        CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse,
     },
     client::{Context, EventHandler},
     gateway::{ConnectionStage, ShardStageUpdateEvent},
@@ -54,6 +54,16 @@ use crate::{
 const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
 const MAX_PENDING_SEARCHES: usize = 128;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The colour on every Auxide embed, so a channel reads them as one voice.
+const EMBED_COLOUR: u32 = 0x00B5_732E;
+
+// Discord's own embed limits are 256 characters for a title, 2048 for a footer,
+// and 4096 for a description. Auxide stays well inside all three, because a
+// title long enough to reach the limit is unreadable before it is rejected.
+const EMBED_TITLE_CHARS: usize = 200;
+const EMBED_FOOTER_CHARS: usize = 100;
+const EMBED_DESCRIPTION_CHARS: usize = 3_800;
 
 /// Registers the complete Auxide command set for this application.
 ///
@@ -318,6 +328,36 @@ struct GuildSession {
     player: GuildPlayerHandle,
 }
 
+/// The part of a message that is the same whichever route it takes to Discord.
+///
+/// An interaction reply, a follow-up, and an unprompted post are three
+/// different builders, and every one of them can carry this.
+#[derive(Clone, Debug, Default)]
+struct Announcement {
+    content: String,
+    embeds: Vec<CreateEmbed>,
+}
+
+impl Announcement {
+    fn text(content: impl Into<String>) -> Self {
+        Self {
+            content: bounded_message(content.into()),
+            embeds: Vec::new(),
+        }
+    }
+
+    /// A card with no sentence above it.
+    ///
+    /// The embed already names the track, who queued it, and where it landed,
+    /// so a line of prose repeating that is the same message twice.
+    fn card(embed: CreateEmbed) -> Self {
+        Self {
+            content: String::new(),
+            embeds: vec![embed],
+        }
+    }
+}
+
 /// Posts the things nobody asked for.
 ///
 /// A track that failed and a channel everyone left are events, not answers:
@@ -351,13 +391,14 @@ impl Announcer {
     /// every caller is in the middle of something that matters more than the
     /// message, and a server that has not granted **Send Messages** should keep
     /// playing music rather than fail.
-    async fn announce(&self, guild_id: u64, origin: Option<u64>, content: String) {
+    async fn announce(&self, guild_id: u64, origin: Option<u64>, announcement: Announcement) {
         let Some(channel_id) = announcement_channel(self.config.guild(guild_id), origin) else {
             tracing::debug!(guild_id, "no announcement channel for this server");
             return;
         };
         let message = CreateMessage::new()
-            .content(bounded_message(content))
+            .content(announcement.content)
+            .embeds(announcement.embeds)
             .allowed_mentions(no_mentions());
         if let Err(error) = ChannelId::new(channel_id)
             .send_message(&self.http, message)
@@ -401,25 +442,36 @@ enum Audience {
 #[derive(Debug)]
 struct InteractionReply {
     content: String,
+    embeds: Vec<CreateEmbed>,
     components: Vec<CreateActionRow>,
     /// A second, channel-visible message to post alongside a private answer.
     ///
     /// A search picker has to stay private while the choice made with it does
     /// not, and one interaction cannot answer twice with different audiences.
-    announcement: Option<String>,
+    announcement: Option<Announcement>,
 }
 
 impl InteractionReply {
     fn message(content: impl Into<String>) -> Self {
         Self {
             content: bounded_message(content.into()),
+            embeds: Vec::new(),
             components: Vec::new(),
             announcement: None,
         }
     }
 
-    fn announcing(mut self, announcement: impl Into<String>) -> Self {
-        self.announcement = Some(bounded_message(announcement.into()));
+    fn from(announcement: Announcement) -> Self {
+        Self {
+            content: announcement.content,
+            embeds: announcement.embeds,
+            components: Vec::new(),
+            announcement: None,
+        }
+    }
+
+    fn announcing(mut self, announcement: Announcement) -> Self {
+        self.announcement = Some(announcement);
         self
     }
 }
@@ -548,8 +600,9 @@ impl BotRuntime {
             .announce(
                 guild_id.get(),
                 origin,
-                "Everyone left the voice channel, so I stopped playing and disconnected."
-                    .to_owned(),
+                Announcement::text(
+                    "Everyone left the voice channel, so I stopped playing and disconnected.",
+                ),
             )
             .await;
     }
@@ -625,6 +678,7 @@ impl BotRuntime {
         };
         let edit = EditInteractionResponse::new()
             .content(reply.content)
+            .embeds(reply.embeds)
             .components(reply.components)
             .allowed_mentions(no_mentions());
         let response = command.edit_response(&ctx.http, edit).await;
@@ -795,7 +849,7 @@ impl BotRuntime {
             return self
                 .enqueue_track(&authorization, voice_channel_id, track)
                 .await
-                .map(InteractionReply::message);
+                .map(InteractionReply::from);
         }
 
         let result = self.resolver.search(query).await;
@@ -847,6 +901,7 @@ impl BotRuntime {
         }
         Ok(InteractionReply {
             content: bounded_message(content),
+            embeds: Vec::new(),
             components: vec![CreateActionRow::Buttons(buttons)],
             announcement: None,
         })
@@ -862,7 +917,7 @@ impl BotRuntime {
         authorization: &Authorization,
         voice_channel_id: u64,
         track: TrackMetadata,
-    ) -> Result<String> {
+    ) -> Result<Announcement> {
         let item = QueueItem::new(
             track.clone(),
             authorization.user_id,
@@ -874,13 +929,13 @@ impl BotRuntime {
             .player
             .enqueue(item, voice_channel_id)
             .await?;
-        let requester = mention(authorization.user_id);
-        let title = single_line(&track.title, 150);
-        let duration = format_duration(track.duration);
         if matches!(transition.directive, PlaybackDirective::Play(_)) {
-            return Ok(format!(
-                "{requester} started playing **{title}** ({duration})."
-            ));
+            return Ok(Announcement::card(track_embed(
+                "Now playing",
+                &track,
+                authorization.user_id,
+                None,
+            )));
         }
         let position = transition
             .snapshot
@@ -888,30 +943,41 @@ impl BotRuntime {
             .iter()
             .position(|queued| queued.queue_id == queue_id)
             .map_or(1, |index| index + 2);
-        Ok(format!(
-            "{requester} queued **{title}** ({duration}) at position {position}."
-        ))
+        Ok(Announcement::card(track_embed(
+            "Added to the queue",
+            &track,
+            authorization.user_id,
+            Some(position),
+        )))
     }
 
     async fn queue(&self, authorization: Authorization) -> Result<InteractionReply> {
         let snapshot = authorization.session.player.snapshot().await?;
-        Ok(InteractionReply::message(format_queue(&snapshot)))
+        let Some(description) = format_queue(&snapshot) else {
+            return Ok(InteractionReply::message("The queue is empty."));
+        };
+        // An embed description holds twice what a message does, which is the
+        // difference between listing twenty of a hundred queued tracks and
+        // listing most of them.
+        Ok(InteractionReply::from(Announcement::card(
+            CreateEmbed::new()
+                .author(CreateEmbedAuthor::new("Queue"))
+                .description(description)
+                .colour(EMBED_COLOUR),
+        )))
     }
 
     async fn now_playing(&self, authorization: Authorization) -> Result<InteractionReply> {
         let snapshot = authorization.session.player.snapshot().await?;
-        let content = snapshot.current.as_ref().map_or_else(
-            || "Nothing is playing.".to_owned(),
-            |item| {
-                format!(
-                    "Now playing **{}** ({})\n{}",
-                    single_line(&item.track.title, 150),
-                    format_duration(item.track.duration),
-                    item.track.canonical_url
-                )
-            },
-        );
-        Ok(InteractionReply::message(content))
+        let Some(item) = snapshot.current else {
+            return Ok(InteractionReply::message("Nothing is playing."));
+        };
+        Ok(InteractionReply::from(Announcement::card(track_embed(
+            "Now playing",
+            &item.track,
+            item.requested_by,
+            None,
+        ))))
     }
 
     async fn skip(&self, ctx: &Context, authorization: Authorization) -> Result<InteractionReply> {
@@ -989,7 +1055,9 @@ impl BotRuntime {
             .create_response(
                 &ctx.http,
                 CreateInteractionResponse::UpdateMessage(
-                    update_message(reply.content).components(reply.components),
+                    update_message(reply.content)
+                        .embeds(reply.embeds)
+                        .components(reply.components),
                 ),
             )
             .await;
@@ -1004,7 +1072,10 @@ impl BotRuntime {
         // the track is already queued either way.
         if let Some(announcement) = announcement {
             if let Err(error) = component
-                .create_followup(&ctx.http, followup_message(announcement))
+                .create_followup(
+                    &ctx.http,
+                    followup_message(announcement.content).embeds(announcement.embeds),
+                )
                 .await
             {
                 tracing::warn!(%error, "failed to announce a search selection");
@@ -1124,6 +1195,50 @@ fn query_option(command: &CommandInteraction) -> Option<&str> {
 /// Renders a requester as a mention, which [`no_mentions`] keeps from pinging.
 fn mention(user_id: u64) -> String {
     format!("<@{user_id}>")
+}
+
+/// Builds the card Auxide shows for one track.
+///
+/// Everything on it was already being parsed out of the source and carried
+/// through the queue: the uploader, the artwork, and who asked for it were
+/// collected from the first version of the resolver and had never reached
+/// Discord.
+///
+/// `heading` is what happened rather than what the track is — the same track
+/// is a different event when it starts playing than when it joins a queue.
+/// `position` is present only for a track that has to wait its turn.
+fn track_embed(
+    heading: &str,
+    track: &TrackMetadata,
+    requested_by: u64,
+    position: Option<usize>,
+) -> CreateEmbed {
+    let mut embed = CreateEmbed::new()
+        .author(CreateEmbedAuthor::new(heading))
+        .title(single_line(&track.title, EMBED_TITLE_CHARS))
+        .url(track.canonical_url.as_str())
+        .colour(EMBED_COLOUR)
+        .field("Duration", format_duration(track.duration), true);
+    if let Some(position) = position {
+        embed = embed.field("Position", position.to_string(), true);
+    }
+    // A mention resolves inside a field value, and `no_mentions` still keeps it
+    // from notifying anybody — the same trade the plain-text replies make.
+    embed = embed.field("Requested by", mention(requested_by), true);
+    if let Some(channel) = &track.channel {
+        // Footers are plain text, so an uploader called `**bold**` renders as
+        // written rather than as markup.
+        embed = embed.footer(CreateEmbedFooter::new(single_line(
+            channel,
+            EMBED_FOOTER_CHARS,
+        )));
+    }
+    // Already parsed as an HTTPS URL by the resolver, which is what makes it
+    // safe to hand to Discord to fetch.
+    if let Some(thumbnail) = &track.thumbnail_url {
+        embed = embed.thumbnail(thumbnail.as_str());
+    }
+    embed
 }
 
 /// Chooses where an unprompted message goes.
@@ -1276,10 +1391,10 @@ async fn playback_worker(
                     .announce(
                         guild_id,
                         transition.snapshot.text_channel_id,
-                        format!(
+                        Announcement::text(format!(
                             "Nothing has been queued for {}, so I have left the voice channel.",
                             announcer.idle_hold()
-                        ),
+                        )),
                     )
                     .await;
             }
@@ -1372,11 +1487,11 @@ async fn start_track(
                 .announce(
                     guild_id,
                     Some(item.response_channel_id),
-                    format!(
+                    Announcement::text(format!(
                         "Skipping **{}** — {}.",
                         single_line(&item.track.title, 150),
                         single_line(&error.to_string(), 200)
-                    ),
+                    )),
                 )
                 .await;
             let _ = player.track_finished(item.queue_id).await;
@@ -1434,12 +1549,12 @@ async fn start_track(
             .announce(
                 guild_id,
                 Some(item.response_channel_id),
-                format!(
-                    "Now playing **{}** ({}), queued by {}.",
-                    single_line(&item.track.title, 150),
-                    format_duration(item.track.duration),
-                    mention(item.requested_by)
-                ),
+                Announcement::card(track_embed(
+                    "Now playing",
+                    &item.track,
+                    item.requested_by,
+                    None,
+                )),
             )
             .await;
     }
@@ -1499,34 +1614,39 @@ fn prune_searches(searches: &mut HashMap<Uuid, PendingSearch>) {
     searches.retain(|_, pending| now.duration_since(pending.created_at) < SEARCH_SELECTION_TTL);
 }
 
-fn format_queue(snapshot: &PlayerSnapshot) -> String {
-    let Some(current) = &snapshot.current else {
-        return "The queue is empty.".to_owned();
-    };
+/// Renders the queue, or `None` when there is nothing in it.
+///
+/// Each line names who asked for the track. In a queue four people are filling
+/// at once that is the thing worth knowing, and it was recorded on every item
+/// from the first version of the player without ever being shown.
+fn format_queue(snapshot: &PlayerSnapshot) -> Option<String> {
+    let current = snapshot.current.as_ref()?;
     let mut content = format!(
-        "Now: **{}** ({})\n",
+        "**Now playing**\n{} ({}) — {}\n",
         single_line(&current.track.title, 120),
-        format_duration(current.track.duration)
+        format_duration(current.track.duration),
+        mention(current.requested_by)
     );
     if snapshot.pending.is_empty() {
-        content.push_str("No tracks are waiting.");
-        return content;
+        content.push_str("\nNo tracks are waiting.");
+        return Some(content);
     }
-    content.push_str("Up next:\n");
+    content.push_str("\n**Up next**\n");
     for (index, item) in snapshot.pending.iter().enumerate() {
         let line = format!(
-            "{}. {} ({})\n",
+            "{}. {} ({}) — {}\n",
             index + 1,
             single_line(&item.track.title, 100),
-            format_duration(item.track.duration)
+            format_duration(item.track.duration),
+            mention(item.requested_by)
         );
-        if content.chars().count() + line.chars().count() > 1_850 {
-            content.push_str("…and more.");
+        if content.chars().count() + line.chars().count() > EMBED_DESCRIPTION_CHARS {
+            let _ = write!(content, "…and {} more.", snapshot.pending.len() - index);
             break;
         }
         content.push_str(&line);
     }
-    content
+    Some(content)
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -1664,24 +1784,77 @@ mod tests {
         assert!(bounded_message("x".repeat(4_000)).chars().count() <= 1_950);
     }
 
-    #[test]
-    fn queue_rendering_stays_inside_discord_limits() {
-        let track = TrackMetadata {
+    fn track(title: &str) -> TrackMetadata {
+        TrackMetadata {
             source_id: "id".to_owned(),
             canonical_url: Url::parse("https://www.youtube.com/watch?v=id").unwrap(),
-            title: "x".repeat(500),
-            channel: None,
+            title: title.to_owned(),
+            channel: Some("Example Channel".to_owned()),
             duration: Duration::from_secs(120),
-            thumbnail_url: None,
-        };
-        let item = QueueItem::new(track, 1, 2);
+            thumbnail_url: Some(Url::parse("https://i.ytimg.com/example.jpg").unwrap()),
+        }
+    }
+
+    #[test]
+    fn queue_rendering_stays_inside_discord_limits() {
+        let item = QueueItem::new(track(&"x".repeat(500)), 1, 2);
         let snapshot = PlayerSnapshot {
             current: Some(item.clone()),
             pending: vec![item; 100],
             voice_channel_id: Some(3),
             text_channel_id: Some(2),
         };
-        assert!(format_queue(&snapshot).chars().count() < 2_000);
+        let rendered = format_queue(&snapshot).unwrap();
+        assert!(rendered.chars().count() <= EMBED_DESCRIPTION_CHARS + 100);
+        assert!(rendered.contains("…and"), "truncation was not reported");
+    }
+
+    #[test]
+    fn the_queue_names_who_asked_for_each_track() {
+        let snapshot = PlayerSnapshot {
+            current: Some(QueueItem::new(track("Playing"), 11, 2)),
+            pending: vec![QueueItem::new(track("Waiting"), 22, 2)],
+            voice_channel_id: Some(3),
+            text_channel_id: Some(2),
+        };
+        let rendered = format_queue(&snapshot).unwrap();
+        assert!(rendered.contains("**Now playing**\nPlaying (2:00) — <@11>"));
+        assert!(rendered.contains("1. Waiting (2:00) — <@22>"));
+    }
+
+    #[test]
+    fn an_empty_queue_has_nothing_to_render() {
+        assert_eq!(format_queue(&PlayerSnapshot::default()), None);
+    }
+
+    #[test]
+    fn a_track_card_carries_the_metadata_and_bounds_it() {
+        let embed = track_embed("Added to the queue", &track(&"y".repeat(400)), 7, Some(3));
+        let json = serde_json::to_value(&embed).unwrap();
+        assert_eq!(json["author"]["name"], "Added to the queue");
+        assert_eq!(json["url"], "https://www.youtube.com/watch?v=id");
+        assert_eq!(json["footer"]["text"], "Example Channel");
+        assert_eq!(json["thumbnail"]["url"], "https://i.ytimg.com/example.jpg");
+        let fields = json["fields"].as_array().unwrap();
+        assert_eq!(fields[0]["value"], "2:00");
+        assert_eq!(fields[1]["value"], "3");
+        assert_eq!(fields[2]["value"], "<@7>");
+        // Discord rejects a title over 256 characters outright, so an
+        // over-long one has to be cut before it is sent, not after.
+        assert!(json["title"].as_str().unwrap().chars().count() <= 256);
+    }
+
+    #[test]
+    fn a_playing_track_has_no_position_to_wait_in() {
+        let embed = track_embed("Now playing", &track("Playing"), 7, None);
+        let json = serde_json::to_value(&embed).unwrap();
+        let names: Vec<_> = json["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|field| field["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(names, ["Duration", "Requested by"]);
     }
 
     #[test]

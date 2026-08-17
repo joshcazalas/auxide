@@ -172,7 +172,8 @@ concurrently, and run every control command. Acceptance requires:
 3. queue order is deterministic, stale completion events do not skip replacements, and each
    interaction receives one response;
 4. what was queued, skipped, stopped, or shuffled is visible to the whole channel, while search
-   results and refusals reach only the person who asked;
+   results and refusals reach only the person who asked, and a queued track shows its artwork,
+   uploader, duration, and requester;
 5. a track that cannot be resolved names itself and its reason in the channel rather than only in
    the journal, and revoking **Send Messages** degrades that to a logged warning without
    interrupting playback;
