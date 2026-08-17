@@ -191,6 +191,9 @@ concurrently, and run every control command. Acceptance requires:
    only reorders what is waiting, and `/stop` forgets both;
 10. `/clear` and `/remove` change only what is waiting — the current track keeps playing and the
     channel is kept — and a position printed on any page of `/queue` is the position `/remove`
-    takes; and
-11. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+    takes;
+11. `/skip` alone needs half the channel to agree before cutting somebody else's track short,
+    while the person who queued it may always skip their own, and `/skip tracks:` and
+    `/skip requester:` take waiting tracks out without touching what is playing; and
+12. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.

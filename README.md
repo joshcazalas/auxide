@@ -9,6 +9,7 @@ The production path now includes:
 
 - `/play`, `/queue`, `/clear`, `/remove`, `/skip`, `/stop`, `/shuffle`, `/repeat`,
   `/now-playing`, `/pause`, `/resume`, and `/volume` guild commands;
+- vote-to-skip for the current track, and bulk removal of waiting ones by position or requester;
 - channel-visible results for what was queued, skipped, or stopped, with private search
   pickers and private refusals;
 - track cards carrying artwork, uploader, duration, and who asked for it;

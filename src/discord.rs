@@ -44,7 +44,7 @@ use crate::{
     observability::{ObservabilityServer, ObservabilityState, start_observability},
     player::{
         GuildPlayerHandle, PlaybackDirective, PlayerSnapshot, PlayerTransition, QueueItem,
-        RepeatMode, ShuffleChange, spawn_guild_player,
+        RepeatMode, ShuffleChange, SkipVerdict, spawn_guild_player,
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
     voice::{SongbirdVoice, TrackEnded, VoiceGateway, VoiceGatewayFactory},
@@ -335,7 +335,26 @@ fn command_definitions() -> Vec<CreateCommand> {
                 .required(true)
                 .min_int_value(1),
             ),
-        CreateCommand::new("skip").description("Skip the current track"),
+        CreateCommand::new("skip")
+            .description("Skip the current track, or take waiting ones out")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "tracks",
+                    "A waiting position or run of them, like 3 or 3-7",
+                )
+                .required(false)
+                .min_length(1)
+                .max_length(16),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::User,
+                    "requester",
+                    "Take out everything this person queued",
+                )
+                .required(false),
+            ),
         CreateCommand::new("stop").description("Clear the queue and disconnect"),
         CreateCommand::new("shuffle")
             .description("Play the queue in random order, or reorder it once")
@@ -841,7 +860,7 @@ impl BotRuntime {
             "queue" => self.queue(command, authorization).await,
             "clear" => self.clear(ctx, authorization).await,
             "remove" => self.remove(ctx, command, authorization).await,
-            "skip" => self.skip(ctx, authorization).await,
+            "skip" => self.skip(ctx, command, authorization).await,
             "stop" => self.stop(ctx, authorization).await,
             "shuffle" => self.shuffle(ctx, command, authorization).await,
             "repeat" => self.repeat(ctx, command, authorization).await,
@@ -1204,26 +1223,76 @@ impl BotRuntime {
         ))))
     }
 
-    async fn skip(&self, ctx: &Context, authorization: Authorization) -> Result<InteractionReply> {
+    async fn skip(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
         self.require_same_voice(ctx, &authorization).await?;
-        let outcome = authorization.session.player.skip().await?;
-        // Nothing changed, so this is the requester's mistake to hear about and
-        // not an event worth announcing to the channel.
-        let skipped = outcome.skipped.context("nothing is playing to skip")?;
         let requester = mention(authorization.user_id);
-        let title = single_line(&skipped.track.title, 150);
-        let next = outcome.transition.snapshot.current.as_ref().map_or_else(
-            || {
+
+        // Taking waiting tracks out is not the same act as cutting short what
+        // the room is listening to, and only the second one needs anybody's
+        // agreement.
+        if let Some(who) = user_option(command, "requester") {
+            let removed = authorization.session.player.remove_requester(who).await?;
+            if removed.removed.is_empty() {
+                bail!("{} has nothing waiting in the queue", mention(who));
+            }
+            return Ok(InteractionReply::message(format!(
+                "{requester} took out {} track(s) queued by {}.",
+                removed.removed.len(),
+                mention(who)
+            )));
+        }
+        if let Some(spec) = string_option(command, "tracks") {
+            let (from, to) = parse_track_range(spec)?;
+            let removed = authorization.session.player.remove_range(from, to).await?;
+            let names = removed
+                .removed
+                .first()
+                .map(|item| single_line(&item.track.title, 100))
+                .unwrap_or_default();
+            return Ok(InteractionReply::message(if removed.removed.len() == 1 {
+                format!("{requester} took **{names}** out of the queue.")
+            } else {
                 format!(
-                    "Nothing else is queued; leaving in {}.",
-                    idle_hold(&self.config)
+                    "{requester} took {} tracks out of the queue, starting with **{names}**.",
+                    removed.removed.len()
                 )
-            },
-            |item| format!("Now playing **{}**.", single_line(&item.track.title, 150)),
-        );
-        Ok(InteractionReply::message(format!(
-            "{requester} skipped **{title}**. {next}"
-        )))
+            }));
+        }
+
+        let listeners = listener_count(ctx, GuildId::new(authorization.guild_id));
+        let needed = votes_needed(listeners);
+        match authorization
+            .session
+            .player
+            .vote_skip(authorization.user_id, needed)
+            .await?
+        {
+            SkipVerdict::Pending { have, needed } => Ok(InteractionReply::message(format!(
+                "{requester} wants to skip this one. {have} of {needed} so far — \
+                 run `/skip` to agree."
+            ))),
+            SkipVerdict::Skipped(outcome) => {
+                let skipped = outcome.skipped.context("nothing is playing to skip")?;
+                let title = single_line(&skipped.track.title, 150);
+                let next = outcome.transition.snapshot.current.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "Nothing else is queued; leaving in {}.",
+                            idle_hold(&self.config)
+                        )
+                    },
+                    |item| format!("Now playing **{}**.", single_line(&item.track.title, 150)),
+                );
+                Ok(InteractionReply::message(format!(
+                    "{requester} skipped **{title}**. {next}"
+                )))
+            }
+        }
     }
 
     async fn set_paused(
@@ -1528,12 +1597,58 @@ fn audience_for(command: &str, argument: Option<&str>) -> Audience {
     }
 }
 
-fn query_option(command: &CommandInteraction) -> Option<&str> {
+fn user_option(command: &CommandInteraction, name: &str) -> Option<u64> {
     command
         .data
         .options
         .iter()
-        .find(|option| option.name == "query")
+        .find(|option| option.name == name)
+        .and_then(|option| match &option.value {
+            CommandDataOptionValue::User(id) => Some(id.get()),
+            _ => None,
+        })
+}
+
+/// Reads `3` or `3-7` as the run of waiting positions it names.
+///
+/// Inclusive at both ends, because that is how the numbers in `/queue` read.
+fn parse_track_range(spec: &str) -> Result<(usize, usize)> {
+    let spec = spec.trim();
+    let (first, last) = spec.split_once('-').unwrap_or((spec, spec));
+    let unreadable = || format!("{spec:?} is not a position or a run of them, like 3 or 3-7");
+    let first: usize = first.trim().parse().with_context(unreadable)?;
+    let last: usize = last.trim().parse().with_context(unreadable)?;
+    if first == 0 {
+        bail!("positions start at 1");
+    }
+    if last < first {
+        bail!("{spec:?} runs backwards");
+    }
+    Ok((first, last))
+}
+
+/// How many people have to agree before one of them cuts a track short.
+///
+/// Half the channel, but never fewer than two: with one other person present a
+/// threshold of one would mean there was no vote at all. Somebody listening
+/// alone never needs anybody's agreement.
+fn votes_needed(listeners: usize) -> usize {
+    if listeners <= 1 {
+        return 1;
+    }
+    listeners.div_ceil(2).max(2)
+}
+
+fn query_option(command: &CommandInteraction) -> Option<&str> {
+    string_option(command, "query")
+}
+
+fn string_option<'a>(command: &'a CommandInteraction, name: &str) -> Option<&'a str> {
+    command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == name)
         .and_then(|option| match &option.value {
             CommandDataOptionValue::String(value) => Some(value.as_str()),
             _ => None,
@@ -1681,6 +1796,38 @@ fn abandoned_voice_channel(ctx: &Context, guild_id: GuildId) -> Option<ChannelId
         })
         .collect::<Vec<_>>();
     abandoned_channel(&occupants, bot_user_id).map(ChannelId::new)
+}
+
+/// Counts the people who would hear a track being cut short.
+///
+/// The same scan the empty-channel disconnect uses, asking a different question
+/// of it: not whether anybody is left, but how many.
+fn listener_count(ctx: &Context, guild_id: GuildId) -> usize {
+    let bot_user_id = ctx.cache.current_user().id.get();
+    let Some(guild) = ctx.cache.guild(guild_id) else {
+        return 1;
+    };
+    let Some(channel_id) = guild
+        .voice_states
+        .get(&UserId::new(bot_user_id))
+        .and_then(|state| state.channel_id)
+    else {
+        return 1;
+    };
+    guild
+        .voice_states
+        .values()
+        .filter(|state| state.channel_id == Some(channel_id))
+        .filter(|state| state.user_id.get() != bot_user_id)
+        .filter(|state| {
+            !guild
+                .members
+                .get(&state.user_id)
+                .or(state.member.as_ref())
+                .is_some_and(|member| member.user.bot)
+        })
+        .count()
+        .max(1)
 }
 
 /// Returns the channel Auxide occupies when no listener is left in it.
@@ -2674,6 +2821,32 @@ mod tests {
         assert_eq!(announcement_channel(None, None), None);
         assert_eq!(announcement_channel(Some(&guild()), None), None);
         assert_eq!(announcement_channel(None, Some(50)), Some(50));
+    }
+
+    #[test]
+    fn a_vote_needs_half_the_room_and_never_fewer_than_two() {
+        // Alone, there is nobody to agree with.
+        assert_eq!(votes_needed(0), 1);
+        assert_eq!(votes_needed(1), 1);
+        // With one other person, half would be one — which is no vote at all.
+        assert_eq!(votes_needed(2), 2);
+        assert_eq!(votes_needed(3), 2);
+        assert_eq!(votes_needed(4), 2);
+        assert_eq!(votes_needed(5), 3);
+        assert_eq!(votes_needed(9), 5);
+    }
+
+    #[test]
+    fn a_run_of_positions_reads_the_way_the_queue_prints_them() {
+        assert_eq!(parse_track_range("3").unwrap(), (3, 3));
+        assert_eq!(parse_track_range("3-7").unwrap(), (3, 7));
+        assert_eq!(parse_track_range(" 3 - 7 ").unwrap(), (3, 7));
+        // Both ends are inclusive, so a single position is a run of one.
+        assert_eq!(parse_track_range("7-7").unwrap(), (7, 7));
+
+        for bad in ["0", "0-3", "7-3", "", "three", "3-", "-3", "3-4-5"] {
+            assert!(parse_track_range(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

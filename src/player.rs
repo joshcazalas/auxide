@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    time::Duration,
+};
 
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use thiserror::Error;
@@ -152,6 +155,13 @@ pub enum ShuffleChange {
     Reorder,
 }
 
+/// Waiting tracks that were taken out together.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RemovedTracks {
+    pub removed: Vec<QueueItem>,
+    pub transition: PlayerTransition,
+}
+
 /// The result of a [`GuildPlayerHandle::enqueue_all`].
 ///
 /// A bulk addition can be partly refused where a single one can only be
@@ -177,6 +187,18 @@ pub struct ClearOutcome {
 pub struct RemoveOutcome {
     pub removed: QueueItem,
     pub transition: PlayerTransition,
+}
+
+/// What came of asking to skip the current track.
+///
+/// A shared queue needs somebody else to agree before one person can cut off
+/// what everybody is listening to, so asking is not the same as it happening.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SkipVerdict {
+    /// Enough people wanted it, or it was the asker's own track.
+    Skipped(Box<SkipOutcome>),
+    /// Counted, and waiting for others.
+    Pending { have: usize, needed: usize },
 }
 
 /// The result of a [`GuildPlayerHandle::skip`], carrying what was interrupted.
@@ -244,6 +266,46 @@ impl GuildPlayerHandle {
             reply,
         })
         .await?
+    }
+
+    /// Counts a vote to skip the current track, and skips once enough agree.
+    ///
+    /// `needed` comes from how many people are listening, which the actor
+    /// cannot see. Voting for a track twice is not an error and does not count
+    /// twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::NothingPlaying`] when there is nothing to skip,
+    /// or a channel error if the actor has stopped.
+    pub async fn vote_skip(&self, user_id: u64, needed: usize) -> Result<SkipVerdict, PlayerError> {
+        self.request(|reply| PlayerCommand::VoteSkip {
+            user_id,
+            needed,
+            reply,
+        })
+        .await?
+    }
+
+    /// Drops a run of waiting tracks, counting from one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::NoSuchPosition`] when the run starts past the end
+    /// of the queue, or a channel error if the actor has stopped.
+    pub async fn remove_range(&self, from: usize, to: usize) -> Result<RemovedTracks, PlayerError> {
+        self.request(|reply| PlayerCommand::RemoveRange { from, to, reply })
+            .await?
+    }
+
+    /// Drops every waiting track one person queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped.
+    pub async fn remove_requester(&self, user_id: u64) -> Result<RemovedTracks, PlayerError> {
+        self.request(|reply| PlayerCommand::RemoveRequester { user_id, reply })
+            .await
     }
 
     /// Removes the current item and advances atomically to the next item, if any.
@@ -424,6 +486,7 @@ pub fn spawn_guild_player(
         voice_channel_id: None,
         text_channel_id: None,
         paused: false,
+        votes: BTreeSet::new(),
         repeat: RepeatMode::Off,
         shuffle: false,
         volume_percent,
@@ -450,6 +513,20 @@ enum PlayerCommand {
     },
     Skip {
         reply: oneshot::Sender<SkipOutcome>,
+    },
+    VoteSkip {
+        user_id: u64,
+        needed: usize,
+        reply: oneshot::Sender<Result<SkipVerdict, PlayerError>>,
+    },
+    RemoveRange {
+        from: usize,
+        to: usize,
+        reply: oneshot::Sender<Result<RemovedTracks, PlayerError>>,
+    },
+    RemoveRequester {
+        user_id: u64,
+        reply: oneshot::Sender<RemovedTracks>,
     },
     Stop {
         reply: oneshot::Sender<PlayerTransition>,
@@ -502,6 +579,8 @@ struct GuildPlayer {
     voice_channel_id: Option<u64>,
     text_channel_id: Option<u64>,
     paused: bool,
+    /// Who has asked to cut the current track short.
+    votes: BTreeSet<u64>,
     repeat: RepeatMode,
     shuffle: bool,
     volume_percent: u16,
@@ -537,88 +616,113 @@ impl GuildPlayer {
             let Some(command) = command else {
                 break;
             };
-            match command {
-                PlayerCommand::Enqueue {
-                    item,
-                    voice_channel_id,
-                    reply,
-                } => {
-                    let result = self.enqueue(*item, voice_channel_id);
-                    if let Ok(transition) = &result {
-                        self.emit(transition.clone()).await;
-                    }
-                    let _ = reply.send(result);
-                }
-                PlayerCommand::Skip { reply } => {
-                    let outcome = self.skip();
-                    self.emit(outcome.transition.clone()).await;
-                    let _ = reply.send(outcome);
-                }
-                PlayerCommand::Stop { reply } => {
-                    let transition = self.stop();
-                    self.emit(transition.clone()).await;
-                    let _ = reply.send(transition);
-                }
-                PlayerCommand::EnqueueAll {
-                    items,
-                    voice_channel_id,
-                    reply,
-                } => {
-                    let result = self.enqueue_all(items, voice_channel_id);
-                    if let Ok(bulk) = &result {
-                        self.emit(bulk.transition.clone()).await;
-                    }
-                    let _ = reply.send(result);
-                }
-                PlayerCommand::Clear { reply } => {
-                    let removed = self.pending.len();
-                    self.pending.clear();
-                    // No directive: what is playing is untouched, and the
-                    // channel is kept. Only the waiting list changed.
-                    let _ = reply.send(ClearOutcome {
-                        removed,
-                        transition: self.transition(PlaybackDirective::None),
-                    });
-                }
-                PlayerCommand::Remove { position, reply } => {
-                    let _ = reply.send(self.remove(position));
-                }
-                PlayerCommand::SetPaused { paused, reply } => {
-                    let result = self.set_paused(paused);
-                    if let Ok(transition) = &result {
-                        self.emit(transition.clone()).await;
-                    }
-                    let _ = reply.send(result);
-                }
-                PlayerCommand::SetVolume { percent, reply } => {
-                    let result = self.set_volume(percent);
-                    if let Ok(transition) = &result {
-                        self.emit(transition.clone()).await;
-                    }
-                    let _ = reply.send(result);
-                }
-                PlayerCommand::Shuffle { change, reply } => {
-                    let _ = reply.send(self.change_shuffle(change));
-                }
-                PlayerCommand::SetRepeat { repeat, reply } => {
-                    let _ = reply.send(self.set_repeat(repeat));
-                }
-                PlayerCommand::Snapshot { reply } => {
-                    let _ = reply.send(self.snapshot());
-                }
-                PlayerCommand::TrackFinished { queue_id, reply } => {
-                    let transition = self.track_finished(queue_id);
-                    self.emit(transition.clone()).await;
-                    let _ = reply.send(transition);
-                }
-                PlayerCommand::Shutdown { reply } => {
-                    let transition = self.stop();
-                    self.emit(transition.clone()).await;
-                    let _ = reply.send(transition);
-                    break;
-                }
+            if !self.handle(command).await {
+                break;
             }
         }
+    }
+
+    /// Applies one command, and reports whether the actor should keep running.
+    async fn handle(&mut self, command: PlayerCommand) -> bool {
+        match command {
+            PlayerCommand::Enqueue {
+                item,
+                voice_channel_id,
+                reply,
+            } => {
+                let result = self.enqueue(*item, voice_channel_id);
+                if let Ok(transition) = &result {
+                    self.emit(transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::Skip { reply } => {
+                let outcome = self.skip();
+                self.emit(outcome.transition.clone()).await;
+                let _ = reply.send(outcome);
+            }
+            PlayerCommand::Stop { reply } => {
+                let transition = self.stop();
+                self.emit(transition.clone()).await;
+                let _ = reply.send(transition);
+            }
+            PlayerCommand::EnqueueAll {
+                items,
+                voice_channel_id,
+                reply,
+            } => {
+                let result = self.enqueue_all(items, voice_channel_id);
+                if let Ok(bulk) = &result {
+                    self.emit(bulk.transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::Clear { reply } => {
+                let removed = self.pending.len();
+                self.pending.clear();
+                // No directive: what is playing is untouched, and the channel
+                // is kept. Only the waiting list changed.
+                let _ = reply.send(ClearOutcome {
+                    removed,
+                    transition: self.transition(PlaybackDirective::None),
+                });
+            }
+            PlayerCommand::Remove { position, reply } => {
+                let _ = reply.send(self.remove(position));
+            }
+            PlayerCommand::VoteSkip {
+                user_id,
+                needed,
+                reply,
+            } => {
+                let result = self.vote_skip(user_id, needed);
+                if let Ok(SkipVerdict::Skipped(outcome)) = &result {
+                    self.emit(outcome.transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::RemoveRange { from, to, reply } => {
+                let _ = reply.send(self.remove_range(from, to));
+            }
+            PlayerCommand::RemoveRequester { user_id, reply } => {
+                let _ = reply.send(self.remove_requester(user_id));
+            }
+            PlayerCommand::SetPaused { paused, reply } => {
+                let result = self.set_paused(paused);
+                if let Ok(transition) = &result {
+                    self.emit(transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::SetVolume { percent, reply } => {
+                let result = self.set_volume(percent);
+                if let Ok(transition) = &result {
+                    self.emit(transition.clone()).await;
+                }
+                let _ = reply.send(result);
+            }
+            PlayerCommand::Shuffle { change, reply } => {
+                let _ = reply.send(self.change_shuffle(change));
+            }
+            PlayerCommand::SetRepeat { repeat, reply } => {
+                let _ = reply.send(self.set_repeat(repeat));
+            }
+            PlayerCommand::Snapshot { reply } => {
+                let _ = reply.send(self.snapshot());
+            }
+            PlayerCommand::TrackFinished { queue_id, reply } => {
+                let transition = self.track_finished(queue_id);
+                self.emit(transition.clone()).await;
+                let _ = reply.send(transition);
+            }
+            PlayerCommand::Shutdown { reply } => {
+                let transition = self.stop();
+                self.emit(transition.clone()).await;
+                let _ = reply.send(transition);
+                return false;
+            }
+        }
+        true
     }
 
     async fn emit(&self, transition: PlayerTransition) -> bool {
@@ -746,6 +850,7 @@ impl GuildPlayer {
         self.voice_channel_id = None;
         self.idle_deadline = None;
         self.paused = false;
+        self.votes.clear();
         self.repeat = RepeatMode::Off;
         self.shuffle = false;
     }
@@ -766,6 +871,66 @@ impl GuildPlayer {
             removed,
             transition: self.transition(PlaybackDirective::None),
         })
+    }
+
+    /// Counts one vote, and skips once enough people have asked.
+    ///
+    /// Somebody may always skip what they queued themselves. That is what keeps
+    /// a vote from being a way to trap the room with your own choice, and it
+    /// means the rule only ever gets in the way of cutting off somebody else.
+    fn vote_skip(&mut self, user_id: u64, needed: usize) -> Result<SkipVerdict, PlayerError> {
+        let current = self.current.as_ref().ok_or(PlayerError::NothingPlaying)?;
+        if current.requested_by == user_id {
+            return Ok(SkipVerdict::Skipped(Box::new(self.skip())));
+        }
+        self.votes.insert(user_id);
+        let have = self.votes.len();
+        if have >= needed {
+            return Ok(SkipVerdict::Skipped(Box::new(self.skip())));
+        }
+        Ok(SkipVerdict::Pending { have, needed })
+    }
+
+    fn remove_range(&mut self, from: usize, to: usize) -> Result<RemovedTracks, PlayerError> {
+        let first = from
+            .checked_sub(1)
+            .filter(|first| *first < self.pending.len());
+        let Some(first) = first else {
+            return Err(PlayerError::NoSuchPosition {
+                position: from,
+                waiting: self.pending.len(),
+            });
+        };
+        // A run reaching past the end takes what is there rather than failing.
+        // Asking to clear "everything from ten onwards" should not depend on
+        // knowing how long the queue is.
+        let last = to.max(from).min(self.pending.len());
+        let removed = self.pending.drain(first..last).collect();
+        Ok(RemovedTracks {
+            removed,
+            transition: self.transition(PlaybackDirective::None),
+        })
+    }
+
+    /// Drops every waiting track one person queued, leaving everyone else's.
+    ///
+    /// The current track is deliberately untouched: cutting off what the room
+    /// is listening to is what the vote is for.
+    fn remove_requester(&mut self, user_id: u64) -> RemovedTracks {
+        let mut removed = Vec::new();
+        let mut kept = VecDeque::with_capacity(self.pending.len());
+        for item in std::mem::take(&mut self.pending) {
+            if item.requested_by == user_id {
+                removed.push(item);
+            } else {
+                kept.push_back(item);
+            }
+        }
+        self.pending = kept;
+        RemovedTracks {
+            removed,
+            transition: self.transition(PlaybackDirective::None),
+        }
     }
 
     fn set_paused(&mut self, paused: bool) -> Result<PlayerTransition, PlayerError> {
@@ -822,9 +987,10 @@ impl GuildPlayer {
     ///
     /// `left` is the track being moved off, which a repeat mode may put back.
     fn advance(&mut self, left: Option<QueueItem>, reason: Departure) -> Option<QueueItem> {
-        // A hold belongs to the track it was placed on, so moving off that
-        // track releases it rather than carrying it to the next one.
+        // A hold, and the votes to cut a track short, both belong to the track
+        // they were placed on rather than to the session.
         self.paused = false;
+        self.votes.clear();
         if let Some(left) = left {
             match (self.repeat, reason) {
                 // Asking to move on has to move on. Replaying the same track
@@ -1109,6 +1275,124 @@ mod tests {
                 "accepted position {position}"
             );
         }
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skipping_your_own_track_never_needs_anybody_else() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+
+        // item()'s requester is 42, and a threshold of five would be
+        // unreachable — which is the point: your own track ignores it.
+        let verdict = player.vote_skip(42, 5).await.unwrap();
+        let SkipVerdict::Skipped(outcome) = verdict else {
+            panic!("a requester could not skip their own track: {verdict:?}");
+        };
+        assert_eq!(outcome.skipped, Some(item(1)));
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cutting_somebody_elses_track_short_waits_for_agreement() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+
+        assert_eq!(
+            player.vote_skip(100, 2).await.unwrap(),
+            SkipVerdict::Pending { have: 1, needed: 2 }
+        );
+        // Voting twice is not an error, and does not count twice.
+        assert_eq!(
+            player.vote_skip(100, 2).await.unwrap(),
+            SkipVerdict::Pending { have: 1, needed: 2 }
+        );
+        assert!(matches!(
+            player.vote_skip(200, 2).await.unwrap(),
+            SkipVerdict::Skipped(_)
+        ));
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn votes_belong_to_the_track_they_were_cast_against() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+        player.vote_skip(100, 3).await.unwrap();
+
+        // The track it was cast against is gone, so the vote goes with it —
+        // otherwise a track could arrive already part-way to being skipped.
+        player.track_finished(item(1).queue_id).await.unwrap();
+        assert_eq!(
+            player.vote_skip(200, 3).await.unwrap(),
+            SkipVerdict::Pending { have: 1, needed: 3 }
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_run_of_waiting_tracks_comes_out_together() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 9, 8, 1, Duration::from_secs(30), 50);
+        for id in 1..=6 {
+            player.enqueue(item(id), 10).await.unwrap();
+        }
+
+        let removed = player.remove_range(2, 4).await.unwrap();
+        assert_eq!(removed.removed, vec![item(3), item(4), item(5)]);
+        assert_eq!(removed.transition.snapshot.pending, vec![item(2), item(6)]);
+        // The current track is never in range; cutting that short is the vote's
+        // business.
+        assert_eq!(removed.transition.snapshot.current, Some(item(1)));
+
+        // A run reaching past the end takes what is there, so clearing
+        // "everything from here" does not need the queue's length.
+        let rest = player.remove_range(1, 99).await.unwrap();
+        assert_eq!(rest.removed.len(), 2);
+        assert!(rest.transition.snapshot.pending.is_empty());
+
+        assert_eq!(
+            player.remove_range(1, 2).await,
+            Err(PlayerError::NoSuchPosition {
+                position: 1,
+                waiting: 0
+            })
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn everything_one_person_queued_comes_out_and_nobody_elses() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 9, 8, 1, Duration::from_secs(30), 50);
+        let mine = |id| QueueItem {
+            requested_by: 500,
+            ..item(id)
+        };
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(mine(2), 10).await.unwrap();
+        player.enqueue(item(3), 10).await.unwrap();
+        player.enqueue(mine(4), 10).await.unwrap();
+
+        let removed = player.remove_requester(500).await.unwrap();
+        assert_eq!(removed.removed, vec![mine(2), mine(4)]);
+        assert_eq!(removed.transition.snapshot.pending, vec![item(3)]);
+        assert_eq!(removed.transition.snapshot.current, Some(item(1)));
 
         player.shutdown().await.unwrap();
         task.await.unwrap();
