@@ -161,17 +161,22 @@ pub async fn run(config: Config) -> Result<()> {
 /// interaction lifecycle — against a Discord that does not exist, a source that
 /// answers from memory, and a voice channel that only records what it was told.
 #[derive(Default)]
-pub(crate) struct Overrides {
-    pub(crate) source: Option<Arc<dyn SourceResolver>>,
-    pub(crate) voice: Option<Arc<dyn VoiceGatewayFactory>>,
+pub struct Overrides {
+    pub source: Option<Arc<dyn SourceResolver>>,
+    pub voice: Option<Arc<dyn VoiceGatewayFactory>>,
     /// Where Discord's HTTP API lives, when it is not Discord.
     ///
     /// Serenity asks this for the gateway address too, so redirecting it is
     /// enough to redirect the websocket as well.
-    pub(crate) api_base: Option<String>,
+    pub api_base: Option<String>,
 }
 
-pub(crate) async fn run_with(config: Config, overrides: Overrides) -> Result<()> {
+/// Runs the bot with some of what it reaches outside this process replaced.
+///
+/// # Errors
+///
+/// Returns whatever [`run`] would, since this is the body of it.
+pub async fn run_with(config: Config, overrides: Overrides) -> Result<()> {
     let config = Arc::new(config);
     let token = config
         .load_discord_token()
