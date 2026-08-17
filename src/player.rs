@@ -164,6 +164,21 @@ pub struct BulkEnqueue {
     pub transition: PlayerTransition,
 }
 
+/// The result of a [`GuildPlayerHandle::clear`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClearOutcome {
+    /// How many waiting tracks were dropped.
+    pub removed: usize,
+    pub transition: PlayerTransition,
+}
+
+/// The result of a [`GuildPlayerHandle::remove`], carrying what was taken out.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoveOutcome {
+    pub removed: QueueItem,
+    pub transition: PlayerTransition,
+}
+
 /// The result of a [`GuildPlayerHandle::skip`], carrying what was interrupted.
 ///
 /// The transition alone describes only what plays next, and announcing a skip
@@ -250,6 +265,33 @@ impl GuildPlayerHandle {
     /// Returns an error if the actor has stopped.
     pub async fn stop(&self) -> Result<PlayerTransition, PlayerError> {
         self.request(|reply| PlayerCommand::Stop { reply }).await
+    }
+
+    /// Drops everything waiting, and leaves the current track playing.
+    ///
+    /// The difference from [`GuildPlayerHandle::stop`] is the whole point:
+    /// throwing out a queue somebody filled with the wrong thing should not
+    /// also mean ending the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped.
+    pub async fn clear(&self) -> Result<ClearOutcome, PlayerError> {
+        self.request(|reply| PlayerCommand::Clear { reply }).await
+    }
+
+    /// Takes one waiting track out of the queue, counting from one.
+    ///
+    /// Positions are the ones `/queue` prints, and they only ever refer to
+    /// waiting tracks — the current one is `/skip`'s business.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlayerError::NoSuchPosition`] when nothing is waiting there,
+    /// or a channel error if the actor has stopped.
+    pub async fn remove(&self, position: usize) -> Result<RemoveOutcome, PlayerError> {
+        self.request(|reply| PlayerCommand::Remove { position, reply })
+            .await?
     }
 
     /// Holds the current track, or continues a held one.
@@ -412,6 +454,13 @@ enum PlayerCommand {
     Stop {
         reply: oneshot::Sender<PlayerTransition>,
     },
+    Clear {
+        reply: oneshot::Sender<ClearOutcome>,
+    },
+    Remove {
+        position: usize,
+        reply: oneshot::Sender<Result<RemoveOutcome, PlayerError>>,
+    },
     EnqueueAll {
         items: Vec<QueueItem>,
         voice_channel_id: u64,
@@ -520,6 +569,19 @@ impl GuildPlayer {
                         self.emit(bulk.transition.clone()).await;
                     }
                     let _ = reply.send(result);
+                }
+                PlayerCommand::Clear { reply } => {
+                    let removed = self.pending.len();
+                    self.pending.clear();
+                    // No directive: what is playing is untouched, and the
+                    // channel is kept. Only the waiting list changed.
+                    let _ = reply.send(ClearOutcome {
+                        removed,
+                        transition: self.transition(PlaybackDirective::None),
+                    });
+                }
+                PlayerCommand::Remove { position, reply } => {
+                    let _ = reply.send(self.remove(position));
                 }
                 PlayerCommand::SetPaused { paused, reply } => {
                     let result = self.set_paused(paused);
@@ -688,6 +750,24 @@ impl GuildPlayer {
         self.shuffle = false;
     }
 
+    fn remove(&mut self, position: usize) -> Result<RemoveOutcome, PlayerError> {
+        let index = position
+            .checked_sub(1)
+            .filter(|index| *index < self.pending.len())
+            .ok_or(PlayerError::NoSuchPosition {
+                position,
+                waiting: self.pending.len(),
+            })?;
+        let removed = self
+            .pending
+            .remove(index)
+            .expect("the index was just bounds-checked");
+        Ok(RemoveOutcome {
+            removed,
+            transition: self.transition(PlaybackDirective::None),
+        })
+    }
+
     fn set_paused(&mut self, paused: bool) -> Result<PlayerTransition, PlayerError> {
         if self.current.is_none() {
             return Err(PlayerError::NothingPlaying);
@@ -848,6 +928,8 @@ pub enum PlayerError {
     NotPaused,
     #[error("volume must be between 1 and {max_percent}")]
     VolumeOutOfRange { max_percent: u16 },
+    #[error("there is no track waiting at position {position}; {waiting} are queued")]
+    NoSuchPosition { position: usize, waiting: usize },
 }
 
 #[cfg(test)]
@@ -950,6 +1032,83 @@ mod tests {
             player.enqueue_all(vec![item(9)], 10).await,
             Err(PlayerError::QueueFull { max_tracks: 2 })
         );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clearing_empties_the_queue_and_leaves_the_track_playing() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        for id in 2..=4 {
+            player.enqueue(item(id), 10).await.unwrap();
+        }
+
+        let cleared = player.clear().await.unwrap();
+        assert_eq!(cleared.removed, 3);
+        // The difference from stop, which is the whole point of the command.
+        assert_eq!(cleared.transition.snapshot.current, Some(item(1)));
+        assert_eq!(cleared.transition.snapshot.voice_channel_id, Some(10));
+        assert!(cleared.transition.snapshot.pending.is_empty());
+        assert_eq!(
+            cleared.transition.directive,
+            PlaybackDirective::None,
+            "clearing the queue disturbed playback"
+        );
+
+        // Clearing again has nothing to drop, and still does not stop anything.
+        assert_eq!(player.clear().await.unwrap().removed, 0);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_takes_the_track_the_printed_position_names() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        for id in 1..=4 {
+            player.enqueue(item(id), 10).await.unwrap();
+        }
+
+        // Position one is the first *waiting* track, because the current one is
+        // what /skip is for.
+        let removed = player.remove(1).await.unwrap();
+        assert_eq!(removed.removed, item(2));
+        assert_eq!(
+            removed.transition.snapshot.pending,
+            vec![item(3), item(4)],
+            "removing renumbered the wrong way"
+        );
+        assert_eq!(removed.transition.snapshot.current, Some(item(1)));
+
+        // And the positions shift up, so the same number now names a new track.
+        assert_eq!(player.remove(1).await.unwrap().removed, item(3));
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_refuses_a_position_that_is_not_there() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+
+        for position in [0, 2, 99] {
+            assert_eq!(
+                player.remove(position).await,
+                Err(PlayerError::NoSuchPosition {
+                    position,
+                    waiting: 1
+                }),
+                "accepted position {position}"
+            );
+        }
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

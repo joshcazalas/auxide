@@ -188,6 +188,9 @@ concurrently, and run every control command. Acceptance requires:
    queues only the one video;
 9. `/repeat single` replays a track but still lets `/skip` move on, `/repeat all` cycles without
    ever reaching the idle hold, `/shuffle` picks at random from then on while `/shuffle once`
-   only reorders what is waiting, and `/stop` forgets both; and
-10. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+   only reorders what is waiting, and `/stop` forgets both;
+10. `/clear` and `/remove` change only what is waiting — the current track keeps playing and the
+    channel is kept — and a position printed on any page of `/queue` is the position `/remove`
+    takes; and
+11. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.

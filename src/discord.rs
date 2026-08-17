@@ -312,7 +312,29 @@ fn command_definitions() -> Vec<CreateCommand> {
                 .min_length(1)
                 .max_length(200),
             ),
-        CreateCommand::new("queue").description("Show the current queue"),
+        CreateCommand::new("queue")
+            .description("Show the current queue")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "page",
+                    "Which page of waiting tracks to show",
+                )
+                .required(false)
+                .min_int_value(1),
+            ),
+        CreateCommand::new("clear").description("Drop everything waiting, and keep playing"),
+        CreateCommand::new("remove")
+            .description("Take one waiting track out of the queue")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "position",
+                    "Its number in /queue",
+                )
+                .required(true)
+                .min_int_value(1),
+            ),
         CreateCommand::new("skip").description("Skip the current track"),
         CreateCommand::new("stop").description("Clear the queue and disconnect"),
         CreateCommand::new("shuffle")
@@ -816,7 +838,9 @@ impl BotRuntime {
         let authorization = self.authorize_command(ctx, command).await?;
         match command.data.name.as_str() {
             "play" => self.play(ctx, command, authorization).await,
-            "queue" => self.queue(authorization).await,
+            "queue" => self.queue(command, authorization).await,
+            "clear" => self.clear(ctx, authorization).await,
+            "remove" => self.remove(ctx, command, authorization).await,
             "skip" => self.skip(ctx, authorization).await,
             "stop" => self.stop(ctx, authorization).await,
             "shuffle" => self.shuffle(ctx, command, authorization).await,
@@ -1101,28 +1125,70 @@ impl BotRuntime {
         Ok(Announcement::card(embed))
     }
 
-    async fn queue(&self, authorization: Authorization) -> Result<InteractionReply> {
+    async fn queue(
+        &self,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
         let snapshot = authorization.session.player.snapshot().await?;
-        let Some(description) = format_queue(&snapshot) else {
+        let page = integer_option(command, "page")
+            .and_then(|page| usize::try_from(page).ok())
+            .unwrap_or(1);
+        let Some(rendered) = format_queue(&snapshot, page) else {
             return Ok(InteractionReply::message("The queue is empty."));
         };
-        // An embed description holds twice what a message does, which is the
-        // difference between listing twenty of a hundred queued tracks and
-        // listing most of them.
         let mut embed = CreateEmbed::new()
             .author(CreateEmbedAuthor::new("Queue"))
-            .description(description)
+            .description(rendered.description)
             .colour(EMBED_COLOUR);
         // A queue that is repeating or picking at random does not play in the
-        // order it is printed in, so saying so belongs beside the list.
-        if snapshot.repeat != RepeatMode::Off || snapshot.shuffle {
-            embed = embed.footer(CreateEmbedFooter::new(format!(
-                "Repeat: {} · Shuffle: {}",
-                snapshot.repeat.as_str(),
-                if snapshot.shuffle { "on" } else { "off" }
-            )));
+        // order it is printed in, and a page says nothing about how many there
+        // are, so both belong beside the list rather than inside it.
+        let mut footer = Vec::new();
+        if rendered.pages > 1 {
+            footer.push(format!("Page {} of {}", rendered.page, rendered.pages));
+        }
+        if snapshot.repeat != RepeatMode::Off {
+            footer.push(format!("Repeat: {}", snapshot.repeat.as_str()));
+        }
+        if snapshot.shuffle {
+            footer.push("Shuffle: on".to_owned());
+        }
+        if !footer.is_empty() {
+            embed = embed.footer(CreateEmbedFooter::new(footer.join(" · ")));
         }
         Ok(InteractionReply::from(Announcement::card(embed)))
+    }
+
+    async fn clear(&self, ctx: &Context, authorization: Authorization) -> Result<InteractionReply> {
+        self.require_same_voice(ctx, &authorization).await?;
+        let outcome = authorization.session.player.clear().await?;
+        if outcome.removed == 0 {
+            bail!("nothing is waiting in the queue");
+        }
+        Ok(InteractionReply::message(format!(
+            "{} cleared {} waiting track(s). What is playing carries on.",
+            mention(authorization.user_id),
+            outcome.removed
+        )))
+    }
+
+    async fn remove(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
+        self.require_same_voice(ctx, &authorization).await?;
+        let position = integer_option(command, "position")
+            .and_then(|position| usize::try_from(position).ok())
+            .context("a position is required")?;
+        let outcome = authorization.session.player.remove(position).await?;
+        Ok(InteractionReply::message(format!(
+            "{} removed **{}** from the queue.",
+            mention(authorization.user_id),
+            single_line(&outcome.removed.track.title, 150)
+        )))
     }
 
     async fn now_playing(&self, authorization: Authorization) -> Result<InteractionReply> {
@@ -1422,6 +1488,18 @@ fn mode_option(command: &CommandInteraction) -> Option<&str> {
         })
 }
 
+fn integer_option(command: &CommandInteraction, name: &str) -> Option<u64> {
+    command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == name)
+        .and_then(|option| match &option.value {
+            CommandDataOptionValue::Integer(value) => u64::try_from(*value).ok(),
+            _ => None,
+        })
+}
+
 fn volume_option(command: &CommandInteraction) -> Option<u16> {
     command
         .data
@@ -1443,7 +1521,9 @@ fn audience_for(command: &str, argument: Option<&str>) -> Audience {
         // Setting the level changes what the room hears; asking what it is does
         // not.
         "volume" if argument.is_some() => Audience::Channel,
-        "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" => Audience::Channel,
+        "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" | "clear" | "remove" => {
+            Audience::Channel
+        }
         _ => Audience::Requester,
     }
 }
@@ -1860,9 +1940,29 @@ fn prune_searches(searches: &mut HashMap<Uuid, PendingSearch>) {
 /// Each line names who asked for the track. In a queue four people are filling
 /// at once that is the thing worth knowing, and it was recorded on every item
 /// from the first version of the player without ever being shown.
-fn format_queue(snapshot: &PlayerSnapshot) -> Option<String> {
+/// How many waiting tracks one page of `/queue` lists.
+///
+/// A fixed count rather than as many as fit, so a position printed on page two
+/// is the position `/remove` takes, whatever the titles happen to be.
+const QUEUE_PAGE_SIZE: usize = 20;
+
+/// One page of the queue, and where it sits among the rest.
+struct QueuePage {
+    description: String,
+    page: usize,
+    pages: usize,
+}
+
+/// Renders a page of the queue, or `None` when there is nothing in it.
+///
+/// Each line names who asked for the track. In a queue four people are filling
+/// at once that is the thing worth knowing, and it was recorded on every item
+/// from the first version of the player without ever being shown.
+fn format_queue(snapshot: &PlayerSnapshot, page: usize) -> Option<QueuePage> {
     let current = snapshot.current.as_ref()?;
-    let mut content = format!(
+    let pages = snapshot.pending.len().div_ceil(QUEUE_PAGE_SIZE).max(1);
+    let page = page.clamp(1, pages);
+    let mut description = format!(
         "**{}**\n{} ({}) — {}\n",
         playback_heading(snapshot.paused),
         single_line(&current.track.title, 120),
@@ -1870,25 +1970,45 @@ fn format_queue(snapshot: &PlayerSnapshot) -> Option<String> {
         mention(current.requested_by)
     );
     if snapshot.pending.is_empty() {
-        content.push_str("\nNo tracks are waiting.");
-        return Some(content);
+        description.push_str("\nNo tracks are waiting.");
+        return Some(QueuePage {
+            description,
+            page,
+            pages,
+        });
     }
-    content.push_str("\n**Up next**\n");
-    for (index, item) in snapshot.pending.iter().enumerate() {
+
+    let first = (page - 1) * QUEUE_PAGE_SIZE;
+    description.push_str("\n**Up next**\n");
+    for (offset, item) in snapshot
+        .pending
+        .iter()
+        .skip(first)
+        .take(QUEUE_PAGE_SIZE)
+        .enumerate()
+    {
+        // Numbered by position in the whole queue rather than on the page, so
+        // the number a reader sees is the one `/remove` takes.
         let line = format!(
             "{}. {} ({}) — {}\n",
-            index + 1,
+            first + offset + 1,
             single_line(&item.track.title, 100),
             format_duration(item.track.duration),
             mention(item.requested_by)
         );
-        if content.chars().count() + line.chars().count() > EMBED_DESCRIPTION_CHARS {
-            let _ = write!(content, "…and {} more.", snapshot.pending.len() - index);
+        // A page is bounded by its track count, but titles are not bounded at
+        // all, so the character limit is still the backstop.
+        if description.chars().count() + line.chars().count() > EMBED_DESCRIPTION_CHARS {
+            let _ = write!(description, "…and more.");
             break;
         }
-        content.push_str(&line);
+        description.push_str(&line);
     }
-    Some(content)
+    Some(QueuePage {
+        description,
+        page,
+        pages,
+    })
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -1994,7 +2114,7 @@ mod playback_tests {
     use crate::{
         config::Config,
         observability::ObservabilityState,
-        player::{QueueItem, spawn_guild_player},
+        player::{QueueItem, RepeatMode, spawn_guild_player},
         source::TrackMetadata,
         voice::fake::{FakeVoice, VoiceAction},
     };
@@ -2274,6 +2394,93 @@ idle_timeout_seconds = 900
     }
 
     #[tokio::test]
+    async fn clearing_the_queue_never_reaches_the_voice_channel() {
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session
+            .player
+            .enqueue(item(2), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+
+        session.player.clear().await.unwrap();
+        // Nothing at all: the track carries on and the channel is kept. This is
+        // the entire difference between /clear and /stop, and it is invisible
+        // at the actor, which reports the same empty pending list either way.
+        time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            session.voice.actions(),
+            [VoiceAction::Stopped, played(1, 50)]
+        );
+
+        // And the cleared track really is gone, so finishing moves to silence
+        // rather than to what used to be queued behind it.
+        session.voice.finish_track().await;
+        session.voice.settle(3).await;
+        assert_eq!(session.voice.actions()[2..], [VoiceAction::Stopped]);
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn removing_a_waiting_track_never_reaches_the_voice_channel() {
+        let session = Session::start(Duration::from_secs(900));
+        for id in 1..=3 {
+            session
+                .player
+                .enqueue(item(id), VOICE_CHANNEL)
+                .await
+                .unwrap();
+        }
+        session.voice.settle(2).await;
+
+        session.player.remove(1).await.unwrap();
+        time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            session.voice.actions().len(),
+            2,
+            "removing disturbed playback"
+        );
+
+        // The one that was removed is skipped over, and the one behind it plays.
+        session.voice.finish_track().await;
+        session.voice.settle(4).await;
+        assert_eq!(
+            session.voice.actions()[2..],
+            [VoiceAction::Stopped, played(3, 50)]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_repeating_queue_plays_the_same_track_again() {
+        let session = Session::start(Duration::from_millis(80));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+        session.player.set_repeat(RepeatMode::Single).await.unwrap();
+
+        session.voice.finish_track().await;
+        session.voice.settle(4).await;
+        assert_eq!(
+            session.voice.actions()[2..],
+            [VoiceAction::Stopped, played(1, 50)]
+        );
+        // A cycling queue never runs dry, so the idle hold it would otherwise
+        // have armed never fires.
+        time::sleep(Duration::from_millis(250)).await;
+        assert!(!session.voice.actions().contains(&VoiceAction::Left));
+        session.finish().await;
+    }
+
+    #[tokio::test]
     async fn stopping_gives_up_the_channel_where_an_empty_queue_does_not() {
         let session = Session::start(Duration::from_secs(900));
         session
@@ -2360,9 +2567,9 @@ mod tests {
             text_channel_id: Some(2),
             ..PlayerSnapshot::default()
         };
-        let rendered = format_queue(&snapshot).unwrap();
-        assert!(rendered.chars().count() <= EMBED_DESCRIPTION_CHARS + 100);
-        assert!(rendered.contains("…and"), "truncation was not reported");
+        let rendered = format_queue(&snapshot, 1).unwrap();
+        assert!(rendered.description.chars().count() <= EMBED_DESCRIPTION_CHARS + 100);
+        assert_eq!(rendered.pages, 5);
     }
 
     #[test]
@@ -2374,14 +2581,45 @@ mod tests {
             text_channel_id: Some(2),
             ..PlayerSnapshot::default()
         };
-        let rendered = format_queue(&snapshot).unwrap();
-        assert!(rendered.contains("**Now playing**\nPlaying (2:00) — <@11>"));
-        assert!(rendered.contains("1. Waiting (2:00) — <@22>"));
+        let rendered = format_queue(&snapshot, 1).unwrap();
+        assert!(
+            rendered
+                .description
+                .contains("**Now playing**\nPlaying (2:00) — <@11>")
+        );
+        assert!(rendered.description.contains("1. Waiting (2:00) — <@22>"));
+    }
+
+    #[test]
+    fn a_second_page_keeps_numbering_from_the_whole_queue() {
+        let snapshot = PlayerSnapshot {
+            current: Some(QueueItem::new(track("Playing"), 11, 2)),
+            pending: (0..25)
+                .map(|index| QueueItem::new(track(&format!("Waiting {index}")), 22, 2))
+                .collect(),
+            ..PlayerSnapshot::default()
+        };
+
+        let first = format_queue(&snapshot, 1).unwrap();
+        assert_eq!((first.page, first.pages), (1, 2));
+        assert!(first.description.contains("1. Waiting 0 "));
+        assert!(first.description.contains("20. Waiting 19 "));
+        assert!(!first.description.contains("21. "));
+
+        // Positions continue rather than restarting, because the number a
+        // reader sees is the number /remove takes.
+        let second = format_queue(&snapshot, 2).unwrap();
+        assert_eq!((second.page, second.pages), (2, 2));
+        assert!(second.description.contains("21. Waiting 20 "));
+        assert!(second.description.contains("25. Waiting 24 "));
+
+        // A page past the end shows the last one rather than an empty list.
+        assert_eq!(format_queue(&snapshot, 99).unwrap().page, 2);
     }
 
     #[test]
     fn an_empty_queue_has_nothing_to_render() {
-        assert_eq!(format_queue(&PlayerSnapshot::default()), None);
+        assert!(format_queue(&PlayerSnapshot::default(), 1).is_none());
     }
 
     #[test]
