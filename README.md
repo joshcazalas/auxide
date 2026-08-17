@@ -7,8 +7,8 @@ Spotify is deliberately out of scope.
 
 The production path now includes:
 
-- `/play`, `/queue`, `/clear`, `/remove`, `/skip`, `/stop`, `/join`, `/leave`, `/shuffle`,
-  `/repeat`, `/now-playing`, `/pause`, `/resume`, and `/volume` guild commands;
+- a `/help` built from the same list Discord is given, so it can never describe a command
+  that is not there;
 - vote-to-skip for the current track, and bulk removal of waiting ones by position or requester;
 - a bounded history of what already played, and a queue that survives a restart as a file;
 - seeking within a track, where the origin will serve ranges and state a length;

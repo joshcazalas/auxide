@@ -208,5 +208,8 @@ concurrently, and run every control command. Acceptance requires:
 15. `/join` brings Auxide in and picks a parked queue back up, restarting its current track
     because the connection it was playing through is gone, and `/leave` gives up the channel
     while keeping the queue for the length of the idle hold; and
-16. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+16. `/help` lists every command Discord was given, grouped, with the rules a newcomer would
+    otherwise have to discover — who sees which answer, that an emptied queue waits, and that
+    skipping somebody else's track needs agreement; and
+17. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.
