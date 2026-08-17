@@ -31,3 +31,9 @@ Discord command registration is an explicit administrative operation. Normal sta
 - YouTube extraction is expected to require regular dependency updates and may fail independently of the bot.
 - The player remains usable with local or future authorized sources if YouTube extraction breaks.
 - Queue state is intentionally ephemeral for the MVP.
+
+## Amendment, 2026-08-16
+
+The spikes passed and the Rust stack played in a private test server, so the Go prototype was
+deleted from the working tree. It stays reachable through `git log`, which is the only place the
+first consequence above should now be read from.
