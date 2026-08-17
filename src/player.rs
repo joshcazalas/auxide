@@ -155,6 +155,12 @@ pub enum ShuffleChange {
     Reorder,
 }
 
+/// How many played tracks a session remembers.
+///
+/// Ephemeral like the queue itself, and bounded for the same reason: a session
+/// left running all week should not grow without limit.
+pub const HISTORY_LENGTH: usize = 50;
+
 /// Waiting tracks that were taken out together.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RemovedTracks {
@@ -407,6 +413,19 @@ impl GuildPlayerHandle {
             .await
     }
 
+    /// Returns what has already played, most recent first.
+    ///
+    /// Off the snapshot deliberately: a snapshot is cloned onto every
+    /// transition, and carrying fifty played tracks through each one would cost
+    /// far more than the two commands that ask for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped.
+    pub async fn history(&self) -> Result<Vec<QueueItem>, PlayerError> {
+        self.request(|reply| PlayerCommand::History { reply }).await
+    }
+
     /// Returns an immutable copy of the current guild state.
     ///
     /// # Errors
@@ -487,6 +506,7 @@ pub fn spawn_guild_player(
         text_channel_id: None,
         paused: false,
         votes: BTreeSet::new(),
+        history: VecDeque::new(),
         repeat: RepeatMode::Off,
         shuffle: false,
         volume_percent,
@@ -559,6 +579,9 @@ enum PlayerCommand {
         repeat: RepeatMode,
         reply: oneshot::Sender<PlayerTransition>,
     },
+    History {
+        reply: oneshot::Sender<Vec<QueueItem>>,
+    },
     Snapshot {
         reply: oneshot::Sender<PlayerSnapshot>,
     },
@@ -581,6 +604,8 @@ struct GuildPlayer {
     paused: bool,
     /// Who has asked to cut the current track short.
     votes: BTreeSet<u64>,
+    /// What has already played, oldest first.
+    history: VecDeque<QueueItem>,
     repeat: RepeatMode,
     shuffle: bool,
     volume_percent: u16,
@@ -687,6 +712,14 @@ impl GuildPlayer {
             PlayerCommand::RemoveRequester { user_id, reply } => {
                 let _ = reply.send(self.remove_requester(user_id));
             }
+            other => return self.handle_playback(other).await,
+        }
+        true
+    }
+
+    /// Applies the commands about what is playing, rather than what is queued.
+    async fn handle_playback(&mut self, command: PlayerCommand) -> bool {
+        match command {
             PlayerCommand::SetPaused { paused, reply } => {
                 let result = self.set_paused(paused);
                 if let Ok(transition) = &result {
@@ -707,6 +740,9 @@ impl GuildPlayer {
             PlayerCommand::SetRepeat { repeat, reply } => {
                 let _ = reply.send(self.set_repeat(repeat));
             }
+            PlayerCommand::History { reply } => {
+                let _ = reply.send(self.history.iter().rev().cloned().collect());
+            }
             PlayerCommand::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
             }
@@ -721,6 +757,7 @@ impl GuildPlayer {
                 let _ = reply.send(transition);
                 return false;
             }
+            forwarded => unreachable!("{forwarded:?} is handled before this point"),
         }
         true
     }
@@ -991,6 +1028,9 @@ impl GuildPlayer {
         // they were placed on rather than to the session.
         self.paused = false;
         self.votes.clear();
+        if let Some(left) = &left {
+            self.remember(left.clone());
+        }
         if let Some(left) = left {
             match (self.repeat, reason) {
                 // Asking to move on has to move on. Replaying the same track
@@ -1019,6 +1059,20 @@ impl GuildPlayer {
             Some(Instant::now() + self.idle_timeout)
         };
         self.current.clone()
+    }
+
+    /// Files a track under what has already played.
+    ///
+    /// A repeated track is not filed twice in a row: under `single` it would
+    /// otherwise fill the whole history with one title.
+    fn remember(&mut self, item: QueueItem) {
+        if self.history.back().map(|last| last.queue_id) == Some(item.queue_id) {
+            return;
+        }
+        if self.history.len() == HISTORY_LENGTH {
+            self.history.pop_front();
+        }
+        self.history.push_back(item);
     }
 
     fn take_random(&mut self) -> Option<QueueItem> {
@@ -1393,6 +1447,64 @@ mod tests {
         assert_eq!(removed.removed, vec![mine(2), mine(4)]);
         assert_eq!(removed.transition.snapshot.pending, vec![item(3)]);
         assert_eq!(removed.transition.snapshot.current, Some(item(1)));
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn what_played_is_remembered_newest_first_and_bounded() {
+        // Enough room for every transition these tracks produce. A full
+        // channel stalls the actor, which is the right production behaviour and
+        // the wrong thing for a test that never listens to it.
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 200, 256, 1, Duration::from_secs(30), 50);
+        assert!(player.history().await.unwrap().is_empty());
+
+        for id in 1..=(HISTORY_LENGTH as u128 + 5) {
+            player.enqueue(item(id), 10).await.unwrap();
+            player.track_finished(item(id).queue_id).await.unwrap();
+        }
+
+        let history = player.history().await.unwrap();
+        assert_eq!(history.len(), HISTORY_LENGTH);
+        // Newest first, because the thing worth finding is usually the thing
+        // that just played.
+        assert_eq!(history[0], item(HISTORY_LENGTH as u128 + 5));
+        assert_eq!(history[HISTORY_LENGTH - 1], item(6));
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_repeated_track_is_not_filed_twice_in_a_row() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.set_repeat(RepeatMode::Single).await.unwrap();
+
+        for _ in 0..4 {
+            player.track_finished(item(1).queue_id).await.unwrap();
+        }
+        // Otherwise repeating one track would fill the whole history with it.
+        assert_eq!(player.history().await.unwrap(), vec![item(1)]);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_skipped_track_is_remembered_too() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.enqueue(item(2), 10).await.unwrap();
+
+        player.skip().await.unwrap();
+        // Cutting a track short is still having played it, and it is exactly
+        // the case somebody wants to find again.
+        assert_eq!(player.history().await.unwrap(), vec![item(1)]);
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

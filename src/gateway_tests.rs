@@ -57,6 +57,10 @@ impl SourceResolver for StubSource {
         Err(SourceError::Disabled)
     }
 
+    fn accepts(&self, _url: &Url) -> Result<(), SourceError> {
+        Ok(())
+    }
+
     async fn playlist(&self, _url: &Url) -> Result<Option<Playlist>, SourceError> {
         Ok(None)
     }

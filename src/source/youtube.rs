@@ -264,6 +264,10 @@ impl SourceResolver for YouTubeResolver {
         self.playable_metadata(&entries)
     }
 
+    fn accepts(&self, url: &Url) -> Result<(), SourceError> {
+        Self::validate_youtube_url(url)
+    }
+
     async fn inspect(&self, url: &Url) -> Result<TrackMetadata, SourceError> {
         Self::validate_youtube_url(url)?;
         let entries = self.query(url.as_str()).await?;

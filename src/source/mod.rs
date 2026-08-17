@@ -48,6 +48,16 @@ pub trait SourceResolver: Send + Sync {
     async fn inspect(&self, url: &Url) -> Result<TrackMetadata, SourceError>;
     async fn resolve(&self, track: &TrackMetadata) -> Result<ResolvedAudio, SourceError>;
 
+    /// Reports whether this resolver would accept a URL at all.
+    ///
+    /// Cheap and offline, so a list of URLs from somewhere untrusted can be
+    /// checked before any of them becomes a subprocess argument.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::InvalidRequest`] describing why it was refused.
+    fn accepts(&self, url: &Url) -> Result<(), SourceError>;
+
     /// Expands a URL that names a list of tracks, or reports that it does not.
     ///
     /// Returning `None` is the ordinary answer for an ordinary link, and it is

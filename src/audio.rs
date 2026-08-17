@@ -626,6 +626,9 @@ mod tests {
         async fn resolve(&self, _track: &TrackMetadata) -> Result<ResolvedAudio, SourceError> {
             panic!("a chunk the origin went on to serve must not cost a fresh media URL")
         }
+        fn accepts(&self, _url: &Url) -> Result<(), SourceError> {
+            unreachable!()
+        }
         async fn playlist(
             &self,
             _url: &Url,
