@@ -47,7 +47,7 @@ use crate::{
         RepeatMode, ShuffleChange, SkipVerdict, spawn_guild_player,
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
-    voice::{SongbirdVoice, TrackEnded, VoiceGateway, VoiceGatewayFactory},
+    voice::{SeekTo, SongbirdVoice, TrackEnded, VoiceGateway, VoiceGatewayFactory},
 };
 
 const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
@@ -375,6 +375,35 @@ fn playing_commands() -> Vec<CreateCommand> {
 /// Commands about the queue behind it.
 fn queue_commands() -> Vec<CreateCommand> {
     vec![
+        CreateCommand::new("seek")
+            .description("Move the playhead within the current track")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "to",
+                    "Like 90, 2:30 or 1:02:03",
+                )
+                .required(true)
+                .min_length(1)
+                .max_length(16),
+            ),
+        CreateCommand::new("forward")
+            .description("Jump forward within the current track")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "by", "Like 30 or 2:30")
+                    .required(true)
+                    .min_length(1)
+                    .max_length(16),
+            ),
+        CreateCommand::new("rewind")
+            .description("Jump back within the current track")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::String, "by", "Like 30 or 2:30")
+                    .required(true)
+                    .min_length(1)
+                    .max_length(16),
+            ),
+        CreateCommand::new("restart").description("Play the current track from the beginning"),
         CreateCommand::new("history")
             .description("Show what has already played, or queue one of them again")
             .add_option(
@@ -502,6 +531,13 @@ struct BotRuntime {
 #[derive(Clone)]
 struct GuildSession {
     player: GuildPlayerHandle,
+    /// Kept beside the player because moving the playhead is not queue state.
+    ///
+    /// Pausing and volume are properties of a session and so belong to the
+    /// actor that owns it. A seek is a one-shot act on the track that is
+    /// playing right now, and its answer — where it actually landed — has to
+    /// come back to the person who asked.
+    voice: Arc<dyn VoiceGateway>,
 }
 
 /// The part of a message that is the same whichever route it takes to Discord.
@@ -705,11 +741,12 @@ impl BotRuntime {
             Duration::from_secs(self.config.playback.idle_timeout_seconds),
             self.config.playback.starting_volume_percent(),
         );
+        let voice = self.voice_factory.create(guild_id);
         let worker_task = tokio::spawn(playback_worker(
             guild_id,
             player.clone(),
             transitions,
-            self.voice_factory.create(guild_id),
+            Arc::clone(&voice),
             self.announcer(http),
             self.observability.clone(),
             self.cancellation.child_token(),
@@ -720,7 +757,7 @@ impl BotRuntime {
             tasks.push(worker_task);
         }
 
-        let session = GuildSession { player };
+        let session = GuildSession { player, voice };
         sessions.insert(guild_id, session.clone());
         self.observability
             .set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
@@ -917,6 +954,9 @@ impl BotRuntime {
             "play" => self.play(ctx, command, authorization).await,
             "queue" => self.queue(command, authorization).await,
             "clear" => self.clear(ctx, authorization).await,
+            "seek" | "forward" | "rewind" | "restart" => {
+                self.seek(ctx, command, authorization).await
+            }
             "history" => self.history(command, authorization).await,
             "export" => self.export(authorization).await,
             "import" => self.import(ctx, command, authorization).await,
@@ -1147,6 +1187,41 @@ impl BotRuntime {
             &track,
             authorization.user_id,
             Some(position),
+        )))
+    }
+
+    /// Moves the playhead within whatever is playing.
+    async fn seek(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
+        self.require_same_voice(ctx, &authorization).await?;
+        let to = match command.data.name.as_str() {
+            "restart" => SeekTo::Start,
+            "seek" => SeekTo::Position(parse_timestamp(
+                string_option(command, "to").context("a time is required")?,
+            )?),
+            "forward" => SeekTo::Forward(parse_timestamp(
+                string_option(command, "by").context("a duration is required")?,
+            )?),
+            other => {
+                debug_assert_eq!(other, "rewind");
+                SeekTo::Backward(parse_timestamp(
+                    string_option(command, "by").context("a duration is required")?,
+                )?)
+            }
+        };
+
+        // Songbird reports where it settled rather than where it was sent: a
+        // container seeks to a boundary it can resume decoding from, which is
+        // rarely the exact instant that was asked for.
+        let landed = authorization.session.voice.seek(to).await?;
+        Ok(InteractionReply::message(format!(
+            "{} moved the track to {}.",
+            mention(authorization.user_id),
+            format_duration(landed)
         )))
     }
 
@@ -1807,12 +1882,11 @@ fn audience_for(command: &str, argument: Option<&str>) -> Audience {
         // Setting the level changes what the room hears; asking what it is does
         // not.
         "volume" | "history" if argument.is_some() => Audience::Channel,
-        // Queueing a whole file changes what the room hears; asking what has
-        // already played, or saving it, does not.
-        "import" => Audience::Channel,
-        "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" | "clear" | "remove" => {
-            Audience::Channel
-        }
+        // Everything that changes what the room hears answers the room.
+        // Queueing a whole file does; asking what already played, or saving it,
+        // does not.
+        "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" | "clear" | "remove"
+        | "import" | "seek" | "forward" | "rewind" | "restart" => Audience::Channel,
         _ => Audience::Requester,
     }
 }
@@ -1845,6 +1919,36 @@ fn parse_track_range(spec: &str) -> Result<(usize, usize)> {
         bail!("{spec:?} runs backwards");
     }
     Ok((first, last))
+}
+
+/// Reads `90`, `2:30`, or `1:02:03` as the duration it names.
+fn parse_timestamp(spec: &str) -> Result<Duration> {
+    let spec = spec.trim();
+    let mut seconds: u64 = 0;
+    let mut parts = 0;
+    for part in spec.split(':') {
+        let part = part.trim();
+        if part.is_empty() || parts == 3 {
+            bail!("{spec:?} is not a time like 90, 2:30 or 1:02:03");
+        }
+        let value: u64 = part
+            .parse()
+            .with_context(|| format!("{spec:?} is not a time like 90, 2:30 or 1:02:03"))?;
+        // Only the leading field may exceed its base, so 1:90 is a mistake
+        // rather than two and a half minutes.
+        if parts > 0 && value >= 60 {
+            bail!("{spec:?} has more than sixty in a minutes or seconds field");
+        }
+        seconds = seconds
+            .checked_mul(60)
+            .and_then(|seconds| seconds.checked_add(value))
+            .context("that time is too long")?;
+        parts += 1;
+    }
+    if parts == 0 {
+        bail!("a time is required");
+    }
+    Ok(Duration::from_secs(seconds))
 }
 
 /// How many people have to agree before one of them cuts a track short.
@@ -2504,6 +2608,7 @@ mod playback_tests {
     use url::Url;
 
     use super::{Announcer, playback_worker};
+    use crate::voice::VoiceGateway as _;
     use crate::{
         config::Config,
         observability::ObservabilityState,
@@ -2874,6 +2979,35 @@ idle_timeout_seconds = 900
     }
 
     #[tokio::test]
+    async fn moving_the_playhead_reaches_the_track_that_is_playing() {
+        use crate::voice::SeekTo;
+
+        let session = Session::start(Duration::from_secs(900));
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+
+        // The gateway is asked where to go rather than told an offset, because
+        // only it knows where the playhead currently is.
+        session
+            .voice
+            .seek(SeekTo::Forward(Duration::from_secs(30)))
+            .await
+            .unwrap();
+        session.voice.settle(3).await;
+        assert_eq!(
+            session.voice.actions()[2..],
+            [VoiceAction::Sought(SeekTo::Forward(Duration::from_secs(
+                30
+            )))]
+        );
+        session.finish().await;
+    }
+
+    #[tokio::test]
     async fn stopping_gives_up_the_channel_where_an_empty_queue_does_not() {
         let session = Session::start(Duration::from_secs(900));
         session
@@ -3067,6 +3201,23 @@ mod tests {
         assert_eq!(announcement_channel(None, None), None);
         assert_eq!(announcement_channel(Some(&guild()), None), None);
         assert_eq!(announcement_channel(None, Some(50)), Some(50));
+    }
+
+    #[test]
+    fn a_time_reads_the_way_a_track_length_is_written() {
+        let at = |spec| parse_timestamp(spec).unwrap();
+        assert_eq!(at("90"), Duration::from_secs(90));
+        assert_eq!(at("2:30"), Duration::from_secs(150));
+        assert_eq!(at("1:02:03"), Duration::from_secs(3_723));
+        assert_eq!(at(" 2:30 "), Duration::from_secs(150));
+        // The leading field carries the overflow, so a long track can be
+        // seeked into by seconds alone.
+        assert_eq!(at("5000"), Duration::from_secs(5_000));
+        assert_eq!(at("90:00"), Duration::from_secs(5_400));
+
+        for bad in ["", ":", "2:", ":30", "1:90", "1:2:3:4", "two", "-5", "1:60"] {
+            assert!(parse_timestamp(bad).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]

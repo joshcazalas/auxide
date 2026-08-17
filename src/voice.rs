@@ -10,7 +10,7 @@
 //! because a worker is per guild too — it removes the guild id from every
 //! method and gives the implementation somewhere to keep the track it started.
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serenity::model::id::{ChannelId, GuildId};
@@ -53,6 +53,12 @@ pub trait VoiceGateway: Send + Sync + 'static {
     async fn pause(&self);
     async fn resume(&self);
     async fn set_volume(&self, volume: f32);
+
+    /// Moves the playhead within the current track.
+    ///
+    /// Where to go is worked out here rather than by the caller, because only
+    /// a gateway knows where the playhead currently is.
+    async fn seek(&self, to: SeekTo) -> Result<Duration, VoiceError>;
 
     /// Stops what is playing and keeps the channel.
     async fn stop(&self);
@@ -97,6 +103,15 @@ impl std::fmt::Debug for Prepared {
     }
 }
 
+/// Where a seek should land.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SeekTo {
+    Position(Duration),
+    Forward(Duration),
+    Backward(Duration),
+    Start,
+}
+
 #[derive(Debug, Error)]
 pub enum VoiceError {
     /// The source could not be made playable, which is the track's fault.
@@ -109,6 +124,10 @@ pub enum VoiceError {
     Join(String),
     #[error("failed to start playback: {0}")]
     Play(String),
+    #[error("nothing is playing")]
+    NothingPlaying,
+    #[error("this track cannot be seeked in")]
+    NotSeekable,
 }
 
 /// Makes a gateway for a guild, the first time that guild needs one.
@@ -241,6 +260,33 @@ impl VoiceGateway for SongbirdGateway {
             .await;
     }
 
+    async fn seek(&self, to: SeekTo) -> Result<Duration, VoiceError> {
+        let handle = self
+            .active
+            .lock()
+            .await
+            .clone()
+            .ok_or(VoiceError::NothingPlaying)?;
+        let now = handle
+            .get_info()
+            .await
+            .map_err(|_| VoiceError::NothingPlaying)?
+            .position;
+        let target = match to {
+            SeekTo::Position(at) => at,
+            SeekTo::Forward(by) => now.saturating_add(by),
+            SeekTo::Backward(by) => now.saturating_sub(by),
+            SeekTo::Start => Duration::ZERO,
+        };
+        // Songbird reports the position it settled on, which need not be the
+        // one asked for: a container seeks to a boundary it can resume from.
+        handle
+            .seek(target)
+            .result_async()
+            .await
+            .map_err(|_| VoiceError::NotSeekable)
+    }
+
     async fn stop(&self) {
         if let Some(handle) = self.active.lock().await.take() {
             let _ = handle.stop();
@@ -285,7 +331,10 @@ pub mod fake {
     // nothing a reader of a test double needs.
     #![allow(clippy::missing_panics_doc)]
 
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use tokio::sync::Notify;
@@ -304,6 +353,7 @@ pub mod fake {
         Paused,
         Resumed,
         VolumeSet(u16),
+        Sought(super::SeekTo),
         Stopped,
         Left,
     }
@@ -434,6 +484,11 @@ pub mod fake {
 
         async fn set_volume(&self, volume: f32) {
             self.record(VoiceAction::VolumeSet(percent(volume)));
+        }
+
+        async fn seek(&self, to: super::SeekTo) -> Result<Duration, VoiceError> {
+            self.record(VoiceAction::Sought(to));
+            Ok(Duration::ZERO)
         }
 
         async fn stop(&self) {
