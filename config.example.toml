@@ -20,6 +20,15 @@ max_guilds = 50
 #
 # [[discord.guilds]]
 # guild_id = 123456789012345678
+#
+# The three lists below are the host owner's boundary, not the server's. They
+# gate every command at once and changing them needs a restart, so in almost
+# every case they should stay empty: a server administrator can already
+# restrict any command to roles, members, or channels in Server Settings →
+# Integrations → Auxide, per command and without anybody touching this file.
+#
+# Reach for these only when you want a limit a server administrator cannot lift.
+#
 # # An empty list permits commands in every text channel in this server.
 # command_channel_ids = [234567890123456789]
 # # When both lists are empty, any member in the requester's voice channel is authorized.

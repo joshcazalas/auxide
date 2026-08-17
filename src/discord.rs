@@ -305,6 +305,18 @@ fn build_http(token: &str, api_base: Option<&str>) -> Http {
     builder.build()
 }
 
+/// Every command Auxide registers.
+///
+/// Which members of a server may run which of these is deliberately not decided
+/// here. Discord already has a per-command permission editor, an audit log, and
+/// somewhere for a server's own administrators to reach both — so these are
+/// registered open, and narrowing them is something a server does to itself
+/// without anybody touching a file on the host.
+///
+/// The one restriction applied to all of them is that they are useless outside
+/// a server. Auxide has a queue, a voice channel, and a room per server; a
+/// direct message has none of those, so a command offered there could only ever
+/// be refused.
 fn command_definitions() -> Vec<CreateCommand> {
     playing_commands()
         .into_iter()
@@ -312,6 +324,7 @@ fn command_definitions() -> Vec<CreateCommand> {
         .chain([
             CreateCommand::new("help").description("What Auxide can do, and who sees each answer")
         ])
+        .map(|command| command.dm_permission(false))
         .collect()
 }
 
@@ -1171,13 +1184,22 @@ impl BotRuntime {
         // same treatment an entry with empty lists already receives. Narrowing
         // one server therefore stays possible without enumerating the others.
         if let Some(guild) = self.config.guild(guild_id) {
+            // Both of these are the host's boundary rather than the server's,
+            // and saying so is the difference between an administrator fixing
+            // it and hunting for a Discord setting that was never involved.
             if !guild.command_channel_ids.is_empty()
                 && !guild.command_channel_ids.contains(&response_channel_id)
             {
-                bail!("commands are not enabled in this channel");
+                bail!(
+                    "Auxide's own configuration does not enable commands in this channel. That \
+                     is set on the host that runs the bot, not in Discord."
+                );
             }
             if !identity_is_authorized(guild, user_id.get(), role_ids) {
-                bail!("you are not authorized to control Auxide");
+                bail!(
+                    "Auxide's own configuration does not list you as permitted to control it. \
+                     That is set on the host that runs the bot, not in Discord."
+                );
             }
         }
         let session = self.session(guild_id, &ctx.http).await?;
@@ -3466,6 +3488,40 @@ mod tests {
 
         for bad in ["0", "0-3", "7-3", "", "three", "3-", "-3", "3-4-5"] {
             assert!(parse_track_range(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_command_is_offered_only_inside_a_server() {
+        // Auxide has a queue, a voice channel, and a room per server. A command
+        // offered in a direct message could only ever be refused, so none of
+        // them should be offered there — and a command added later must not be
+        // able to slip through without this.
+        for command in command_definitions() {
+            let payload = serde_json::to_value(&command).expect("a command serialises");
+            let name = payload["name"].as_str().unwrap_or_default().to_owned();
+            assert_eq!(
+                payload
+                    .get("dm_permission")
+                    .and_then(serde_json::Value::as_bool),
+                Some(false),
+                "/{name} is offered in direct messages"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_is_narrowed_before_a_server_has_narrowed_it() {
+        // Deciding here who may run what would take the decision away from the
+        // server administrators who have Discord's editor, its audit log, and
+        // the context to use both.
+        for command in command_definitions() {
+            let payload = serde_json::to_value(&command).expect("a command serialises");
+            let name = payload["name"].as_str().unwrap_or_default().to_owned();
+            assert!(
+                payload.get("default_member_permissions").is_none(),
+                "/{name} decides who may run it, instead of leaving that to the server"
+            );
         }
     }
 

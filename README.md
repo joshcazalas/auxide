@@ -20,7 +20,8 @@ The production path now includes:
 - unprompted notices for the events nobody asked for — a track that could not be played, and
   why Auxide left a voice channel — plus optional per-track announcements;
 - one bounded actor/state machine per guild with stale-completion protection;
-- requester, role, guild, command-channel, and voice-channel authorization;
+- per-command restriction through Discord's own permission editor, over a host-owned allowlist
+  for which servers and people may drive the bot at all;
 - bounded yt-dlp/Deno subprocesses and fresh audio URL resolution before playback;
 - Songbird voice joining, playback, reconnect/session handling, and DAVE support;
 - a fifteen-minute hold on an emptied queue, a pause when the room empties that lifts when
