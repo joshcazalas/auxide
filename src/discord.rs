@@ -42,7 +42,7 @@ use uuid::Uuid;
 
 use crate::{
     audio::AudioPipeline,
-    config::{Config, GuildConfig},
+    config::{Config, GuildConfig, MAX_VOLUME_PERCENT},
     observability::{ObservabilityServer, ObservabilityState, start_observability},
     player::{
         GuildPlayerHandle, PlaybackDirective, PlayerSnapshot, PlayerTransition, QueueItem,
@@ -263,6 +263,20 @@ fn command_definitions() -> Vec<CreateCommand> {
         CreateCommand::new("stop").description("Clear the queue and disconnect"),
         CreateCommand::new("shuffle").description("Shuffle tracks waiting in the queue"),
         CreateCommand::new("now-playing").description("Show the current track"),
+        CreateCommand::new("pause").description("Hold the current track where it is"),
+        CreateCommand::new("resume").description("Continue a held track"),
+        CreateCommand::new("volume")
+            .description("Show or set how loud Auxide plays")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "level",
+                    "Percent of the source's own level; omit to show the current one",
+                )
+                .required(false)
+                .min_int_value(1)
+                .max_int_value(u64::from(MAX_VOLUME_PERCENT)),
+            ),
     ]
 }
 
@@ -526,6 +540,7 @@ impl BotRuntime {
             self.config.playback.actor_mailbox_capacity,
             random(),
             Duration::from_secs(self.config.playback.idle_timeout_seconds),
+            self.config.playback.starting_volume_percent(),
         );
         let worker_task = tokio::spawn(playback_worker(
             guild_id,
@@ -740,6 +755,9 @@ impl BotRuntime {
             "stop" => self.stop(ctx, authorization).await,
             "shuffle" => self.shuffle(ctx, authorization).await,
             "now-playing" => self.now_playing(authorization).await,
+            "pause" => self.set_paused(ctx, authorization, true).await,
+            "resume" => self.set_paused(ctx, authorization, false).await,
+            "volume" => self.volume(ctx, command, authorization).await,
             other => bail!("unsupported command {other:?}"),
         }
     }
@@ -973,7 +991,7 @@ impl BotRuntime {
             return Ok(InteractionReply::message("Nothing is playing."));
         };
         Ok(InteractionReply::from(Announcement::card(track_embed(
-            "Now playing",
+            playback_heading(snapshot.paused),
             &item.track,
             item.requested_by,
             None,
@@ -999,6 +1017,51 @@ impl BotRuntime {
         );
         Ok(InteractionReply::message(format!(
             "{requester} skipped **{title}**. {next}"
+        )))
+    }
+
+    async fn set_paused(
+        &self,
+        ctx: &Context,
+        authorization: Authorization,
+        paused: bool,
+    ) -> Result<InteractionReply> {
+        self.require_same_voice(ctx, &authorization).await?;
+        let transition = authorization.session.player.set_paused(paused).await?;
+        let title = transition.snapshot.current.as_ref().map_or_else(
+            || "the current track".to_owned(),
+            |item| format!("**{}**", single_line(&item.track.title, 150)),
+        );
+        let requester = mention(authorization.user_id);
+        Ok(InteractionReply::message(if paused {
+            format!(
+                "{requester} paused {title}. Leaving in {} unless it resumes.",
+                idle_hold(&self.config)
+            )
+        } else {
+            format!("{requester} resumed {title}.")
+        }))
+    }
+
+    async fn volume(
+        &self,
+        ctx: &Context,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
+        let Some(level) = volume_option(command) else {
+            let snapshot = authorization.session.player.snapshot().await?;
+            return Ok(InteractionReply::message(format!(
+                "Auxide is playing at {}% of the source's own level.",
+                snapshot.volume_percent
+            )));
+        };
+        self.require_same_voice(ctx, &authorization).await?;
+        let transition = authorization.session.player.set_volume(level).await?;
+        Ok(InteractionReply::message(format!(
+            "{} set the volume to {}%.",
+            mention(authorization.user_id),
+            transition.snapshot.volume_percent
         )))
     }
 
@@ -1166,16 +1229,34 @@ struct Authorization {
 /// only look something up, and a search whose answer is a list of candidates
 /// nobody has chosen between yet, stay with the person who ran them.
 fn command_audience(command: &CommandInteraction) -> Audience {
-    audience_for(&command.data.name, query_option(command))
+    // Both commands that take an argument are told apart by having one, so the
+    // presence of any argument is all this needs to see.
+    let argument = query_option(command).or_else(|| volume_option(command).map(|_| "level"));
+    audience_for(&command.data.name, argument)
 }
 
-fn audience_for(command: &str, query: Option<&str>) -> Audience {
+fn volume_option(command: &CommandInteraction) -> Option<u16> {
+    command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == "level")
+        .and_then(|option| match &option.value {
+            CommandDataOptionValue::Integer(value) => u16::try_from(*value).ok(),
+            _ => None,
+        })
+}
+
+fn audience_for(command: &str, argument: Option<&str>) -> Audience {
     match command {
         // A URL is played outright, so the answer is the track. Search terms
         // are answered with candidates, and the choice announces itself once it
         // is made.
-        "play" if query.is_some_and(|query| Url::parse(query).is_ok()) => Audience::Channel,
-        "skip" | "stop" | "shuffle" => Audience::Channel,
+        "play" if argument.is_some_and(|query| Url::parse(query).is_ok()) => Audience::Channel,
+        // Setting the level changes what the room hears; asking what it is does
+        // not.
+        "volume" if argument.is_some() => Audience::Channel,
+        "skip" | "stop" | "shuffle" | "pause" | "resume" => Audience::Channel,
         _ => Audience::Requester,
     }
 }
@@ -1248,6 +1329,16 @@ fn track_embed(
 /// answer already are.
 fn announcement_channel(guild: Option<&GuildConfig>, origin: Option<u64>) -> Option<u64> {
     guild.and_then(|guild| guild.announce_channel_id).or(origin)
+}
+
+/// Names the state of the current track, so a held one does not read as playing.
+const fn playback_heading(paused: bool) -> &'static str {
+    if paused { "Paused" } else { "Now playing" }
+}
+
+/// Converts a session's whole-percent level into the scale Songbird takes.
+fn volume_scale(percent: u16) -> f32 {
+    f32::from(percent.clamp(1, MAX_VOLUME_PERCENT)) / 100.0
 }
 
 fn idle_hold(config: &Config) -> String {
@@ -1366,6 +1457,10 @@ async fn playback_worker(
         let Some(transition) = transition else {
             break;
         };
+        // Every transition carries the session's level, so the worker never has
+        // to be told it separately — a track starting later reads it from here
+        // and a change to it while one plays arrives as its own directive.
+        let volume = volume_scale(transition.snapshot.volume_percent);
 
         match transition.directive {
             PlaybackDirective::None => {}
@@ -1373,6 +1468,11 @@ async fn playback_worker(
                 if let Some(handle) = active.take() {
                     let _ = handle.stop();
                 }
+            }
+            directive @ (PlaybackDirective::Pause
+            | PlaybackDirective::Resume
+            | PlaybackDirective::SetVolume) => {
+                adjust_track(guild_id, active.as_ref(), &directive, volume);
             }
             PlaybackDirective::StopAndDisconnect | PlaybackDirective::Disconnect => {
                 if let Some(handle) = active.take() {
@@ -1417,6 +1517,7 @@ async fn playback_worker(
                     &observability,
                     &cancellation,
                     item,
+                    volume,
                 )
                 .await
                 {
@@ -1454,6 +1555,7 @@ async fn start_track(
     observability: &ObservabilityState,
     cancellation: &CancellationToken,
     item: QueueItem,
+    volume: f32,
 ) -> StartTrackOutcome {
     let preparation = pipeline.prepare(&item.track);
     tokio::pin!(preparation);
@@ -1522,7 +1624,7 @@ async fn start_track(
         }
     };
     let handle = call.lock().await.play_only_input(input);
-    if let Err(error) = handle.set_volume(pipeline.output_volume()) {
+    if let Err(error) = handle.set_volume(volume) {
         tracing::warn!(%error, guild_id, "failed to set playback volume");
     }
     let event = RuntimeTrackFinished {
@@ -1559,6 +1661,31 @@ async fn start_track(
             .await;
     }
     StartTrackOutcome::Active(handle)
+}
+
+/// Applies a session-level change to the track that is already playing.
+///
+/// Doing nothing is the right answer when there is no track: the actor refuses
+/// to hold a session with nothing in it, and a level set while the queue is
+/// empty rides the snapshot to whatever starts next.
+fn adjust_track(
+    guild_id: u64,
+    active: Option<&TrackHandle>,
+    directive: &PlaybackDirective,
+    volume: f32,
+) {
+    let Some(handle) = active else {
+        return;
+    };
+    let adjusted = match directive {
+        PlaybackDirective::Pause => handle.pause(),
+        PlaybackDirective::Resume => handle.play(),
+        PlaybackDirective::SetVolume => handle.set_volume(volume),
+        _ => return,
+    };
+    if let Err(error) = adjusted {
+        tracing::warn!(%error, guild_id, ?directive, "failed to adjust the current track");
+    }
 }
 
 async fn remove_voice(voice: &Songbird, guild_id: u64) {
@@ -1622,7 +1749,8 @@ fn prune_searches(searches: &mut HashMap<Uuid, PendingSearch>) {
 fn format_queue(snapshot: &PlayerSnapshot) -> Option<String> {
     let current = snapshot.current.as_ref()?;
     let mut content = format!(
-        "**Now playing**\n{} ({}) — {}\n",
+        "**{}**\n{} ({}) — {}\n",
+        playback_heading(snapshot.paused),
         single_line(&current.track.title, 120),
         format_duration(current.track.duration),
         mention(current.requested_by)
@@ -1803,6 +1931,7 @@ mod tests {
             pending: vec![item; 100],
             voice_channel_id: Some(3),
             text_channel_id: Some(2),
+            ..PlayerSnapshot::default()
         };
         let rendered = format_queue(&snapshot).unwrap();
         assert!(rendered.chars().count() <= EMBED_DESCRIPTION_CHARS + 100);
@@ -1816,6 +1945,7 @@ mod tests {
             pending: vec![QueueItem::new(track("Waiting"), 22, 2)],
             voice_channel_id: Some(3),
             text_channel_id: Some(2),
+            ..PlayerSnapshot::default()
         };
         let rendered = format_queue(&snapshot).unwrap();
         assert!(rendered.contains("**Now playing**\nPlaying (2:00) — <@11>"));
@@ -1903,8 +2033,30 @@ mod tests {
         assert_eq!(audience_for("skip", None), Audience::Channel);
         assert_eq!(audience_for("stop", None), Audience::Channel);
         assert_eq!(audience_for("shuffle", None), Audience::Channel);
+        assert_eq!(audience_for("pause", None), Audience::Channel);
+        assert_eq!(audience_for("resume", None), Audience::Channel);
+        // Setting the level changes what everyone hears; asking what it is only
+        // answers the person who asked.
+        assert_eq!(audience_for("volume", Some("30")), Audience::Channel);
+        assert_eq!(audience_for("volume", None), Audience::Requester);
         assert_eq!(audience_for("queue", None), Audience::Requester);
         assert_eq!(audience_for("now-playing", None), Audience::Requester);
+    }
+
+    #[test]
+    fn a_percentage_becomes_the_scale_songbird_takes() {
+        assert!((volume_scale(100) - 1.0).abs() < f32::EPSILON);
+        assert!((volume_scale(30) - 0.3).abs() < f32::EPSILON);
+        // Nothing should reach this clamped, but silence and amplification are
+        // both worse failures than the nearest level that was asked for.
+        assert!((volume_scale(0) - 0.01).abs() < f32::EPSILON);
+        assert!((volume_scale(500) - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_held_track_does_not_read_as_playing() {
+        assert_eq!(playback_heading(false), "Now playing");
+        assert_eq!(playback_heading(true), "Paused");
     }
 
     fn occupant(user_id: u64, channel_id: Option<u64>, is_bot: bool) -> VoiceOccupant {

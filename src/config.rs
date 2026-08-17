@@ -116,7 +116,7 @@ pub struct PlaybackConfig {
     pub actor_mailbox_capacity: usize,
     pub max_concurrent_resolutions: usize,
 
-    /// Level tracks are played at, where `1.0` is the source's own level.
+    /// Level a session starts at, where `1.0` is the source's own level.
     ///
     /// Discord applies no normalisation, and `YouTube` audio is mastered loud, so
     /// joining at full scale is startling for everyone already in the channel.
@@ -124,8 +124,33 @@ pub struct PlaybackConfig {
     /// Anything other than `1.0` costs Songbird's Opus passthrough: a track
     /// whose volume is untouched can be forwarded to Discord without being
     /// decoded and re-encoded, and adjusting the level means it can no longer
-    /// be. That trade is worth it for one track at a time.
+    /// be. That trade is worth it for one track at a time, and it is a trade
+    /// this default already makes, so changing the level while a session runs
+    /// costs nothing further.
     pub output_volume: f32,
+}
+
+/// The loudest a session may be set to, as a percentage of the source's level.
+///
+/// Amplifying past the source multiplies samples that are already near full
+/// scale, so it buys distortion rather than volume. The configured
+/// [`PlaybackConfig::output_volume`] is capped at `1.0` for the same reason, and
+/// a command that could exceed what the file is allowed to say would be an odd
+/// thing to offer.
+pub const MAX_VOLUME_PERCENT: u16 = 100;
+
+impl PlaybackConfig {
+    /// The starting level as whole percent, which is how a session carries it.
+    ///
+    /// Percent is the unit `/volume` speaks in, and it keeps the player's state
+    /// comparable — a float in there would make every transition in the actor
+    /// impossible to assert on exactly.
+    #[must_use]
+    pub fn starting_volume_percent(&self) -> u16 {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let percent = (self.output_volume * 100.0).round() as u16;
+        percent.clamp(1, MAX_VOLUME_PERCENT)
+    }
 }
 
 impl Default for PlaybackConfig {

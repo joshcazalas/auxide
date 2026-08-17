@@ -180,6 +180,8 @@ concurrently, and run every control command. Acceptance requires:
 6. an emptied queue holds the voice channel for `playback.idle_timeout_seconds` and any track
    queued inside that window cancels the pending disconnect, while `/stop` and the departure of
    the last person in the voice channel disconnect immediately, and each of the two departures
-   Auxide decides on for itself says why in the channel; and
-7. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+   Auxide decides on for itself says why in the channel;
+7. `/pause` holds a track and starts the same countdown, `/resume` cancels it, and `/volume`
+   changes the level of what is playing and of everything queued behind it; and
+8. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.
