@@ -1,7 +1,7 @@
 //! The seam between deciding what to play and actually playing it.
 //!
 //! [`crate::source::SourceResolver`] already lets a test hand the player a fake
-//! YouTube. This is the matching boundary on the other side: without it, the
+//! `YouTube`. This is the matching boundary on the other side: without it, the
 //! only way to exercise the playback worker is to connect to Discord, so the
 //! step between a queue deciding something and a voice channel hearing it was
 //! the one part of Auxide with no tests at all.
@@ -190,12 +190,36 @@ impl VoiceGateway for SongbirdGateway {
     }
 }
 
+/// Bridges Songbird's completion event onto [`TrackEnded`].
+struct EndedEvent {
+    guild_id: u64,
+    ended: Arc<dyn TrackEnded>,
+}
+
+#[async_trait]
+impl VoiceEventHandler for EndedEvent {
+    async fn act(&self, context: &EventContext<'_>) -> Option<Event> {
+        if let EventContext::Track([(state, _)]) = context {
+            if let PlayMode::Errored(error) = &state.playing {
+                tracing::warn!(%error, guild_id = self.guild_id, "track ended with an error");
+            }
+        }
+        self.ended.ended().await;
+        Some(Event::Cancel)
+    }
+}
+
 /// A gateway that records what was asked of it instead of doing it.
 ///
 /// Public within the crate rather than private to one test module, because the
 /// tests that need it are in `discord`, beside the worker it stands in for.
 #[cfg(test)]
 pub mod fake {
+    // A poisoned lock here means a test panicked while holding it, which the
+    // panic already reports. Documenting that on every accessor would say
+    // nothing a reader of a test double needs.
+    #![allow(clippy::missing_panics_doc)]
+
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -364,24 +388,5 @@ pub mod fake {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let percent = (volume * 100.0).round() as u16;
         percent
-    }
-}
-
-/// Bridges Songbird's completion event onto [`TrackEnded`].
-struct EndedEvent {
-    guild_id: u64,
-    ended: Arc<dyn TrackEnded>,
-}
-
-#[async_trait]
-impl VoiceEventHandler for EndedEvent {
-    async fn act(&self, context: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::Track([(state, _)]) = context {
-            if let PlayMode::Errored(error) = &state.playing {
-                tracing::warn!(%error, guild_id = self.guild_id, "track ended with an error");
-            }
-        }
-        self.ended.ended().await;
-        Some(Event::Cancel)
     }
 }
