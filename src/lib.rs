@@ -1,3 +1,8 @@
+#[cfg(test)]
+pub mod fake_discord;
+#[cfg(test)]
+mod gateway_tests;
+
 pub mod audio;
 pub mod config;
 pub mod discord;
