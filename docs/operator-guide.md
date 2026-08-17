@@ -195,5 +195,8 @@ concurrently, and run every control command. Acceptance requires:
 11. `/skip` alone needs half the channel to agree before cutting somebody else's track short,
     while the person who queued it may always skip their own, and `/skip tracks:` and
     `/skip requester:` take waiting tracks out without touching what is playing; and
-12. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
+12. `/history` lists what already played newest first and `/history replay:` queues one again
+    without resolving anything, while `/export` and `/import` round-trip a queue through a file
+    whose links are re-checked on the way back in; and
+13. SIGINT/SIGTERM, Discord reconnects, resolver errors, over-duration videos, and live videos leave
    the process in a clean, usable state.

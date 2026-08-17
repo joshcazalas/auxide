@@ -11,9 +11,9 @@ use secrecy::ExposeSecret;
 use serenity::{
     async_trait,
     builder::{
-        CreateActionRow, CreateAllowedMentions, CreateAutocompleteResponse, CreateButton,
-        CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter,
-        CreateInteractionResponse, CreateInteractionResponseFollowup,
+        CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateAutocompleteResponse,
+        CreateButton, CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedAuthor,
+        CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseFollowup,
         CreateInteractionResponseMessage, CreateMessage, EditInteractionResponse,
     },
     client::ClientBuilder,
@@ -63,6 +63,12 @@ const EMBED_COLOUR: u32 = 0x00B5_732E;
 const EMBED_TITLE_CHARS: usize = 200;
 const EMBED_FOOTER_CHARS: usize = 100;
 const EMBED_DESCRIPTION_CHARS: usize = 3_800;
+
+/// The largest file `/import` will read.
+///
+/// A full hundred-track export runs to a few tens of kilobytes, so this leaves
+/// room to spare while keeping a hostile upload from being read at all.
+const MAX_IMPORT_BYTES: u32 = 512 * 1024;
 
 /// Registers the complete Auxide command set for this application.
 ///
@@ -299,6 +305,14 @@ fn build_http(token: &str, api_base: Option<&str>) -> Http {
 }
 
 fn command_definitions() -> Vec<CreateCommand> {
+    playing_commands()
+        .into_iter()
+        .chain(queue_commands())
+        .collect()
+}
+
+/// Commands about what is playing now.
+fn playing_commands() -> Vec<CreateCommand> {
     vec![
         CreateCommand::new("play")
             .description("Queue a YouTube URL or search")
@@ -354,6 +368,39 @@ fn command_definitions() -> Vec<CreateCommand> {
                     "Take out everything this person queued",
                 )
                 .required(false),
+            ),
+    ]
+}
+
+/// Commands about the queue behind it.
+fn queue_commands() -> Vec<CreateCommand> {
+    vec![
+        CreateCommand::new("history")
+            .description("Show what has already played, or queue one of them again")
+            .add_option(
+                CreateCommandOption::new(CommandOptionType::Integer, "page", "Which page to show")
+                    .required(false)
+                    .min_int_value(1),
+            )
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Integer,
+                    "replay",
+                    "Queue this one again, by its number",
+                )
+                .required(false)
+                .min_int_value(1),
+            ),
+        CreateCommand::new("export").description("Save the queue to a file you can bring back"),
+        CreateCommand::new("import")
+            .description("Queue everything in a file /export made")
+            .add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::Attachment,
+                    "file",
+                    "A file /export made",
+                )
+                .required(true),
             ),
         CreateCommand::new("stop").description("Clear the queue and disconnect"),
         CreateCommand::new("shuffle")
@@ -572,6 +619,7 @@ enum Audience {
 struct InteractionReply {
     content: String,
     embeds: Vec<CreateEmbed>,
+    attachments: Vec<CreateAttachment>,
     components: Vec<CreateActionRow>,
     /// A second, channel-visible message to post alongside a private answer.
     ///
@@ -585,15 +633,22 @@ impl InteractionReply {
         Self {
             content: bounded_message(content.into()),
             embeds: Vec::new(),
+            attachments: Vec::new(),
             components: Vec::new(),
             announcement: None,
         }
+    }
+
+    fn attaching(mut self, attachment: CreateAttachment) -> Self {
+        self.attachments.push(attachment);
+        self
     }
 
     fn from(announcement: Announcement) -> Self {
         Self {
             content: announcement.content,
             embeds: announcement.embeds,
+            attachments: Vec::new(),
             components: Vec::new(),
             announcement: None,
         }
@@ -798,11 +853,14 @@ impl BotRuntime {
                 return;
             }
         };
-        let edit = EditInteractionResponse::new()
+        let mut edit = EditInteractionResponse::new()
             .content(reply.content)
             .embeds(reply.embeds)
             .components(reply.components)
             .allowed_mentions(no_mentions());
+        for attachment in reply.attachments {
+            edit = edit.new_attachment(attachment);
+        }
         let response = command.edit_response(&ctx.http, edit).await;
         self.observability.record_interaction(response.is_ok());
         if let Err(error) = response {
@@ -859,6 +917,9 @@ impl BotRuntime {
             "play" => self.play(ctx, command, authorization).await,
             "queue" => self.queue(command, authorization).await,
             "clear" => self.clear(ctx, authorization).await,
+            "history" => self.history(command, authorization).await,
+            "export" => self.export(authorization).await,
+            "import" => self.import(ctx, command, authorization).await,
             "remove" => self.remove(ctx, command, authorization).await,
             "skip" => self.skip(ctx, command, authorization).await,
             "stop" => self.stop(ctx, authorization).await,
@@ -1039,6 +1100,7 @@ impl BotRuntime {
         Ok(InteractionReply {
             content: bounded_message(content),
             embeds: Vec::new(),
+            attachments: Vec::new(),
             components: vec![CreateActionRow::Buttons(buttons)],
             announcement: None,
         })
@@ -1085,6 +1147,155 @@ impl BotRuntime {
             &track,
             authorization.user_id,
             Some(position),
+        )))
+    }
+
+    /// Lists what has already played, or queues one of them again.
+    async fn history(
+        &self,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
+        let history = authorization.session.player.history().await?;
+        if history.is_empty() {
+            bail!("nothing has played yet");
+        }
+
+        if let Some(position) =
+            integer_option(command, "replay").and_then(|position| usize::try_from(position).ok())
+        {
+            let voice_channel_id = authorization
+                .voice_channel_id
+                .context("join a voice channel before queueing something")?;
+            let item = history
+                .get(position - 1)
+                .with_context(|| format!("nothing played at position {position}"))?;
+            // A history entry is a whole track, so this needs no resolution —
+            // the media URL is fetched just before it plays, as it always is.
+            return self
+                .enqueue_track(&authorization, voice_channel_id, item.track.clone())
+                .await
+                .map(InteractionReply::from);
+        }
+
+        let page = integer_option(command, "page")
+            .and_then(|page| usize::try_from(page).ok())
+            .unwrap_or(1);
+        let pages = history.len().div_ceil(QUEUE_PAGE_SIZE).max(1);
+        let page = page.clamp(1, pages);
+        let mut description = String::new();
+        for (offset, item) in history
+            .iter()
+            .skip((page - 1) * QUEUE_PAGE_SIZE)
+            .take(QUEUE_PAGE_SIZE)
+            .enumerate()
+        {
+            let _ = writeln!(
+                description,
+                "{}. {} ({}) — {}",
+                (page - 1) * QUEUE_PAGE_SIZE + offset + 1,
+                single_line(&item.track.title, 100),
+                format_duration(item.track.duration),
+                mention(item.requested_by)
+            );
+        }
+        let mut embed = CreateEmbed::new()
+            .author(CreateEmbedAuthor::new("Already played"))
+            .description(bounded_message(description))
+            .colour(EMBED_COLOUR)
+            .footer(CreateEmbedFooter::new(if pages > 1 {
+                format!("Page {page} of {pages} · /history replay:N to queue one again")
+            } else {
+                "/history replay:N to queue one again".to_owned()
+            }));
+        if pages == 1 {
+            embed = embed.footer(CreateEmbedFooter::new(
+                "/history replay:N to queue one again",
+            ));
+        }
+        Ok(InteractionReply::from(Announcement::card(embed)))
+    }
+
+    /// Writes the queue to a file that `/import` can bring back.
+    ///
+    /// The whole track travels, not just its link, so bringing a queue back
+    /// costs no resolutions at all — which is what makes a hundred-track export
+    /// usable. A media URL was never in here to begin with; those are fetched
+    /// just before a track plays.
+    async fn export(&self, authorization: Authorization) -> Result<InteractionReply> {
+        let snapshot = authorization.session.player.snapshot().await?;
+        let tracks = snapshot
+            .current
+            .into_iter()
+            .chain(snapshot.pending)
+            .map(|item| item.track)
+            .collect::<Vec<_>>();
+        if tracks.is_empty() {
+            bail!("there is nothing in the queue to save");
+        }
+        let saved = serde_json::to_vec_pretty(&Export { tracks })
+            .context("failed to write the queue out")?;
+        Ok(
+            InteractionReply::message("Here is the queue. Bring it back with `/import`.")
+                .attaching(CreateAttachment::bytes(saved, "auxide-queue.json")),
+        )
+    }
+
+    /// Queues everything in a file `/export` made.
+    async fn import(
+        &self,
+        _ctx: &Context,
+        command: &CommandInteraction,
+        authorization: Authorization,
+    ) -> Result<InteractionReply> {
+        let voice_channel_id = authorization
+            .voice_channel_id
+            .context("join a voice channel before using /import")?;
+        let attachment =
+            attachment_option(command, "file").context("attach a file that /export made")?;
+        if attachment.size > MAX_IMPORT_BYTES {
+            bail!(
+                "that file is larger than the {} KiB an exported queue can be",
+                MAX_IMPORT_BYTES / 1024
+            );
+        }
+
+        let body = attachment
+            .download()
+            .await
+            .context("failed to read the attached file")?;
+        let export: Export =
+            serde_json::from_slice(&body).context("that file is not one /export made")?;
+
+        // Everything past this point came from a file somebody uploaded. Each
+        // link is checked against what the source will accept before any of
+        // them can become a subprocess argument later.
+        let mut tracks = Vec::with_capacity(export.tracks.len());
+        for track in export
+            .tracks
+            .into_iter()
+            .take(self.config.playback.max_queue_length)
+        {
+            self.resolver.accepts(&track.canonical_url)?;
+            tracks.push(QueueItem::new(
+                track,
+                authorization.user_id,
+                authorization.response_channel_id,
+            ));
+        }
+        if tracks.is_empty() {
+            bail!("that file has no tracks in it");
+        }
+
+        let bulk = authorization
+            .session
+            .player
+            .enqueue_all(tracks, voice_channel_id)
+            .await?;
+        Ok(InteractionReply::message(format!(
+            "{} brought back {} track(s).",
+            mention(authorization.user_id),
+            bulk.accepted
         )))
     }
 
@@ -1539,9 +1750,15 @@ struct Authorization {
 /// only look something up, and a search whose answer is a list of candidates
 /// nobody has chosen between yet, stay with the person who ran them.
 fn command_audience(command: &CommandInteraction) -> Audience {
-    // Both commands that take an argument are told apart by having one, so the
-    // presence of any argument is all this needs to see.
-    let argument = query_option(command).or_else(|| volume_option(command).map(|_| "level"));
+    // Three commands are told apart by an argument: `/play` by whether its
+    // query is a link, and `/volume` and `/history` by whether they were given
+    // anything to change with. A page number is not one of those.
+    let argument = match command.data.name.as_str() {
+        "play" => query_option(command),
+        "volume" => volume_option(command).map(|_| "level"),
+        "history" => integer_option(command, "replay").map(|_| "replay"),
+        _ => None,
+    };
     audience_for(&command.data.name, argument)
 }
 
@@ -1589,7 +1806,10 @@ fn audience_for(command: &str, argument: Option<&str>) -> Audience {
         "play" if argument.is_some_and(|query| Url::parse(query).is_ok()) => Audience::Channel,
         // Setting the level changes what the room hears; asking what it is does
         // not.
-        "volume" if argument.is_some() => Audience::Channel,
+        "volume" | "history" if argument.is_some() => Audience::Channel,
+        // Queueing a whole file changes what the room hears; asking what has
+        // already played, or saving it, does not.
+        "import" => Audience::Channel,
         "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" | "clear" | "remove" => {
             Audience::Channel
         }
@@ -1757,6 +1977,32 @@ fn requester_voice_channel(ctx: &Context, guild_id: u64, user_id: UserId) -> Opt
                 .and_then(|state| state.channel_id)
         })
         .map(ChannelId::get)
+}
+
+/// A queue written out to a file, and read back from one.
+///
+/// Whole tracks rather than links, because the queue has always held canonical
+/// identity and metadata while media URLs are resolved just before playback —
+/// so a round trip costs no resolutions and expires nothing.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Export {
+    tracks: Vec<TrackMetadata>,
+}
+
+fn attachment_option<'a>(
+    command: &'a CommandInteraction,
+    name: &str,
+) -> Option<&'a serenity::model::channel::Attachment> {
+    let id = command
+        .data
+        .options
+        .iter()
+        .find(|option| option.name == name)
+        .and_then(|option| match &option.value {
+            CommandDataOptionValue::Attachment(id) => Some(*id),
+            _ => None,
+        })?;
+    command.data.resolved.attachments.get(&id)
 }
 
 /// One occupant of a voice channel, reduced to what deciding to leave needs.
