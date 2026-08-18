@@ -1049,10 +1049,19 @@ impl GuildPlayer {
         self.transition(directive)
     }
 
-    /// Drops everything about a session but the level it was playing at.
+    /// Drops the queue and everything that was true of it.
     ///
-    /// Volume is about the room's ears and survives; repeat and shuffle are
-    /// about a particular queue, and that queue is what this throws away.
+    /// Two things deliberately survive, and both are about the room rather than
+    /// about the queue. Volume is what the room is comfortable with. History is
+    /// what the room has heard, which is the whole reason anybody looks it up —
+    /// `/stop` and a quarter of an hour of nobody queueing anything are exactly
+    /// the moments somebody wants the track from earlier back, and a record
+    /// wiped by the thing that ended the session would never be there for it.
+    /// It is bounded at [`HISTORY_LENGTH`] and lives only in memory, so keeping
+    /// it costs nothing that grows.
+    ///
+    /// Repeat and shuffle are about a particular queue, and that queue is what
+    /// this throws away.
     fn clear(&mut self) {
         self.current = None;
         self.pending.clear();
@@ -1950,6 +1959,52 @@ mod tests {
             SkipVerdict::Pending { have: 1, needed: 3 },
             "a vote survived the track it was cast against"
         );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_batch_says_how_much_of_it_did_not_fit() {
+        // Three slots, five offered. The two that did not fit have to be
+        // counted, because the caller reports them and cannot work them out:
+        // the queue was already partly full, so `offered - accepted` is the
+        // only place that number exists.
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 3, 8, 1, Duration::from_secs(30), 50);
+        let bulk = player
+            .enqueue_all((1..=5).map(item).collect(), 10)
+            .await
+            .unwrap();
+        assert_eq!(bulk.accepted, 3);
+        assert_eq!(
+            bulk.refused, 2,
+            "the tracks that did not fit went uncounted"
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn what_the_room_has_heard_outlives_the_queue_that_played_it() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        let heard = item(1);
+        player.enqueue(heard.clone(), 10).await.unwrap();
+        player.track_finished(heard.queue_id).await.unwrap();
+        assert_eq!(player.history().await.unwrap().len(), 1);
+
+        // `/stop` ends the session and clears the queue. It does not erase what
+        // the room already heard: ending playback is one of the two moments
+        // somebody reaches for the track from earlier, and a record wiped by
+        // the thing that ended the session would never be there for it. Pinned
+        // because `clear` drops everything else, so this reads as an oversight
+        // until something says it is not.
+        player.stop().await.unwrap();
+        let history = player.history().await.unwrap();
+        assert_eq!(history.len(), 1, "stopping erased what had played");
+        assert_eq!(history[0].queue_id, heard.queue_id);
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

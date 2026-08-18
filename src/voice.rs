@@ -275,7 +275,17 @@ impl VoiceGateway for SongbirdGateway {
             .prepare(track)
             .await
             .map(Prepared::new::<Input>)
-            .map_err(|error| VoiceError::Prepare(error.to_string()))
+            // `{:#}` rather than `to_string`, which on an anyhow error prints
+            // the outermost context and silently drops everything under it.
+            //
+            // Today that changes one path. A refused resolution arrives as a
+            // single `SourceError` that already says what yt-dlp said, so both
+            // render the same; a header the source got wrong arrives with the
+            // name it got wrong wrapped underneath, and only this shows it.
+            // The reason to write it anyway is that the failing direction is
+            // silent: any `.context` added along here later would be thrown
+            // away with nothing to notice it had been.
+            .map_err(|error| VoiceError::Prepare(format!("{error:#}")))
     }
 
     async fn join(&self, channel_id: u64) -> Result<(), VoiceError> {
