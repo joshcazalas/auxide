@@ -1862,7 +1862,7 @@ impl BotRuntime {
             format!("{requester} sent Auxide away.")
         } else {
             format!(
-                "{requester} sent Auxide away. {waiting} track(s) are kept for {}; bring it back with `/join`.",
+                "{requester} sent Auxide away. {waiting} track(s) are kept for {}; bring it back with `/join`, or just queue something with `/play`.",
                 idle_hold(&self.config)
             )
         }))
@@ -2468,6 +2468,22 @@ async fn playback_worker(
             PlaybackDirective::SetVolume => voice.set_volume(volume).await,
             PlaybackDirective::StopAndDisconnect | PlaybackDirective::Disconnect => {
                 voice.leave().await;
+            }
+            PlaybackDirective::IdleExpired => {
+                // Nothing is done to a voice channel because a parked session
+                // holds none — this only closes out the promise `/leave` made
+                // to keep the queue, so that a queue quietly disappearing is
+                // not the first anybody hears of it.
+                announcer
+                    .announce(
+                        guild_id,
+                        transition.snapshot.text_channel_id,
+                        Announcement::text(format!(
+                            "The queue I kept when I left has expired after {}.",
+                            announcer.idle_hold()
+                        )),
+                    )
+                    .await;
             }
             PlaybackDirective::IdleDisconnect => {
                 voice.leave().await;
