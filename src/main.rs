@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use auxide::{
+    audio::AudioPipeline,
     config::{Config, ObservabilityConfig},
     discord::{register_commands, run},
     source::{SourceResolver, YouTubeResolver},
@@ -47,6 +48,18 @@ enum Command {
     YouTubePlaylist {
         #[arg(value_parser = parse_url)]
         url: Url,
+    },
+    /// Fetch the start of a track's audio, to prove YouTube will still serve it.
+    ///
+    /// Answering questions about a track is not the same as handing it over,
+    /// and only one of those keeps the music playing.
+    #[command(name = "youtube-fetch")]
+    YouTubeFetch {
+        #[arg(value_parser = parse_url)]
+        url: Url,
+        /// How many bytes to read before stopping.
+        #[arg(long, default_value_t = 2 * 1024 * 1024)]
+        bytes: u64,
     },
     /// Join an existing voice channel and play one source without registering commands.
     VoiceSpike {
@@ -133,6 +146,22 @@ async fn main() -> Result<()> {
                     track.title
                 );
             }
+        }
+        Command::YouTubeFetch { url, bytes } => {
+            let resolver = Arc::new(YouTubeResolver::new(
+                config.youtube.clone(),
+                &config.playback,
+            ));
+            let track = resolver.inspect(&url).await?;
+            let pipeline = AudioPipeline::new(resolver, config.playback.output_volume)?;
+            let reach = pipeline.reach(&track, bytes).await?;
+            // Tab separated like every other probe, and the length second so a
+            // short read can be told apart from a short track.
+            println!(
+                "{}\t{}",
+                reach.fetched,
+                reach.total.map_or(String::new(), |total| total.to_string())
+            );
         }
         Command::VoiceSpike {
             guild_id,
