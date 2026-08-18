@@ -12,16 +12,18 @@ Git history.
 
 ## Advisories against dependencies
 
-`cargo deny check advisories` runs on every push, as part of the lint job, and reads `Cargo.lock`
-against the RustSec database. A new advisory fails the build.
+Dependabot watches `Cargo.lock` and is the alerting path. Nothing else gates on it: Auxide pins
+`serenity` and `songbird` exactly, and most advisories that appear are held by one of those two
+with no published version to move to, so a build that failed on them would be failing on somebody
+else's release schedule.
 
-Advisories that cannot be resolved by updating are listed in `deny.toml`, each with what holds the
-vulnerable crate at its version, what would release it, and why it is tolerable meanwhile. That
-file is the record of what has been weighed up; anything absent from it has not been, which is why
-its absence is what breaks the build rather than its presence. Auxide pins `serenity` and
-`songbird` exactly, so most of what appears there is waiting on one of those two.
+`cargo deny check advisories` is in the development shell for when a fuller picture is wanted —
+it reads the RustSec database directly and reports more than Dependabot does, including
+unmaintained crates. It is not wired into CI and there is no ignore list to keep.
 
-Treat an entry that names a released fix as work to do, not as a settled decision.
+When an alert cannot be resolved by updating, dismiss it on the repository's Security tab with the
+reason and the dependency that holds it. That keeps the record next to the alert rather than in a
+file that has to be pruned, and a later Dependabot alert for the same crate still arrives.
 
 The supported threat model assumes a trusted NixOS administrator, an unprivileged bot service,
 configured Discord allowlists, no public observability port, and public unauthenticated YouTube
