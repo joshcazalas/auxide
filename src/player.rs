@@ -112,6 +112,15 @@ pub enum PlaybackDirective {
     /// be explained. Every other way of leaving was asked for by somebody who
     /// therefore already knows why it happened.
     IdleDisconnect,
+    /// Let go of a queue `/leave` asked to be kept, now that the hold has run out.
+    ///
+    /// The same countdown as [`PlaybackDirective::IdleDisconnect`], reached from
+    /// the other kind of idle session: this one gave up its voice channel when
+    /// it was parked, so there is nothing left to leave. Kept apart because the
+    /// two need different things said about them, and announcing a departure
+    /// from a channel Auxide walked out of a quarter of an hour earlier
+    /// describes something that did not happen.
+    IdleExpired,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -704,12 +713,36 @@ impl GuildPlayer {
                 tokio::select! {
                     command = self.receiver.recv() => command,
                     () = time::sleep_until(deadline) => {
+                        // Two different sessions run this same countdown, and
+                        // only one of them is in a voice channel. A session
+                        // holding a channel with nothing queued is leaving it,
+                        // and the room is owed an explanation. A session `/leave`
+                        // parked is only letting go of the queue it was asked to
+                        // keep — it walked out a quarter of an hour ago, so
+                        // announcing a departure would describe something that
+                        // did not happen. Which one this is has to be read
+                        // before the clear, because the clear is what erases the
+                        // difference.
+                        let held_a_channel = self.voice_channel_id.is_some();
+                        let kept_a_queue = !self.is_empty();
                         // A full clear, because the hold can now be reached with
                         // a track still held: leaving with one paused would keep
                         // a current track and a paused flag for a session that
                         // no longer has a voice channel to play them in.
                         self.clear();
-                        if !self.emit(self.transition(PlaybackDirective::IdleDisconnect)).await {
+                        let directive = if held_a_channel {
+                            PlaybackDirective::IdleDisconnect
+                        } else if kept_a_queue {
+                            PlaybackDirective::IdleExpired
+                        } else {
+                            // Parked with an empty queue, so `/leave` promised
+                            // to keep nothing and nothing has been lost. There
+                            // is no event here to tell anybody about, and
+                            // inventing one would be the same mistake in the
+                            // other direction.
+                            PlaybackDirective::None
+                        };
+                        if !self.emit(self.transition(directive)).await {
                             break;
                         }
                         continue;
@@ -886,6 +919,22 @@ impl GuildPlayer {
         }
         self.check_voice_channel(voice_channel_id)?;
         self.text_channel_id = Some(item.response_channel_id);
+        // What decides whether this starts anything is whether the session is
+        // playing, and a session can fail to be playing in two ways. The queue
+        // may be empty, or `/leave` may have parked it: a parked session still
+        // holds the track it was on, but it gave up the channel, so asking
+        // whether a track exists would answer that one is already playing when
+        // nothing is. It would then queue behind a track nobody can hear, on a
+        // connection nobody holds, and report a cheerful position in a queue
+        // that would never advance again.
+        if self.voice_channel_id.is_none() {
+            if let Some(current) = self.current.clone() {
+                // `/leave` promised to keep this queue, so coming back to it
+                // resumes what was held and the new track waits its turn.
+                self.pending.push_back(item);
+                return Ok(self.resume_held(voice_channel_id, current));
+            }
+        }
         if self.current.is_none() {
             // Only a track that actually starts cancels the countdown. Adding
             // to a queue that is paused leaves the held session held, and its
@@ -1124,18 +1173,39 @@ impl GuildPlayer {
     /// Takes a channel, and starts a parked queue playing again.
     fn join(&mut self, voice_channel_id: u64) -> Result<PlayerTransition, PlayerError> {
         self.check_voice_channel(voice_channel_id)?;
-        self.voice_channel_id = Some(voice_channel_id);
+        // Refused rather than repeated, and the mirror of what parking an
+        // already-parked session does. Coming back restarts the current track
+        // from the beginning, which is right when the connection it was playing
+        // through is gone and wrong when it is still playing: `/join` typed by
+        // somebody who is already listening would otherwise cut the song off
+        // and start it over for the whole room.
+        if self.voice_channel_id == Some(voice_channel_id) {
+            return Err(PlayerError::AlreadyConnected);
+        }
         let Some(current) = self.current.clone() else {
             // Nothing to play, so this is somebody asking Auxide to be present.
             // It waits exactly as long as an exhausted queue would.
+            self.voice_channel_id = Some(voice_channel_id);
             self.idle_deadline = Some(Instant::now() + self.idle_timeout);
             return Ok(self.transition(PlaybackDirective::Join(voice_channel_id)));
         };
-        // The connection the track was playing through is gone, so it starts
-        // again rather than resuming — there is no position left to resume to.
+        Ok(self.resume_held(voice_channel_id, current))
+    }
+
+    /// Takes a channel and starts the track a parked session kept, from the top.
+    ///
+    /// The connection that track was playing through is gone, so there is no
+    /// position left to resume to and it begins again rather than continuing.
+    /// That makes it a different performance from the one the room was voting
+    /// on, so the votes cast against the last one do not carry into it — this
+    /// is the one way what is playing changes without going through `advance`
+    /// or `clear`, which is why it has to say so itself.
+    fn resume_held(&mut self, voice_channel_id: u64, current: QueueItem) -> PlayerTransition {
+        self.voice_channel_id = Some(voice_channel_id);
         self.hold = None;
         self.idle_deadline = None;
-        Ok(self.transition(PlaybackDirective::Play(current)))
+        self.votes.clear();
+        self.transition(PlaybackDirective::Play(current))
     }
 
     fn set_volume(&mut self, percent: u16) -> Result<PlayerTransition, PlayerError> {
@@ -1292,6 +1362,8 @@ pub enum PlayerError {
     NotPaused,
     #[error("Auxide is not in a voice channel")]
     NotConnected,
+    #[error("Auxide is already in that voice channel")]
+    AlreadyConnected,
     #[error("volume must be between 1 and {max_percent}")]
     VolumeOutOfRange { max_percent: u16 },
     #[error("there is no track waiting at position {position}; {waiting} are queued")]
@@ -1702,6 +1774,147 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(idle.directive, PlaybackDirective::IdleDisconnect);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn playing_something_brings_a_parked_queue_back_instead_of_queueing_into_silence() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        let held = item(1);
+        player.enqueue(held.clone(), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        let parked = player.park().await.unwrap();
+        assert_eq!(parked.directive, PlaybackDirective::Disconnect);
+        assert_eq!(transitions.recv().await.unwrap(), parked);
+
+        // A parked session still holds the track it was on, so asking whether
+        // one exists answers that something is already playing when nothing is.
+        // /play then queued behind a track nobody could hear, on a connection
+        // nobody held, and reported a position in a queue that would never
+        // advance — no directive reached the worker, so Auxide simply never
+        // came back and never said why.
+        let added = item(2);
+        let resumed = player.enqueue(added.clone(), 10).await.unwrap();
+        assert_eq!(
+            resumed.directive,
+            PlaybackDirective::Play(held.clone()),
+            "/play left the session parked"
+        );
+        assert_eq!(transitions.recv().await.unwrap(), resumed);
+        // /leave promised to keep the queue, so what was held resumes and the
+        // track just asked for waits its turn rather than displacing it.
+        assert_eq!(resumed.snapshot.current, Some(held));
+        assert_eq!(resumed.snapshot.len(), 2);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_parked_queue_expiring_never_claims_to_have_left_a_channel() {
+        let idle_timeout = Duration::from_millis(200);
+        let (player, mut transitions, task) = spawn_guild_player(7, 5, 8, 1, idle_timeout, 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.park().await.unwrap();
+        transitions.recv().await.unwrap();
+
+        // The countdown /leave arms is the same one an idle channel runs, and
+        // the two used to end identically — so a quarter of an hour after
+        // somebody dismissed Auxide, the room was told it had just left a voice
+        // channel it had not been in since. Letting go of a kept queue is what
+        // actually happened, and it is what gets said.
+        let expired = time::timeout(Duration::from_secs(1), transitions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.directive, PlaybackDirective::IdleExpired);
+        assert_eq!(expired.snapshot.len(), 0);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_parked_session_that_kept_nothing_has_nothing_to_report() {
+        let idle_timeout = Duration::from_millis(200);
+        let (player, mut transitions, task) = spawn_guild_player(7, 5, 8, 1, idle_timeout, 50);
+        player.join(10).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.park().await.unwrap();
+        transitions.recv().await.unwrap();
+
+        // Dismissed with an empty queue, so nothing was promised and nothing
+        // was lost. Announcing an expiry here would be the same mistake as
+        // announcing a departure — inventing an event, only in the other
+        // direction.
+        assert!(
+            time::timeout(idle_timeout * 4, transitions.recv())
+                .await
+                .is_err(),
+            "an empty parked session announced something expiring"
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn joining_a_channel_auxide_is_already_in_leaves_the_track_alone() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        let playing = item(1);
+        player.enqueue(playing.clone(), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        // Coming back restarts the current track, which is right when the
+        // connection it was playing through is gone and wrong when everybody is
+        // still listening to it. Typed by somebody already in the channel, this
+        // used to cut the song off and start it again for the whole room.
+        assert!(matches!(
+            player.join(10).await,
+            Err(PlayerError::AlreadyConnected)
+        ));
+        assert!(
+            time::timeout(Duration::from_millis(100), transitions.recv())
+                .await
+                .is_err(),
+            "/join into the channel it already holds disturbed playback"
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn votes_against_a_track_do_not_survive_it_starting_over() {
+        let (player, mut transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        assert_eq!(
+            player.vote_skip(1, 3).await.unwrap(),
+            SkipVerdict::Pending { have: 1, needed: 3 }
+        );
+
+        player.park().await.unwrap();
+        transitions.recv().await.unwrap();
+        player.join(11).await.unwrap();
+        transitions.recv().await.unwrap();
+
+        // Parking and coming back is the one way what is playing changes
+        // without going through advance or clear, and it restarts the track
+        // from zero. A vote banked against the performance that is now over
+        // would count towards cutting short the one that just began.
+        assert_eq!(
+            player.vote_skip(2, 3).await.unwrap(),
+            SkipVerdict::Pending { have: 1, needed: 3 },
+            "a vote survived the track it was cast against"
+        );
 
         player.shutdown().await.unwrap();
         task.await.unwrap();
