@@ -56,6 +56,35 @@
             dependencies = (previous.dependencies or [ ]) ++ [ bgutil-pot-plugin ];
           });
 
+          # The other half: the provider the plugin above talks to, fetched at
+          # build time rather than pulled during activation.
+          #
+          # `virtualisation.oci-containers` bakes `--pull missing` into the
+          # container's ExecStart, which makes activation depend on Docker Hub
+          # being reachable and on a tag nobody here controls. Neither belongs
+          # in the window where a deployment is switching generations under a
+          # health gate. Fetching here moves the download into the build, where
+          # a deploy already waits for one, and brings the image under the same
+          # pinning as the rest of the closure.
+          #
+          # It also survives a host that prunes. `docker system prune --all`
+          # deletes any image no container is currently using, which is this
+          # one whenever the provider happens to be down; the archive lives in
+          # the store instead, and the container's pre-start reloads it from
+          # there without a network at all.
+          #
+          # Pulled by digest, so the tag below is a label rather than a promise
+          # someone upstream could quietly rewrite. The digest and the tag pin
+          # one release and move together with bgutil-pot-plugin's version.
+          pot-provider-image = pkgs.dockerTools.pullImage {
+            imageName = "docker.io/brainicism/bgutil-ytdlp-pot-provider";
+            imageDigest = "sha256:1aaa43a0ca72dfca6a6d2129a0fb4a23465c25adb1b043f8aff829a20825646b";
+            hash = "sha256-tsOkSFxSdUPxL1xYOOg3YRd4/tv0lgGlNsrqwJmHUdw=";
+            finalImageTag = "1.3.1";
+            os = "linux";
+            arch = "amd64";
+          };
+
           runtimePath = pkgs.lib.makeBinPath [
             pkgs.deno
             pkgs.ffmpeg-headless
@@ -106,9 +135,31 @@
             ];
           };
 
+          providerContainer =
+            enabledModule.config.virtualisation.oci-containers.containers.auxide-pot-provider;
+          providerUnit =
+            enabledModule.config.systemd.services."${enabledModule.config.virtualisation.oci-containers.backend}-auxide-pot-provider";
+
           module-evaluation = pkgs.runCommand "auxide-nixos-module-evaluation" { } ''
             test ${pkgs.lib.escapeShellArg enabledModule.config.systemd.services.auxide.serviceConfig.User} = auxide
             test ${pkgs.lib.escapeShellArg enabledModule.config.systemd.services.auxide.serviceConfig.Group} = auxide
+
+            # Activation must not depend on a registry being reachable, which
+            # is what `--pull missing` would leave it doing. Both halves are
+            # asserted as plain strings so the check keeps proving that without
+            # CI having to realise the 300 MB archive it asserts about.
+            test ${pkgs.lib.escapeShellArg providerContainer.pull} = never
+            test ${pkgs.lib.escapeShellArg (pkgs.lib.boolToString (providerContainer.imageFile != null))} = true
+
+            # The provider once gave up permanently on a port that was busy,
+            # because the generated unit spends the default start limit in
+            # three seconds. These three keep the runway, and keep it finite:
+            # a unit retrying forever never reaches the `failed` state the
+            # homeserver alerts on.
+            test ${pkgs.lib.escapeShellArg providerUnit.serviceConfig.RestartSec} = 5s
+            test ${pkgs.lib.escapeShellArg (toString providerUnit.startLimitBurst)} = 10
+            test ${pkgs.lib.escapeShellArg (toString providerUnit.startLimitIntervalSec)} = 120
+
             touch "$out"
           '';
 
@@ -149,7 +200,12 @@
         {
           packages = {
             default = auxide;
-            inherit credential-helper auxide oci-image;
+            inherit
+              credential-helper
+              auxide
+              oci-image
+              pot-provider-image
+              ;
           };
 
           checks = {

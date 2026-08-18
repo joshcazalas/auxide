@@ -11,7 +11,8 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   # Named by the backend actually in use, so this keeps working if a host is
   # configured for podman rather than docker.
-  providerUnit = "${config.virtualisation.oci-containers.backend}-auxide-pot-provider.service";
+  providerService = "${config.virtualisation.oci-containers.backend}-auxide-pot-provider";
+  providerUnit = "${providerService}.service";
 in
 {
   options.services.auxide = {
@@ -98,6 +99,20 @@ in
           without the change being visible in this file.
         '';
       };
+
+      imageFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = self.packages.${system}.pot-provider-image;
+        defaultText = lib.literalExpression "auxide.packages.\${system}.pot-provider-image";
+        description = ''
+          Local archive holding `image`, loaded before the container starts.
+
+          Without one, the container pulls from a registry the first time it starts, which makes
+          activation depend on that registry being reachable and on a tag nobody here controls.
+          Setting this to null restores that pull, and is only sensible on a host that is not
+          deploying under a health gate.
+        '';
+      };
     };
   };
 
@@ -138,76 +153,102 @@ in
     # request that reaches it, so what reaches it is the only control there is.
     virtualisation.oci-containers.containers = lib.mkIf cfg.poTokenProvider.enable {
       auxide-pot-provider = {
-        inherit (cfg.poTokenProvider) image;
+        inherit (cfg.poTokenProvider) image imageFile;
+        # The archive is the whole supply. Left at the default this would still
+        # reach for a registry whenever the local image is missing, which is
+        # exactly the activation-time download the archive exists to avoid, and
+        # it would do it silently. Refusing is louder and comes with a build
+        # that already fetched the answer.
+        pull = if cfg.poTokenProvider.imageFile == null then "missing" else "never";
         ports = [ "127.0.0.1:${toString cfg.poTokenProvider.port}:4416" ];
         extraOptions = [ "--init" ];
       };
     };
 
-    systemd.services.auxide = {
-      description = "Auxide Discord music bot";
-      documentation = [ "https://github.com/joshcazalas/auxide" ];
-      wantedBy = [ "multi-user.target" ];
-      wants = [
-        "network-online.target"
-      ]
-      ++ lib.optional cfg.poTokenProvider.enable providerUnit;
-      # Wanted rather than required, and only ordered after: a provider that is
-      # slow to start or has fallen over should cost whole tracks, not the bot.
-      # Auxide answers commands, reports what YouTube said, and recovers on its
-      # own when the provider comes back.
-      after = [
-        "network-online.target"
-      ]
-      ++ lib.optional cfg.poTokenProvider.enable providerUnit;
+    systemd.services =
+      lib.optionalAttrs cfg.poTokenProvider.enable {
+        # The generated unit restarts on failure with systemd's default 100ms
+        # delay, so five attempts burn the default start limit in three seconds
+        # and the provider gives up for good. Nothing that frees a port does so
+        # that fast, and an orphaned backend port-forwarder outliving its own
+        # container is how the port stays busy here, so the one failure this
+        # unit could recover from on its own was the one it never waited for.
+        #
+        # The limit stays finite deliberately. A unit that retries forever never
+        # reaches `failed`, and `failed` is what the homeserver alerts on, so an
+        # unbounded retry would trade a loud outage for a silent one.
+        ${providerService} = {
+          startLimitIntervalSec = 120;
+          startLimitBurst = 10;
+          serviceConfig.RestartSec = "5s";
+        };
+      }
+      // {
+        auxide = {
+          description = "Auxide Discord music bot";
+          documentation = [ "https://github.com/joshcazalas/auxide" ];
+          wantedBy = [ "multi-user.target" ];
+          wants = [
+            "network-online.target"
+          ]
+          ++ lib.optional cfg.poTokenProvider.enable providerUnit;
+          # Wanted rather than required, and only ordered after: a provider that is
+          # slow to start or has fallen over should cost whole tracks, not the bot.
+          # Auxide answers commands, reports what YouTube said, and recovers on its
+          # own when the provider comes back.
+          after = [
+            "network-online.target"
+          ]
+          ++ lib.optional cfg.poTokenProvider.enable providerUnit;
 
-      serviceConfig = {
-        Type = "simple";
-        ExecStart = "${lib.getExe cfg.package} --config ${credentialsDirectory}/auxide-config run";
-        User = cfg.user;
-        Group = cfg.group;
-        LoadCredential = [ "auxide-config:${toString cfg.configFile}" ];
-        LoadCredentialEncrypted = [ "discord-token:${toString cfg.credentialFile}" ];
+          serviceConfig = {
+            Type = "simple";
+            ExecStart = "${lib.getExe cfg.package} --config ${credentialsDirectory}/auxide-config run";
+            User = cfg.user;
+            Group = cfg.group;
+            LoadCredential = [ "auxide-config:${toString cfg.configFile}" ];
+            LoadCredentialEncrypted = [ "discord-token:${toString cfg.credentialFile}" ];
 
-        Restart = "on-failure";
-        RestartSec = "5s";
-        TimeoutStopSec = "30s";
-        UMask = "0077";
+            Restart = "on-failure";
+            RestartSec = "5s";
+            TimeoutStopSec = "30s";
+            UMask = "0077";
 
-        CacheDirectory = "auxide";
-        RuntimeDirectory = "auxide";
-        CacheDirectoryMode = "0700";
-        RuntimeDirectoryMode = "0700";
+            CacheDirectory = "auxide";
+            RuntimeDirectory = "auxide";
+            CacheDirectoryMode = "0700";
+            RuntimeDirectoryMode = "0700";
 
-        CapabilityBoundingSet = "";
-        DevicePolicy = "closed";
-        LockPersonality = true;
-        MemoryMax = cfg.memoryMax;
-        NoNewPrivileges = true;
-        PrivateDevices = true;
-        PrivateTmp = true;
-        ProcSubset = "pid";
-        ProtectClock = true;
-        ProtectControlGroups = true;
-        ProtectHome = true;
-        ProtectHostname = true;
-        ProtectKernelLogs = true;
-        ProtectKernelModules = true;
-        ProtectKernelTunables = true;
-        ProtectProc = "invisible";
-        ProtectSystem = "strict";
-        RemoveIPC = true;
-        RestrictAddressFamilies = [
-          "AF_INET"
-          "AF_INET6"
-          "AF_UNIX"
-        ];
-        RestrictNamespaces = true;
-        RestrictRealtime = true;
-        RestrictSUIDSGID = true;
-        SystemCallArchitectures = "native";
-        TasksMax = 128;
+            CapabilityBoundingSet = "";
+            DevicePolicy = "closed";
+            LockPersonality = true;
+            MemoryMax = cfg.memoryMax;
+            NoNewPrivileges = true;
+            PrivateDevices = true;
+            PrivateTmp = true;
+            ProcSubset = "pid";
+            ProtectClock = true;
+            ProtectControlGroups = true;
+            ProtectHome = true;
+            ProtectHostname = true;
+            ProtectKernelLogs = true;
+            ProtectKernelModules = true;
+            ProtectKernelTunables = true;
+            ProtectProc = "invisible";
+            ProtectSystem = "strict";
+            RemoveIPC = true;
+            RestrictAddressFamilies = [
+              "AF_INET"
+              "AF_INET6"
+              "AF_UNIX"
+            ];
+            RestrictNamespaces = true;
+            RestrictRealtime = true;
+            RestrictSUIDSGID = true;
+            SystemCallArchitectures = "native";
+            TasksMax = 128;
+          };
+        };
       };
-    };
   };
 }
