@@ -10,12 +10,12 @@
 //! because a worker is per guild too — it removes the guild id from every
 //! method and gives the implementation somewhere to keep the track it started.
 
-use std::{any::Any, sync::Arc, time::Duration};
+use std::{any::Any, fmt::Write as _, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serenity::model::id::{ChannelId, GuildId};
 use songbird::{
-    Event, EventContext, EventHandler as VoiceEventHandler, Songbird, TrackEvent,
+    Call, Event, EventContext, EventHandler as VoiceEventHandler, Songbird, TrackEvent,
     input::Input,
     tracks::{PlayMode, TrackHandle},
 };
@@ -133,6 +133,29 @@ pub enum VoiceError {
     NotSeekable,
 }
 
+/// Everything an error has to say, not only its outermost sentence.
+///
+/// Songbird renders every driver failure as the same sentence — `establishing
+/// connection failed` — and keeps what distinguishes them, a close code from
+/// Discord or a refused socket or a crypto mode the server would not offer,
+/// behind [`Error::source`]. Logging the error on its own therefore records
+/// only that something went wrong, which is the one thing the journal already
+/// knew, and leaves an operator unable to tell a revoked permission apart from
+/// a blocked port. The other ways a join can fail each say what they were, so
+/// this is a no-op for them.
+///
+/// [`Error::source`]: std::error::Error::source
+fn full_cause(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        // Writing into a String cannot fail, so there is nothing to report.
+        let _ = write!(message, ": {next}");
+        cause = next.source();
+    }
+    message
+}
+
 /// Makes a gateway for a guild, the first time that guild needs one.
 ///
 /// A session's gateway cannot be built before the session exists, so the
@@ -189,6 +212,42 @@ impl SongbirdGateway {
         }
     }
 
+    /// Takes the voice channel, and leaves nothing behind if it cannot.
+    ///
+    /// A driver failure leaves Songbird still holding the endpoint, token, and
+    /// session Discord issued for the attempt, with the gateway half of the
+    /// handshake marked complete. The next join sees a finished handshake for
+    /// the same channel, skips the gateway entirely, and retries the driver
+    /// against those same details. When Discord has invalidated the session
+    /// behind them — the case seen in the wild — every later attempt then fails
+    /// exactly as the first did, and only something that gives the channel up
+    /// breaks the cycle. Songbird's own guidance for this error is to leave the
+    /// server on the gateway before re-attempting, so that is done here on the
+    /// way out of the failure rather than left for `/leave` or the idle
+    /// countdown to do a quarter of an hour later.
+    ///
+    /// The other half of why this matters is that the gateway half of the join
+    /// did succeed. Until Discord is told otherwise it counts Auxide as sitting
+    /// in the channel, which holds the channel against the people who actually
+    /// wanted to use it.
+    async fn connect(&self, channel_id: u64) -> Result<Arc<Mutex<Call>>, VoiceError> {
+        let guild = GuildId::new(self.guild_id);
+        match self.songbird.join(guild, ChannelId::new(channel_id)).await {
+            Ok(call) => Ok(call),
+            Err(error) => {
+                let reason = full_cause(&error);
+                if let Err(error) = self.songbird.remove(guild).await {
+                    tracing::debug!(
+                        %error,
+                        guild_id = self.guild_id,
+                        "could not discard the failed voice session"
+                    );
+                }
+                Err(VoiceError::Join(reason))
+            }
+        }
+    }
+
     /// Applies something to the current track, if there is one.
     ///
     /// Every one of these is a no-op with nothing playing, which is the right
@@ -220,11 +279,7 @@ impl VoiceGateway for SongbirdGateway {
     }
 
     async fn join(&self, channel_id: u64) -> Result<(), VoiceError> {
-        self.songbird
-            .join(GuildId::new(self.guild_id), ChannelId::new(channel_id))
-            .await
-            .map(|_| ())
-            .map_err(|error| VoiceError::Join(error.to_string()))
+        self.connect(channel_id).await.map(|_| ())
     }
 
     async fn play(
@@ -235,11 +290,7 @@ impl VoiceGateway for SongbirdGateway {
         ended: Arc<dyn TrackEnded>,
     ) -> Result<(), VoiceError> {
         let prepared: Input = prepared.take();
-        let call = self
-            .songbird
-            .join(GuildId::new(self.guild_id), ChannelId::new(channel_id))
-            .await
-            .map_err(|error| VoiceError::Join(error.to_string()))?;
+        let call = self.connect(channel_id).await?;
         let handle = call.lock().await.play_only_input(prepared);
         if let Err(error) = handle.set_volume(volume) {
             tracing::warn!(%error, guild_id = self.guild_id, "failed to set playback volume");
@@ -252,7 +303,7 @@ impl VoiceGateway for SongbirdGateway {
             },
         ) {
             let _ = handle.stop();
-            return Err(VoiceError::Play(error.to_string()));
+            return Err(VoiceError::Play(full_cause(&error)));
         }
         *self.active.lock().await = Some(handle);
         Ok(())
@@ -328,6 +379,109 @@ impl VoiceEventHandler for EndedEvent {
         }
         self.ended.ended().await;
         Some(Event::Cancel)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::Arc, time::Duration};
+
+    use async_trait::async_trait;
+    use serenity::model::id::{GuildId, UserId};
+    use songbird::{
+        Config, Songbird,
+        error::{ConnectionError, JoinError},
+    };
+    use url::Url;
+
+    use super::{AudioPipeline, SongbirdGateway, VoiceGateway, full_cause};
+    use crate::source::{Playlist, ResolvedAudio, SourceError, SourceResolver, TrackMetadata};
+
+    const GUILD: u64 = 730_675_093_197_422_623;
+    const VOICE_CHANNEL: u64 = 222;
+
+    /// A resolver that is never reached.
+    ///
+    /// Building a gateway needs a pipeline and a pipeline needs a resolver, but
+    /// a join that fails never gets as far as asking for audio.
+    struct UnusedSource;
+
+    #[async_trait]
+    impl SourceResolver for UnusedSource {
+        async fn search(&self, _query: &str) -> Result<Vec<TrackMetadata>, SourceError> {
+            Err(SourceError::Disabled)
+        }
+
+        async fn inspect(&self, _url: &Url) -> Result<TrackMetadata, SourceError> {
+            Err(SourceError::Disabled)
+        }
+
+        async fn resolve(&self, _track: &TrackMetadata) -> Result<ResolvedAudio, SourceError> {
+            Err(SourceError::Disabled)
+        }
+
+        fn accepts(&self, _url: &Url) -> Result<(), SourceError> {
+            Err(SourceError::Disabled)
+        }
+
+        async fn playlist(&self, _url: &Url) -> Result<Option<Playlist>, SourceError> {
+            Err(SourceError::Disabled)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_join_that_fails_does_not_leave_auxide_holding_the_channel() {
+        // The whole point of the fix, and it needs no network: Songbird buffers
+        // gateway sends when no shard is registered, so the handshake it is
+        // waiting on simply never arrives and the configured timeout ends it.
+        //
+        // What is asserted is that the session is gone afterwards. While one
+        // exists, Songbird believes the gateway half of the join is complete —
+        // so it skips the gateway on the next attempt and replays details
+        // Discord may already have invalidated, and Discord goes on counting
+        // Auxide as an occupant of a channel it never reached.
+        let songbird = Songbird::serenity();
+        songbird.initialise_client_data(1, UserId::new(1));
+        songbird.set_config(Config::default().gateway_timeout(Some(Duration::from_millis(10))));
+
+        let pipeline = AudioPipeline::new(Arc::new(UnusedSource), 0.5).expect("a pipeline builds");
+        let gateway = SongbirdGateway::new(Arc::clone(&songbird), pipeline, GUILD);
+
+        let error = gateway
+            .join(VOICE_CHANNEL)
+            .await
+            .expect_err("no shard is registered, so the join cannot complete");
+        assert!(
+            error.to_string().contains("failed to join voice"),
+            "unexpected failure: {error}"
+        );
+        assert!(
+            songbird.get(GuildId::new(GUILD)).is_none(),
+            "a failed join left the voice session in place"
+        );
+    }
+
+    #[test]
+    fn a_failed_join_reports_the_reason_and_not_only_the_summary() {
+        // Every driver failure Songbird can have — a close code from Discord, a
+        // refused socket, a crypto mode the server would not offer — displays
+        // as the same sentence, and only the cause behind it tells them apart.
+        //
+        // Written against the real error, and pinned to its exact wording,
+        // because `songbird = "=0.6.0"` means no passive bump can break this.
+        // It can only fail when somebody moves the pin deliberately, which is
+        // the moment to find out that the cause is no longer being carried —
+        // rather than months later, in a journal, mid-incident.
+        let error = JoinError::Driver(ConnectionError::CryptoModeUnavailable);
+        assert_eq!(
+            error.to_string(),
+            "failed to join voice channel: establishing connection failed"
+        );
+        assert_eq!(
+            full_cause(&error),
+            "failed to join voice channel: establishing connection failed: failed to connect to \
+             Discord RTP server: server did not offer chosen encryption mode"
+        );
     }
 }
 
