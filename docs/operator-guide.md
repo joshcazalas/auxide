@@ -291,10 +291,11 @@ concurrently, and run every control command. Acceptance requires:
 12. `/history` lists what already played newest first and `/history replay:` queues one again
     without resolving anything, while `/export` and `/import` round-trip a queue through a file
     whose links are re-checked on the way back in; and
-13. `/seek`, `/forward`, `/rewind`, and `/restart` move the playhead and report where it settled,
-    which is the boundary the container could resume from rather than the exact instant asked
-    for, and a source whose origin will not serve ranges refuses them rather than failing
-    silently; and
+13. `/seek`, `/forward`, `/rewind`, and `/restart` are not offered — Discord's picker does not
+    list them and `/help` does not describe them. They are built and withdrawn: moving the
+    playhead could trip an assertion inside the Matroska reader, on a mixer thread, and take
+    the process down with it. A queue that always plays is worth more than a playhead that
+    sometimes moves; and
 14. typing into `/play` offers suggestions without ever making a keystroke wait, choosing one
     queues it as a link rather than a fresh search, and a burst of typing never leaves a track
     waiting behind it; and

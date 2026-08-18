@@ -11,7 +11,7 @@ The production path now includes:
   that is not there;
 - vote-to-skip for the current track, and bulk removal of waiting ones by position or requester;
 - a bounded history of what already played, and a queue that survives a restart as a file;
-- seeking within a track, where the origin will serve ranges and state a length;
+- seeking within a track — built, but withdrawn while it can take the process down;
 - search suggestions while typing `/play`, answered from memory so a keystroke never waits;
 - channel-visible results for what was queued, skipped, or stopped, with private search
   pickers and private refusals;
