@@ -39,6 +39,13 @@ check_lint() {
 
   echo "==> Linting GitHub Actions workflows"
   actionlint
+
+  # Here rather than with the Rust job because it needs no build: it reads
+  # Cargo.lock against the advisory database, in about a second. What it is for
+  # is the advisory nobody has looked at yet — the ones already weighed up are
+  # listed in deny.toml with what holds them and what would release them.
+  echo "==> Checking dependencies against the advisory database"
+  cargo deny check advisories
 }
 
 check_rust() {

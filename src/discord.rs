@@ -1287,14 +1287,13 @@ impl BotRuntime {
         let tracks = tracks.into_iter().take(5).collect::<Vec<_>>();
         let mut searches = self.pending_searches.lock().await;
         prune_searches(&mut searches);
-        if searches.len() >= MAX_PENDING_SEARCHES {
-            if let Some(oldest) = searches
+        if searches.len() >= MAX_PENDING_SEARCHES
+            && let Some(oldest) = searches
                 .iter()
                 .min_by_key(|(_, pending)| pending.created_at)
                 .map(|(id, _)| *id)
-            {
-                searches.remove(&oldest);
-            }
+        {
+            searches.remove(&oldest);
         }
         searches.insert(
             search_id,
@@ -1976,16 +1975,15 @@ impl BotRuntime {
         // The picker this replaced was private, so telling the channel what was
         // chosen takes a second message. Losing it costs the announcement only;
         // the track is already queued either way.
-        if let Some(announcement) = announcement {
-            if let Err(error) = component
+        if let Some(announcement) = announcement
+            && let Err(error) = component
                 .create_followup(
                     &ctx.http,
                     followup_message(announcement.content).embeds(announcement.embeds),
                 )
                 .await
-            {
-                tracing::warn!(%error, "failed to announce a search selection");
-            }
+        {
+            tracing::warn!(%error, "failed to announce a search selection");
         }
     }
 

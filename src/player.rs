@@ -927,13 +927,13 @@ impl GuildPlayer {
         // nothing is. It would then queue behind a track nobody can hear, on a
         // connection nobody holds, and report a cheerful position in a queue
         // that would never advance again.
-        if self.voice_channel_id.is_none() {
-            if let Some(current) = self.current.clone() {
-                // `/leave` promised to keep this queue, so coming back to it
-                // resumes what was held and the new track waits its turn.
-                self.pending.push_back(item);
-                return Ok(self.resume_held(voice_channel_id, current));
-            }
+        if self.voice_channel_id.is_none()
+            && let Some(current) = self.current.clone()
+        {
+            // `/leave` promised to keep this queue, so coming back to it
+            // resumes what was held and the new track waits its turn.
+            self.pending.push_back(item);
+            return Ok(self.resume_held(voice_channel_id, current));
         }
         if self.current.is_none() {
             // Only a track that actually starts cancels the countdown. Adding

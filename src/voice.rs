@@ -372,10 +372,10 @@ struct EndedEvent {
 #[async_trait]
 impl VoiceEventHandler for EndedEvent {
     async fn act(&self, context: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::Track([(state, _)]) = context {
-            if let PlayMode::Errored(error) = &state.playing {
-                tracing::warn!(%error, guild_id = self.guild_id, "track ended with an error");
-            }
+        if let EventContext::Track([(state, _)]) = context
+            && let PlayMode::Errored(error) = &state.playing
+        {
+            tracing::warn!(%error, guild_id = self.guild_id, "track ended with an error");
         }
         self.ended.ended().await;
         Some(Event::Cancel)

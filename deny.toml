@@ -1,0 +1,56 @@
+# What Auxide accepts from its dependency tree, and why.
+#
+# Every entry below is an advisory that cannot currently be resolved by
+# updating: the vulnerable crate is held at its version by something between it
+# and this crate, and the intermediate has not released a version that moves.
+# Each records what holds it and what would release it, so that a stale
+# exception is visible as one rather than looking like a decision somebody made.
+#
+# The point of the file is what it does *not* list. An advisory that is not here
+# fails the build, so a new one has to be looked at rather than accumulating
+# quietly on a page nobody opens.
+#
+# Re-check with:  cargo deny check advisories
+
+[advisories]
+yanked = "deny"
+
+ignore = [
+  # ---------------------------------------------------------------------
+  # rustls-webpki 0.102.8, held by serenity.
+  #
+  #   rustls-webpki 0.102.8 <- rustls 0.22 <- tokio-rustls 0.25
+  #                        <- tokio-tungstenite 0.21 <- serenity 0.12.5
+  #
+  # Every fix is in 0.103, and rustls 0.22 requires ^0.102, so this moves when
+  # serenity moves. 0.12.5 is the latest published version, so there is nothing
+  # to move to today. The crate is also present at 0.103.14 for everything
+  # else in the tree, which is patched; only serenity's copy is not.
+  # ---------------------------------------------------------------------
+  { id = "RUSTSEC-2026-0104", reason = "Panic parsing a CRL. The advisory states applications that do not use CRLs are unaffected, and nothing here configures any: neither serenity nor tokio-tungstenite calls with_crls, so the verifier is built without them. Released by serenity moving past tokio-tungstenite 0.21." },
+  { id = "RUSTSEC-2026-0049", reason = "CRL distribution point matching. Same path and the same reason it cannot be reached: no CRLs are configured anywhere in this tree. Released by serenity moving past tokio-tungstenite 0.21." },
+  { id = "RUSTSEC-2026-0098", reason = "Name constraints for URI names accepted incorrectly. Reachable in principle during certificate verification, but requires a trusted CA to issue a name-constrained intermediate and an attacker to hold a certificate under it. Auxide connects only to Discord's own endpoints. Released by serenity moving past tokio-tungstenite 0.21." },
+  { id = "RUSTSEC-2026-0099", reason = "Name constraints accepted for a wildcard name. Same path, same conditions, same release as RUSTSEC-2026-0098." },
+
+  # ---------------------------------------------------------------------
+  # The libcrux family, held by songbird's end-to-end encryption support.
+  #
+  #   libcrux-* <- hpke-rs 0.6.1 <- openmls_rust_crypto 0.5.1
+  #             <- davey 0.1.4 <- songbird 0.6.0
+  #
+  # hpke-rs 0.6.1 requires ^0.0.8 of these, and each 0.0.x is its own
+  # incompatible version to Cargo, so the fixes in 0.0.10 are unreachable
+  # until hpke-rs releases. songbird is pinned to =0.6.0 in Cargo.toml.
+  # ---------------------------------------------------------------------
+  { id = "RUSTSEC-2026-0207", reason = "Incorrect incremental SHAKE output across multiple squeeze calls, in libcrux-sha3. Reached only through DAVE, the voice end-to-end encryption Discord turns on per connection. Released by hpke-rs accepting libcrux-sha3 0.0.10." },
+  { id = "RUSTSEC-2026-0208", reason = "Panic in AVX2 SHAKE-256, in libcrux-sha3. Same path and same release as RUSTSEC-2026-0207." },
+  { id = "RUSTSEC-2026-0212", reason = "Constant-time swap/select on aarch64, in libcrux-secrets. Not applicable: this crate declares and builds x86_64-linux only, in both flake.nix and the package's own meta.platforms. Released by hpke-rs accepting libcrux-secrets 0.0.6." },
+
+  # ---------------------------------------------------------------------
+  # Unmaintained, with no successor version to move to. None is a
+  # vulnerability; each is a notice that nobody is looking after the crate.
+  # ---------------------------------------------------------------------
+  { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained. A build-time derive macro reached through songbird, with no runtime component and no safe upgrade published. Released by songbird dropping it." },
+  { id = "RUSTSEC-2024-0384", reason = "instant is unmaintained. Reached transitively, and no safe upgrade is published. Released by whichever dependency still asks for it moving to web-time." },
+  { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is unmaintained, as is the crate it forked. A build-time dependency with no runtime component and no safe upgrade published." },
+]

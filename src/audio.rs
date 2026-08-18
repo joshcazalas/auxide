@@ -470,13 +470,13 @@ impl AsyncSeek for ChunkedHttpStream {
                 offset_by(total, delta)?
             }
         };
-        if let Some(total) = self.total {
-            if target > total {
-                return Err(IoError::new(
-                    IoErrorKind::InvalidInput,
-                    "seek past the end of the media",
-                ));
-            }
+        if let Some(total) = self.total
+            && target > total
+        {
+            return Err(IoError::new(
+                IoErrorKind::InvalidInput,
+                "seek past the end of the media",
+            ));
         }
         self.pending_seek = Some(target);
         Ok(())

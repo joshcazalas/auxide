@@ -2,7 +2,7 @@
 name = "auxide"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A self-hosted, guild-scoped Discord music bot with current encrypted voice support"
 license = "MIT"
 publish = false

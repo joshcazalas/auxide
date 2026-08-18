@@ -164,6 +164,7 @@
           devShells.default = pkgs.mkShell {
             packages = [
               pkgs.cargo
+              pkgs.cargo-deny
               pkgs.clippy
               pkgs.gitleaks
               pkgs.actionlint
