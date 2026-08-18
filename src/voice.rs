@@ -529,6 +529,8 @@ pub mod fake {
         actions: Vec<VoiceAction>,
         /// Source ids `prepare` should refuse, and why.
         unplayable: Vec<String>,
+        /// Whether taking the voice channel fails, as a driver failure does.
+        channel_refused: bool,
         /// The end-of-track callback for whatever is playing.
         ended: Option<Arc<dyn TrackEnded>>,
     }
@@ -544,6 +546,27 @@ pub mod fake {
         #[must_use]
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// Makes the voice channel refuse to be taken.
+        ///
+        /// What a driver failure looks like from above: the gateway half of the
+        /// join succeeded, so Discord believes Auxide is in the channel, and
+        /// nothing is playing through it. Without this the fake could only ever
+        /// succeed, which is why the worker's behaviour on a failed join went
+        /// unexamined for as long as it did.
+        pub fn refuse_the_channel(&self) {
+            self.state
+                .lock()
+                .expect("fake voice state is not poisoned")
+                .channel_refused = true;
+        }
+
+        fn channel_is_refused(&self) -> bool {
+            self.state
+                .lock()
+                .expect("fake voice state is not poisoned")
+                .channel_refused
         }
 
         /// Makes one source refuse to prepare, as an unplayable track would.
@@ -621,6 +644,11 @@ pub mod fake {
         }
 
         async fn join(&self, channel_id: u64) -> Result<(), VoiceError> {
+            if self.channel_is_refused() {
+                return Err(VoiceError::Join(
+                    "establishing connection failed".to_owned(),
+                ));
+            }
             self.record(VoiceAction::Joined(channel_id));
             Ok(())
         }
@@ -632,6 +660,11 @@ pub mod fake {
             volume: f32,
             ended: Arc<dyn TrackEnded>,
         ) -> Result<(), VoiceError> {
+            if self.channel_is_refused() {
+                return Err(VoiceError::Join(
+                    "establishing connection failed".to_owned(),
+                ));
+            }
             let source_id: String = prepared.take();
             self.state
                 .lock()

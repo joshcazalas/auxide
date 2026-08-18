@@ -48,7 +48,7 @@ use crate::{
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
     suggest::Suggestions,
-    voice::{SeekTo, SongbirdVoice, TrackEnded, VoiceGateway, VoiceGatewayFactory},
+    voice::{SeekTo, SongbirdVoice, TrackEnded, VoiceError, VoiceGateway, VoiceGatewayFactory},
 };
 
 const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
@@ -2461,6 +2461,14 @@ async fn playback_worker(
             PlaybackDirective::Join(channel_id) => {
                 if let Err(error) = voice.join(channel_id).await {
                     tracing::warn!(%error, guild_id, channel_id, "failed to take a voice channel");
+                    give_up_the_channel(
+                        guild_id,
+                        &player,
+                        &announcer,
+                        transition.snapshot.text_channel_id,
+                        &error,
+                    )
+                    .await;
                 }
             }
             PlaybackDirective::Pause => voice.pause().await,
@@ -2530,6 +2538,48 @@ async fn playback_worker(
     }
 
     voice.leave().await;
+}
+
+/// Stops pretending to hold a channel that could not be taken, and says so.
+///
+/// The player records the channel as soon as somebody asks for it, before the
+/// worker has tried. When the attempt fails, nothing used to correct that, and
+/// the session went on believing it was connected: `/join` had already answered
+/// that Auxide was in, `require_same_voice` agreed, so `/pause` and `/volume`
+/// were accepted and did nothing at all against a connection that did not
+/// exist. A quarter of an hour later the idle countdown announced leaving a
+/// channel never entered.
+///
+/// Parking is the honest state — no channel held, the queue kept — and it is
+/// also the recoverable one, because `/join` and `/play` both bring a parked
+/// session back. So a failed join leaves something to retry rather than
+/// something to restart.
+///
+/// The room is told because nothing else will. The reply to `/join` went out
+/// before the attempt and cannot be taken back, and a `/play` whose track never
+/// starts is otherwise just silence.
+async fn give_up_the_channel(
+    guild_id: u64,
+    player: &GuildPlayerHandle,
+    announcer: &Announcer,
+    text_channel_id: Option<u64>,
+    error: &VoiceError,
+) {
+    if let Err(error) = player.park().await {
+        tracing::debug!(%error, guild_id, "the session had already given the channel up");
+    }
+    announcer
+        .announce(
+            guild_id,
+            text_channel_id,
+            Announcement::text(format!(
+                "I could not join the voice channel — {}. Anything queued is kept for {}; \
+                 `/play` or `/join` will try again.",
+                single_line(&error.to_string(), 200),
+                announcer.idle_hold()
+            )),
+        )
+        .await;
 }
 
 enum StartTrackOutcome {
@@ -2617,6 +2667,22 @@ async fn start_track(
         queue_id: item.queue_id,
     });
     if let Err(error) = voice.play(channel_id, prepared, volume, ended).await {
+        // Whether the channel or the track is at fault decides what to do next,
+        // and the error already says which. Advancing past a track the channel
+        // refused would work through the whole queue at a quarter of a minute
+        // each, failing identically every time and saying nothing.
+        if matches!(error, VoiceError::Join(_)) {
+            tracing::warn!(%error, guild_id, channel_id, "failed to take a voice channel for a track");
+            give_up_the_channel(
+                guild_id,
+                player,
+                announcer,
+                Some(item.response_channel_id),
+                &error,
+            )
+            .await;
+            return StartTrackOutcome::Failed;
+        }
         tracing::warn!(%error, guild_id, channel_id, "failed to start playback; advancing");
         let _ = player.track_finished(item.queue_id).await;
         return StartTrackOutcome::Failed;
@@ -2976,6 +3042,69 @@ idle_timeout_seconds = 900
             source_id: format!("source-{id}"),
             volume_percent,
         }
+    }
+
+    #[tokio::test]
+    async fn a_channel_that_refuses_leaves_the_session_holding_nothing() {
+        let session = Session::start(Duration::from_secs(900));
+        session.voice.refuse_the_channel();
+
+        session
+            .player
+            .enqueue(item(1), VOICE_CHANNEL)
+            .await
+            .unwrap();
+        // The worker gives the channel up on its way out of the failure, which
+        // is the action to wait for — there is no successful one coming.
+        session.voice.settle(2).await;
+
+        // The player records the channel the moment somebody asks for it,
+        // before the worker has tried. Nothing used to correct that, so the
+        // session went on believing it was connected: /pause and /volume were
+        // accepted and did nothing at all, and a quarter of an hour later the
+        // idle countdown announced leaving somewhere it had never been.
+        let snapshot = session.player.snapshot().await.unwrap();
+        assert_eq!(
+            snapshot.voice_channel_id, None,
+            "the session still believes it holds a channel it never took"
+        );
+        // Parked rather than emptied, because parked is the state /play and
+        // /join both know how to come back from.
+        assert_eq!(snapshot.len(), 1, "the queue was thrown away");
+
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_channel_is_not_worked_through_a_whole_queue() {
+        let session = Session::start(Duration::from_secs(900));
+        session.voice.refuse_the_channel();
+        for id in 1..=3 {
+            session
+                .player
+                .enqueue(item(id), VOICE_CHANNEL)
+                .await
+                .unwrap();
+        }
+        session.voice.settle(2).await;
+
+        // Advancing past a track the *channel* refused would try every track in
+        // turn, each failing identically and each costing a resolution, to
+        // arrive where the first one already did. The error says which of the
+        // two is at fault, so only a track's own failure moves the queue on.
+        let snapshot = session.player.snapshot().await.unwrap();
+        assert_eq!(snapshot.len(), 3, "the queue was worked through and lost");
+        assert!(
+            !session
+                .voice
+                .actions()
+                .iter()
+                .any(|action| matches!(action, VoiceAction::Played { .. })),
+            "something played through a channel that refused: {:?}",
+            session.voice.actions()
+        );
+
+        session.finish().await;
     }
 
     #[tokio::test]
