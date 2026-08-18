@@ -68,6 +68,25 @@ search_results = 5
 resolution_timeout_seconds = 20
 max_output_bytes = 1048576
 
+# The two settings below are what let a whole track play.
+#
+# YouTube hands almost anybody the first megabyte of a song and refuses the
+# rest. That arrives as music that stops about a minute in, with 403s in the
+# journal and nothing said in the channel. Getting the whole thing takes both
+# of these at once, and neither is any use alone: extracting as a client that
+# asks for a proof-of-origin token, and having somewhere to get one.
+#
+# Which clients YouTube will serve is the part that changes, so it is a setting
+# rather than a constant — when one stops working the repair is to name another
+# here and restart. `default` is yt-dlp's own choice and belongs last, as the
+# fallback for a video the named clients cannot see.
+player_clients = ["tv_simply", "default"]
+
+# Where the token provider listens. The NixOS module runs one on loopback with
+# services.auxide.poTokenProvider. Comment this out only if no provider is
+# running: unset, nothing is asked for, and full-length tracks will not play.
+po_token_base_url = "http://127.0.0.1:4416"
+
 [observability]
 # Publish this port only to a private container network, never to the public Internet.
 listen_address = "127.0.0.1:9090"

@@ -13,6 +13,35 @@ use crate::{
 
 const AUDIO_FORMAT: &str = "bestaudio[abr>0][vcodec=none]/bestaudio";
 
+/// What to tell yt-dlp about which `YouTube` to be, and who will vouch for it.
+///
+/// `YouTube` will hand almost anybody the first megabyte of a track and refuse
+/// the rest, which arrives as a song that stops a minute in rather than as an
+/// error. Getting the whole thing takes two things at once, and neither is any
+/// use without the other: extracting as a client that asks for a proof-of-origin
+/// token, and having somewhere to get one.
+///
+/// yt-dlp's own default clients do neither. One of them `YouTube` now refuses
+/// outright, and everything falls through to the other, which yt-dlp still has
+/// recorded as needing no token — so it never asks for one and, because it only
+/// warns when it knowingly skips a format, never mentions it. The visible
+/// symptom is a truncated song and a silent journal.
+///
+/// Returned as whole `--extractor-args` values because that is yt-dlp's own
+/// shape for this: one namespaced key per argument, repeated.
+fn extractor_args(config: &YouTubeConfig) -> impl Iterator<Item = String> + '_ {
+    let clients = (!config.player_clients.is_empty())
+        .then(|| format!("youtube:player_client={}", config.player_clients.join(",")));
+    // Skipped entirely when no provider is configured, so an installation
+    // without one fails against `YouTube`'s own answer rather than against a
+    // connection refused to a service that was never running.
+    let provider = config
+        .po_token_base_url
+        .as_ref()
+        .map(|base_url| format!("youtubepot-bgutilhttp:base_url={base_url}"));
+    clients.into_iter().chain(provider)
+}
+
 /// The exact fields [`YtDlpEntry`] deserialises, as a yt-dlp output template.
 ///
 /// `--dump-json` emits the complete info dictionary instead, which is dominated
@@ -143,6 +172,10 @@ impl YouTubeResolver {
             OsString::from(runtime),
         ]
         .into_iter()
+        .chain(
+            extractor_args(&self.config)
+                .flat_map(|value| [OsString::from("--extractor-args"), OsString::from(value)]),
+        )
         .chain(extra)
         .chain([OsString::from("--"), OsString::from(target)]);
         let output = CommandSpec::new(
@@ -385,6 +418,36 @@ fn sanitize_stderr(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_default_installation_asks_for_a_token_and_says_who_is_asking() {
+        // Both halves or neither. Naming a client that requests a token does
+        // nothing with no provider to answer, and a provider is never consulted
+        // for a client yt-dlp believes needs no token — which is exactly the
+        // pair yt-dlp defaults to, and exactly why tracks stopped a minute in.
+        let args: Vec<String> = extractor_args(&YouTubeConfig::default()).collect();
+        assert_eq!(
+            args,
+            vec![
+                "youtube:player_client=tv_simply,default".to_owned(),
+                "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_provider_configured_means_nothing_is_said_about_one() {
+        // An installation without a provider should fail against YouTube's own
+        // answer, not against a connection refused to something that was never
+        // running — the first is a diagnosable refusal, the second is noise.
+        let config = YouTubeConfig {
+            po_token_base_url: None,
+            ..YouTubeConfig::default()
+        };
+        let args: Vec<String> = extractor_args(&config).collect();
+        assert_eq!(args, vec!["youtube:player_client=tv_simply,default"]);
+        assert!(!args.iter().any(|arg| arg.contains("bgutil")));
+    }
 
     fn resolver(max_seconds: u64) -> YouTubeResolver {
         YouTubeResolver::new(

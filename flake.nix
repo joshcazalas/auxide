@@ -20,10 +20,46 @@
       perSystem =
         { pkgs, ... }:
         let
+          # Lets yt-dlp ask a running provider for a proof-of-origin token.
+          #
+          # Without one, YouTube hands over roughly the first megabyte of a
+          # track and refuses the rest, which reaches a listener as a song that
+          # stops a minute in. This half only knows how to ask; something has to
+          # be listening on services.auxide.poTokenProviderUrl to answer, which
+          # the NixOS module runs as a container beside the bot.
+          #
+          # Not in nixpkgs, so it is built from the published release here. The
+          # wheel rather than the sdist because the 1.3.1 sdist is a malformed
+          # tarball — it carries a `../README.md` that tar refuses to extract.
+          bgutil-pot-plugin = pkgs.python3Packages.buildPythonPackage rec {
+            pname = "bgutil-ytdlp-pot-provider";
+            version = "1.3.1";
+            format = "wheel";
+            src = pkgs.fetchPypi {
+              pname = "bgutil_ytdlp_pot_provider";
+              inherit version format;
+              dist = "py3";
+              python = "py3";
+              hash = "sha256-5ish+bLkR51Zr4eokAOHw0iS6Nf9siPyZnSakOC+It4=";
+            };
+            # A yt-dlp plugin rather than an importable library, so there is no
+            # module of its own name to check for.
+            pythonImportsCheck = [ ];
+            doCheck = false;
+          };
+
+          # yt-dlp finds plugins on its own Python path, so the plugin is added
+          # to the interpreter yt-dlp runs under rather than passed by flag.
+          # That keeps the discovery a packaging concern and leaves the bot's
+          # command line to say only what it wants, not where the code lives.
+          yt-dlp-with-pot = pkgs.yt-dlp.overridePythonAttrs (previous: {
+            dependencies = (previous.dependencies or [ ]) ++ [ bgutil-pot-plugin ];
+          });
+
           runtimePath = pkgs.lib.makeBinPath [
             pkgs.deno
             pkgs.ffmpeg-headless
-            pkgs.yt-dlp
+            yt-dlp-with-pot
           ];
 
           auxide = pkgs.rustPlatform.buildRustPackage {
