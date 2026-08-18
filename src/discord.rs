@@ -1429,8 +1429,13 @@ impl BotRuntime {
             let voice_channel_id = authorization
                 .voice_channel_id
                 .context("join a voice channel before queueing something")?;
-            let item = history
-                .get(position - 1)
+            // Discord enforces the option's own minimum of one, so a zero
+            // arrives only from something that is not Discord. Subtracting
+            // without checking wrapped it to the top of the range, which is a
+            // panic in a debug build and a nonsense lookup in a release one.
+            let item = position
+                .checked_sub(1)
+                .and_then(|index| history.get(index))
                 .with_context(|| format!("nothing played at position {position}"))?;
             // A history entry is a whole track, so this needs no resolution —
             // the media URL is fetched just before it plays, as it always is.
@@ -1554,11 +1559,23 @@ impl BotRuntime {
             .player
             .enqueue_all(tracks, voice_channel_id)
             .await?;
-        Ok(InteractionReply::message(format!(
+        // Say what was left behind, the way a playlist already does. A file
+        // holding more than the queue has room for was accepted silently, and
+        // reported only the part that fit — so an import that lost half of
+        // itself read exactly like one that did not.
+        let mut reply = format!(
             "{} brought back {} track(s).",
             mention(authorization.user_id),
             bulk.accepted
-        )))
+        );
+        if bulk.refused > 0 {
+            let _ = write!(
+                reply,
+                " {} did not fit the {}-track queue limit.",
+                bulk.refused, self.config.playback.max_queue_length
+            );
+        }
+        Ok(InteractionReply::message(reply))
     }
 
     /// Adds a whole playlist and describes it as the one thing it was.
