@@ -150,18 +150,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Starts logging, on standard error.
+///
+/// Standard output belongs to whichever subcommand is running. Three of them —
+/// `youtube-inspect`, `youtube-search`, and `youtube-playlist` — print
+/// tab-separated records for a script to read, and the daily probe in
+/// `scripts/source-check.sh` reads exactly that. Sharing the stream with the
+/// log put a line of JSON where the first track should have been, and the probe
+/// dutifully reported that `YouTube` had changed the shape of its answers.
+/// It had not. Nothing had, except that Auxide had started saying which
+/// configuration it loaded before doing anything else.
+///
+/// Under systemd this changes nothing: the journal takes both streams.
 fn init_logging(config: &ObservabilityConfig) -> Result<()> {
     let filter = EnvFilter::try_new(&config.log_filter)
         .with_context(|| format!("invalid log filter: {}", config.log_filter))?;
     if config.json_logs {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
+            .with_writer(std::io::stderr)
             .json()
             .try_init()
             .map_err(|error| anyhow::anyhow!("failed to initialize JSON logging: {error}"))?;
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
+            .with_writer(std::io::stderr)
             .try_init()
             .map_err(|error| anyhow::anyhow!("failed to initialize logging: {error}"))?;
     }

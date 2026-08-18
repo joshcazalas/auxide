@@ -63,8 +63,25 @@ check_track_lines() {
 # Only ever writes to stdout. Counting a failure here would be counting it in
 # the subshell a command substitution creates, where the increment is discarded
 # and every probe could fail while the script still reported success.
+#
+# Standard error is kept rather than discarded, and shown when the probe fails.
+# It carries the reason — what yt-dlp said, or which field would not parse —
+# and this whole script exists to report that reason to somebody who was not
+# watching. Throwing it away left "the probe exited non-zero" as the entire
+# finding.
+PROBE_STDERR="$(mktemp)"
+readonly PROBE_STDERR
+trap 'rm -f "${PROBE_STDERR}"' EXIT
+
 run_probe() {
-  "${auxide[@]}" "$@" 2>/dev/null
+  "${auxide[@]}" "$@" 2>"${PROBE_STDERR}"
+}
+
+# What the probe said on its way out, indented so it reads as detail.
+report_stderr() {
+  if [[ -s "${PROBE_STDERR}" ]]; then
+    sed 's/^/     | /' "${PROBE_STDERR}" >&2
+  fi
 }
 
 echo "==> Resolving a single video"
@@ -72,6 +89,7 @@ if output="$(run_probe youtube-inspect "${PROBE_VIDEO}")"; then
   check_track_lines inspect "${output}" 1
 else
   fail "inspect: the probe exited non-zero"
+  report_stderr
 fi
 
 echo "==> Searching"
@@ -79,6 +97,7 @@ if output="$(run_probe youtube-search "${PROBE_SEARCH}")"; then
   check_track_lines search "${output}" 1
 else
   fail "search: the probe exited non-zero"
+  report_stderr
 fi
 
 echo "==> Expanding a playlist"
@@ -91,6 +110,7 @@ if output="$(run_probe youtube-playlist "${PROBE_PLAYLIST}")"; then
   check_track_lines playlist "$(tail -n +2 <<<"${output}")" 2
 else
   fail "playlist: the probe exited non-zero"
+  report_stderr
 fi
 
 if ((failures > 0)); then
