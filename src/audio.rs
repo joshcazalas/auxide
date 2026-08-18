@@ -48,14 +48,20 @@ const CHUNK_SPAN: u64 = 1024 * 1024;
 /// connection this feeds already requires.
 const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Attempts one URL gets at a chunk before it is treated as stale.
+/// Attempts one URL gets at a chunk that never arrived, before it is stale.
+///
+/// Only for a chunk that failed on the way — a refused one is not retried at
+/// all, because a status is the origin's answer and it will give the same one.
 const CHUNK_ATTEMPTS: u32 = 3;
 
 /// Pause before retrying a chunk, multiplied by the attempt that just failed.
 ///
-/// `YouTube` answers 403 when it is rate-limiting the requester, not only when
-/// a URL has gone bad, and it counts resolutions too. Backing off is what
-/// clears that; asking the source for another URL only adds to it.
+/// This covers a dropped connection, a reset, a request that ran out of time —
+/// the failures where nothing was said and trying again is the whole remedy. It
+/// once covered refusals too, on the belief that a 403 meant `YouTube` was
+/// rate-limiting and waiting would clear it. Measurement said otherwise: the
+/// identical range requested twice in a row was answered 206 both times while a
+/// chunk past a ceiling was refused every time, however long the wait.
 const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Audio buffered between the network and the decoder.
@@ -285,6 +291,19 @@ impl ChunkedHttpRequest {
                 Ok(chunk) => return Ok(chunk),
                 Err(error) => error,
             };
+            // A status is an answer, not a hiccup. The origin has said what it
+            // will do with this request, and asking again in a second gets the
+            // same sentence — only a different URL can be answered differently,
+            // and that is the caller's move rather than this loop's.
+            //
+            // Against the megabyte ceiling YouTube spent a while enforcing,
+            // waiting it out cost twelve requests and three quarters of a
+            // minute per track to arrive at the refusal the first one gave, and
+            // made a wall look like rate limiting for a day.
+            if error.kind() == IoErrorKind::PermissionDenied {
+                tracing::warn!(%error, position, last, "media chunk was refused; the same URL will not answer differently");
+                return Err(error);
+            }
             if attempt >= CHUNK_ATTEMPTS {
                 tracing::warn!(%error, position, last, attempts = attempt, "media chunk failed on every attempt");
                 return Err(error);
@@ -320,11 +339,17 @@ impl ChunkedHttpRequest {
                 return Ok(Chunk::Exhausted);
             }
             if !status.is_success() {
-                // Reported as an error so the retry above, and then Songbird's
-                // call to try_resume, both get their turn.
-                return Err(IoError::other(format!(
-                    "media request for bytes {position}-{last} was refused with status {status}"
-                )));
+                // `PermissionDenied` marks this as the origin's answer rather
+                // than something that went wrong on the way, which is what
+                // stops the caller asking again. Songbird's call to try_resume
+                // still gets its turn, and a fresh URL is the one thing that
+                // could be answered differently.
+                return Err(IoError::new(
+                    IoErrorKind::PermissionDenied,
+                    format!(
+                        "media request for bytes {position}-{last} was refused with status {status}"
+                    ),
+                ));
             }
             let total = content_range_total(response.headers());
             let bytes = response.bytes().await.map_err(IoError::other)?;
@@ -645,8 +670,10 @@ mod tests {
         Full,
         /// Serve only this many of the requested bytes, and say so honestly.
         Short(usize),
-        /// Refuse, the way `YouTube` does while it is rate-limiting.
+        /// Refuse, with a status. An answer, however unwelcome.
         Refuse(u16),
+        /// Answer nothing at all and hang up, the way a dropped connection does.
+        Drop,
     }
 
     struct Origin {
@@ -695,6 +722,10 @@ mod tests {
                             "HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                         );
                         let _ = socket.write_all(refusal.as_bytes()).await;
+                        let _ = socket.shutdown().await;
+                        continue;
+                    }
+                    Reply::Drop => {
                         let _ = socket.shutdown().await;
                         continue;
                     }
@@ -914,13 +945,37 @@ mod tests {
     /// `YouTube` refuses while it is rate-limiting this host, and asking the
     /// source for another URL is one more request against that same limit.
     #[tokio::test]
-    async fn retries_a_refused_chunk_before_replacing_the_url() {
+    async fn a_refused_chunk_is_never_asked_for_twice() {
         let body = media(4096);
+        // The origin would serve it on a second ask, and is never given one.
         let origin = origin(Arc::clone(&body), vec![Reply::Refuse(403), Reply::Full]).await;
+
+        let mut played = Vec::new();
+        let refused = request(&origin.url)
+            .open(0, None)
+            .read_to_end(&mut played)
+            .await
+            .expect_err("a refused chunk must reach the reader as an error");
+        assert_eq!(refused.kind(), IoErrorKind::PermissionDenied);
+
+        // A status is the origin's answer. Repeating the identical request only
+        // spends time arriving at it again — against the ceiling YouTube
+        // enforced for a day, three attempts and three fresh URLs came to
+        // twelve requests and forty-five seconds of silence per track, and made
+        // a wall look like rate limiting.
+        let ranges = origin.ranges.lock().unwrap().clone();
+        assert_eq!(ranges.len(), 1, "the refused range was asked for again");
+    }
+
+    /// A chunk that never arrived said nothing, so trying again is the remedy.
+    #[tokio::test]
+    async fn a_chunk_that_never_arrived_is_asked_for_again() {
+        let body = media(4096);
+        let origin = origin(Arc::clone(&body), vec![Reply::Drop, Reply::Full]).await;
 
         assert_eq!(play(&request(&origin.url)).await, *body);
         let ranges = origin.ranges.lock().unwrap().clone();
-        assert_eq!(ranges.len(), 2, "the same range must be asked for twice");
+        assert_eq!(ranges.len(), 2, "a dropped connection ended the track");
         assert_eq!(ranges[0], ranges[1]);
     }
 
