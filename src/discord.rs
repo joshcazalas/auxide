@@ -321,9 +321,35 @@ fn command_definitions() -> Vec<CreateCommand> {
         .chain([
             CreateCommand::new("help").description("What Auxide can do, and who sees each answer")
         ])
+        .filter(|command| {
+            described(command).is_none_or(|(name, _)| !DISABLED_COMMANDS.contains(&name.as_str()))
+        })
         .map(|command| command.dm_permission(false))
         .collect()
 }
+
+/// Commands built but not offered.
+///
+/// Moving the playhead is the one thing Auxide does that reaches into a
+/// half-decoded container rather than into its own state, and it is the only
+/// part that has taken the process down: seeking a `WebM` stream can trip an
+/// assertion inside Symphonia's Matroska reader, on a mixer thread, where a
+/// panic is nobody's to catch. The rest of the failures were milder but the
+/// same shape — a seek landing somewhere the decoder could not resume from,
+/// reported as a track that cannot be seeked in.
+///
+/// So they are withdrawn rather than repaired, for now. A queue that always
+/// plays is worth more than a playhead that sometimes moves, and every one of
+/// these is a convenience nobody had asked for. The handlers, the argument
+/// parsing, and their tests all stay: what is wrong is under them, in how a
+/// seek meets the decoder, and none of that is rediscovered by deleting the
+/// commands that reach it.
+///
+/// Naming them here is the whole switch. Registration filters on it, help is
+/// read back from what registration produced, and dispatch refuses anything
+/// listed — so there is no second place to remember, and re-offering one is
+/// this line and a release.
+const DISABLED_COMMANDS: [&str; 4] = ["seek", "forward", "rewind", "restart"];
 
 /// How `/help` groups commands, by name.
 ///
@@ -1087,6 +1113,17 @@ impl BotRuntime {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<InteractionReply> {
+        // Discord keeps offering a command until the guild's copy is replaced,
+        // so a withdrawn one stays clickable for a while after it stops being
+        // registered. Refusing here is what makes the withdrawal true straight
+        // away, and says so rather than failing somewhere further in.
+        if DISABLED_COMMANDS.contains(&command.data.name.as_str()) {
+            bail!(
+                "`/{}` is turned off in this version of Auxide. It could stop playback \
+                 altogether, so it has been withdrawn until that is fixed.",
+                command.data.name
+            );
+        }
         let authorization = self.authorize_command(ctx, command).await?;
         match command.data.name.as_str() {
             "play" => self.play(ctx, command, authorization).await,
@@ -3539,6 +3576,54 @@ mod tests {
     }
 
     #[test]
+    fn a_withdrawn_command_is_offered_nowhere() {
+        // Discord's picker, `/help`, and the dispatcher are three different
+        // places a command can be visible, and a command that is off has to be
+        // off in all of them: one that help still lists is a promise the bot
+        // will refuse, and one Discord still offers is the crash it was
+        // withdrawn for.
+        let text = help_text();
+        let registered: Vec<String> = command_definitions()
+            .iter()
+            .filter_map(described)
+            .map(|(name, _)| name)
+            .collect();
+        for name in DISABLED_COMMANDS {
+            assert!(
+                !registered.iter().any(|listed| listed == name),
+                "/{name} is disabled but still registered"
+            );
+            assert!(!text.contains(&format!("`/{name}`")), "/{name} is in help");
+        }
+    }
+
+    #[test]
+    fn what_is_still_offered_did_not_go_with_them() {
+        // The withdrawal is four commands, not the group they sat in. `/pause`
+        // and `/resume` are in the same help heading and are the ones people
+        // actually use.
+        let registered: Vec<String> = command_definitions()
+            .iter()
+            .filter_map(described)
+            .map(|(name, _)| name)
+            .collect();
+        for name in [
+            "play",
+            "pause",
+            "resume",
+            "skip",
+            "now-playing",
+            "queue",
+            "help",
+        ] {
+            assert!(
+                registered.iter().any(|listed| listed == name),
+                "/{name} went missing"
+            );
+        }
+    }
+
+    #[test]
     fn help_stays_inside_what_an_embed_will_hold() {
         assert!(bounded_embed(help_text()).chars().count() <= EMBED_DESCRIPTION_CHARS);
         assert_eq!(
@@ -3552,7 +3637,10 @@ mod tests {
     #[test]
     fn a_command_nobody_grouped_still_appears() {
         // Every name in the grouping table has to be a command that exists, or
-        // the heading it sits under is describing something imaginary.
+        // the heading it sits under is describing something imaginary. A
+        // withdrawn one is allowed to stay in the table and is skipped when
+        // help is rendered, so that re-offering it stays a one-line change
+        // rather than a hunt for where its heading used to be.
         let registered = command_definitions()
             .iter()
             .filter_map(described)
@@ -3561,7 +3649,7 @@ mod tests {
         for (heading, names) in HELP_GROUPS {
             for name in names {
                 assert!(
-                    registered.contains(*name),
+                    registered.contains(*name) || DISABLED_COMMANDS.contains(name),
                     "help groups /{name} under {heading}, but nothing registers it"
                 );
             }
