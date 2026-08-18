@@ -176,7 +176,10 @@
               pkgs.rustfmt
               pkgs.shellcheck
               pkgs.statix
-              pkgs.yt-dlp
+              # The same yt-dlp the bot runs, plugin and all. Without it the
+              # daily probe cannot ask for a proof-of-origin token, so it would
+              # be checking a configuration nothing ships.
+              yt-dlp-with-pot
             ];
 
             RUST_BACKTRACE = "1";

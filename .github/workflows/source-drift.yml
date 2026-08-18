@@ -31,6 +31,18 @@ jobs:
       contents: read
       issues: write
 
+    # YouTube serves roughly the first megabyte of a track to a client that
+    # cannot present a proof-of-origin token, and refuses the rest. A probe
+    # without one would answer every metadata question correctly and then fail
+    # to fetch — reporting drift that is only this workflow's own configuration.
+    # So it runs the provider the bot runs, on the loopback address the default
+    # configuration already points at.
+    services:
+      pot-provider:
+        image: brainicism/bgutil-ytdlp-pot-provider:1.3.1
+        ports:
+          - 4416:4416
+
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,7 +92,11 @@ jobs:
             --label source-drift \
             --body "The daily probes stopped answering, so something about YouTube extraction has moved.
 
-          This is expected to happen periodically and independently of anything in this repository — ADR 0001 says so. The usual cause is that yt-dlp needs updating, or that the fields \`ENTRY_TEMPLATE\` names have changed shape.
+          This is expected to happen periodically and independently of anything in this repository — ADR 0001 says so.
+
+          **Which probe failed narrows it a long way.** \`inspect\`, \`search\`, or \`playlist\` means the answers about a track changed shape: yt-dlp usually needs updating, or the fields \`ENTRY_TEMPLATE\` names have moved.
+
+          \`fetch\` means the answers are fine and YouTube will no longer hand the track over. That is the failure that sounds like music stopping a minute in rather than like anything being broken, and it is almost always the proof-of-origin token: either the provider is not answering, or \`youtube.player_clients\` names a client YouTube has since tightened and a different one is needed. Metadata probes cannot see it, which is why this one exists.
 
           Run: ${RUN_URL}
 

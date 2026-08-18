@@ -175,6 +175,62 @@ impl AudioPipeline {
             Some(protocol) => bail!("source selected unsupported media protocol {protocol:?}"),
         }
     }
+
+    /// Reads the first `wanted` bytes of a track, through the real media path.
+    ///
+    /// The daily probe checks that `YouTube` still answers questions about a
+    /// track — its title, its length, what a playlist holds. Answering those is
+    /// not the same as handing the track over, and the difference is not
+    /// academic: through the whole outage that stopped every song a minute in,
+    /// every one of those questions was answered correctly. Resolution had
+    /// never broken. Only fetching had, and nothing looked at fetching.
+    ///
+    /// So this asks for bytes, over the same chunked ranged reader playback
+    /// uses, and reports how many arrived. Asking for more than the ceiling
+    /// that outage imposed is what makes it a check rather than a formality:
+    /// the first megabyte came back fine throughout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the track cannot be resolved, the source supplies
+    /// headers that are not headers, or the media is served over a protocol
+    /// this does not read.
+    pub async fn reach(&self, track: &TrackMetadata, wanted: u64) -> Result<MediaReach> {
+        let audio = self.resolver.resolve(track).await?;
+        let headers = convert_headers(&audio.headers)?;
+        match audio.protocol.as_deref() {
+            None | Some("https") => {}
+            Some(protocol) => bail!("media is served over {protocol:?}, which this cannot read"),
+        }
+        let request = ChunkedHttpRequest {
+            client: self.http.clone(),
+            resolver: Arc::clone(&self.resolver),
+            track: track.clone(),
+            url: audio.stream_url.to_string(),
+            headers,
+        };
+        let total = request.probe_length().await;
+        let mut stream = request.open(0, total);
+        let mut fetched = 0;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        while fetched < wanted {
+            let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            fetched += read as u64;
+        }
+        Ok(MediaReach { fetched, total })
+    }
+}
+
+/// What a media probe managed to get, and how much there was to get.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MediaReach {
+    /// Bytes that actually arrived.
+    pub fetched: u64,
+    /// The whole resource's length, when the origin stated one.
+    pub total: Option<u64>,
 }
 
 /// A media stream fetched as a sequence of bounded ranged requests.
