@@ -75,16 +75,19 @@ impl Suggestions {
 
         let mut searched = self.searched.lock().await;
         searched.retain(|_, cached| cached.at.elapsed() < CACHE_TTL);
-        if let Some(cached) = searched.get(&key) {
-            return cached.tracks.iter().map(choice).collect();
-        }
-        let already_looking = searched.len() >= MAX_CACHED;
+        let exact = searched.contains_key(&key);
+        let offered = best_match(&searched, &key)
+            .map(|cached| cached.tracks.iter().map(choice).collect())
+            .unwrap_or_default();
         drop(searched);
 
-        if !already_looking {
+        // Searched even when something was offered, because what was offered
+        // was for less than has been typed. The exact query is what the next
+        // keystroke will want, and this is the only chance to have it ready.
+        if !exact {
             self.warm(key);
         }
-        Vec::new()
+        offered
     }
 
     /// Searches for a query nobody has searched for yet, if there is room.
@@ -104,15 +107,29 @@ impl Suggestions {
             match found {
                 Ok(tracks) => {
                     let mut searched = searched.lock().await;
-                    if searched.len() < MAX_CACHED {
-                        searched.insert(
-                            key,
-                            Cached {
-                                at: Instant::now(),
-                                tracks,
-                            },
-                        );
+                    // Room is made rather than the result thrown away. Every
+                    // keystroke is a query of its own, so a full table is the
+                    // ordinary state after a couple of searches rather than a
+                    // sign of anything — and refusing to remember any more
+                    // would have turned suggestions off for a minute at a time,
+                    // right after the typing that filled it.
+                    while searched.len() >= MAX_CACHED {
+                        let Some(oldest) = searched
+                            .iter()
+                            .min_by_key(|(_, cached)| cached.at)
+                            .map(|(key, _)| key.clone())
+                        else {
+                            break;
+                        };
+                        searched.remove(&oldest);
                     }
+                    searched.insert(
+                        key,
+                        Cached {
+                            at: Instant::now(),
+                            tracks,
+                        },
+                    );
                 }
                 // A failed search is not worth remembering or reporting: the
                 // person is still typing, and the picker behind `/play` will
@@ -121,6 +138,26 @@ impl Suggestions {
             }
         });
     }
+}
+
+/// The best thing already known for what somebody has typed so far.
+///
+/// An exact hit if there is one, and otherwise the longest query already
+/// searched that this one begins with. Somebody midway through typing
+/// `ella langley` has `ella lang` in hand, and those are the same results.
+///
+/// Without this there are almost never any suggestions at all, which is what
+/// the feature looked like in use. Every keystroke is a different query, so the
+/// search one keystroke starts lands under a key the next keystroke has already
+/// moved past — and the last keystroke, the only one whose answer anybody sees,
+/// is by definition the one nothing has searched yet. Exact matching could only
+/// pay off for somebody who typed a letter and deleted it again.
+fn best_match<'a>(searched: &'a HashMap<String, Cached>, key: &str) -> Option<&'a Cached> {
+    searched
+        .iter()
+        .filter(|(searched_key, _)| key.starts_with(searched_key.as_str()))
+        .max_by_key(|(searched_key, _)| searched_key.len())
+        .map(|(_, cached)| cached)
 }
 
 /// Reduces a query to what makes two of them the same search.
@@ -261,6 +298,74 @@ mod tests {
         // crowd out a track waiting to start.
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(searches.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn what_was_searched_a_keystroke_ago_answers_what_is_being_typed_now() {
+        let (suggestions, _) = counting(Duration::ZERO);
+
+        // Typing out a query, one keystroke at a time, is the only way anybody
+        // ever uses this — and every keystroke is a different query. Answering
+        // only exact matches meant the last keystroke, the one whose answer is
+        // actually seen, was always the one nothing had searched, so the whole
+        // feature read as "No options match your search" no matter what was
+        // typed.
+        assert!(suggestions.for_query("ella").await.is_empty());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        for typed in ["ella l", "ella lan", "ella langley"] {
+            let offered = suggestions.for_query(typed).await;
+            assert_eq!(offered.len(), 1, "nothing offered for {typed:?}");
+            // Whatever answers has to be a search for something this query
+            // begins with — never a leftover from some unrelated word. Which
+            // prefix it is depends on how many background searches have landed,
+            // and a longer one taking over as it arrives is the point.
+            let answered = offered[0]
+                .0
+                .strip_suffix(" result (1:30)")
+                .unwrap_or_else(|| panic!("unexpected suggestion {:?}", offered[0].0));
+            assert!(
+                typed.starts_with(answered),
+                "{typed:?} was answered with a search for {answered:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // And the longer query, once its own search has landed, wins over the
+        // shorter one it was standing in for.
+        let offered = suggestions.for_query("ella langley").await;
+        assert!(
+            offered[0].0.starts_with("ella langley result"),
+            "a stale prefix outlived the exact search: {:?}",
+            offered[0].0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_table_still_learns_what_is_being_typed_now() {
+        let (suggestions, _) = counting(Duration::ZERO);
+
+        // Filling it takes only a few words typed out, because each keystroke
+        // is its own entry. Refusing to search once full meant suggestions
+        // stopped entirely for the next minute.
+        for index in 0..MAX_CACHED + 20 {
+            suggestions
+                .for_query(&format!("query number {index}"))
+                .await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let offered = suggestions.for_query("something entirely new").await;
+        assert!(offered.is_empty(), "a query nobody typed before was cached");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !suggestions
+                .for_query("something entirely new")
+                .await
+                .is_empty(),
+            "a full table stopped learning"
+        );
     }
 
     #[test]

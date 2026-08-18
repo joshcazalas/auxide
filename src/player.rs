@@ -118,6 +118,24 @@ pub enum PlaybackDirective {
 pub struct PlayerTransition {
     pub directive: PlaybackDirective,
     pub snapshot: PlayerSnapshot,
+    /// Whether the command that caused this is already reporting the result.
+    ///
+    /// A track that starts the moment somebody asks for it gets named twice:
+    /// once by the reply to the command that asked, and once by the
+    /// announcement made as it starts. Both are the same card, in the same
+    /// channel, seconds apart. The reply is the one that cannot go missing —
+    /// it travels on the interaction's own token and needs no permission to
+    /// post — so the announcement is the one that gives way.
+    ///
+    /// Only the player can tell the two apart. A track beginning because
+    /// somebody just queued it and a track beginning because the queue moved on
+    /// reach the worker as the same directive, so the difference is recorded
+    /// here, where it is still visible.
+    ///
+    /// It belongs on the transition rather than on the queued track: it
+    /// describes this one occasion of something starting, not the track, which
+    /// may come round again under a repeat mode with nobody waiting to hear.
+    pub start_is_answered: bool,
 }
 
 /// Why a session is not playing.
@@ -893,7 +911,7 @@ impl GuildPlayer {
             self.idle_deadline = None;
             self.voice_channel_id = Some(voice_channel_id);
             self.current = Some(item.clone());
-            Ok(self.transition(PlaybackDirective::Play(item)))
+            Ok(self.answered(PlaybackDirective::Play(item)))
         } else {
             self.pending.push_back(item);
             Ok(self.transition(PlaybackDirective::None))
@@ -1135,7 +1153,7 @@ impl GuildPlayer {
         // again rather than resuming — there is no position left to resume to.
         self.hold = None;
         self.idle_deadline = None;
-        Ok(self.transition(PlaybackDirective::Play(current)))
+        Ok(self.answered(PlaybackDirective::Play(current)))
     }
 
     fn set_volume(&mut self, percent: u16) -> Result<PlayerTransition, PlayerError> {
@@ -1249,6 +1267,20 @@ impl GuildPlayer {
         PlayerTransition {
             directive,
             snapshot: self.snapshot(),
+            start_is_answered: false,
+        }
+    }
+
+    /// A transition whose command is already telling the room what happened.
+    ///
+    /// Used by the two commands that start a track and then name it in their
+    /// own reply: queueing into a session with nothing playing, and coming back
+    /// to a parked one. Everything else reaches a listener only if the
+    /// announcement makes it.
+    fn answered(&self, directive: PlaybackDirective) -> PlayerTransition {
+        PlayerTransition {
+            start_is_answered: true,
+            ..self.transition(directive)
         }
     }
 
@@ -1702,6 +1734,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(idle.directive, PlaybackDirective::IdleDisconnect);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_a_start_nobody_asked_for_is_left_to_the_announcement() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+
+        // Queueing into a silent session starts the track at once, and the
+        // reply to that command names it. Announcing it as well put the same
+        // card in the same channel twice, seconds apart, every single time
+        // somebody started playing something.
+        let first = item(1);
+        let started = player.enqueue(first.clone(), 10).await.unwrap();
+        assert!(matches!(started.directive, PlaybackDirective::Play(_)));
+        assert!(
+            started.start_is_answered,
+            "the reply already named this one"
+        );
+
+        // A track queued behind it is added, not started, so nothing has named
+        // it yet — and when the queue reaches it, the announcement is the only
+        // thing that will.
+        let queued = player.enqueue(item(2), 10).await.unwrap();
+        assert_eq!(queued.directive, PlaybackDirective::None);
+        let advanced = player.track_finished(first.queue_id).await.unwrap();
+        assert!(matches!(advanced.directive, PlaybackDirective::Play(_)));
+        assert!(
+            !advanced.start_is_answered,
+            "the queue moving on was left unannounced"
+        );
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coming_back_to_a_parked_queue_is_answered_by_the_command() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        player.park().await.unwrap();
+
+        // `/join` replies by naming the track it is starting again, so the
+        // announcement would be the second time the room was told.
+        let rejoined = player.join(10).await.unwrap();
+        assert!(matches!(rejoined.directive, PlaybackDirective::Play(_)));
+        assert!(rejoined.start_is_answered);
+
+        player.shutdown().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_track_coming_round_again_is_announced_like_any_other() {
+        let (player, _transitions, task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(30), 50);
+        let only = item(1);
+        let started = player.enqueue(only.clone(), 10).await.unwrap();
+        assert!(started.start_is_answered);
+        player.set_repeat(RepeatMode::Single).await.unwrap();
+
+        // The same track, but a different occasion of it starting, and this
+        // time nobody ran a command and is waiting to be told. Had this been
+        // recorded against the track rather than against the transition, a
+        // repeating queue would have gone silent after its first play.
+        let again = player.track_finished(only.queue_id).await.unwrap();
+        assert!(matches!(again.directive, PlaybackDirective::Play(_)));
+        assert!(
+            !again.start_is_answered,
+            "a repeat kept the first play's answer"
+        );
 
         player.shutdown().await.unwrap();
         task.await.unwrap();

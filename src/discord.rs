@@ -2501,6 +2501,7 @@ async fn playback_worker(
                     &cancellation,
                     item,
                     volume,
+                    transition.start_is_answered,
                 )
                 .await
                 {
@@ -2534,6 +2535,8 @@ async fn start_track(
     cancellation: &CancellationToken,
     item: QueueItem,
     volume: f32,
+    // Whether the command that queued this track is already naming it.
+    start_is_answered: bool,
 ) -> StartTrackOutcome {
     // Preparing reaches the network and takes seconds, so a skip arriving in
     // the middle of it has to be able to supersede the track being prepared.
@@ -2610,7 +2613,10 @@ async fn start_track(
         title = %single_line(&item.track.title, 200),
         "playback started"
     );
-    if announcer.announces_tracks(guild_id) {
+    // A track that started the moment somebody asked for it has already been
+    // named, by the reply to the command that asked. Saying it again here put
+    // the same card in the same channel twice, seconds apart.
+    if announcer.announces_tracks(guild_id) && !start_is_answered {
         announcer
             .announce(
                 guild_id,
