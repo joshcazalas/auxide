@@ -63,6 +63,48 @@ systemd, and gets a private runtime/cache directory. YouTube is streamed rather 
 so the dying `/srv` disk is not involved. A future NAS source can be mounted read-only from
 `/var/lib/homelab/media` without changing the YouTube path.
 
+### The proof-of-origin token provider
+
+Enabling Auxide also starts a small container beside it, bound to `127.0.0.1:4416`. This is not
+optional in practice. YouTube hands almost any client the first megabyte of a track and refuses
+the rest; without a token to present, a song stops about a minute in, the journal fills with
+`403 Forbidden` on media chunks, and the channel is told nothing. A megabyte is roughly a minute
+of Opus, so short clips play to the end and everything else does not — which is what makes the
+failure look intermittent rather than total.
+
+It needs a container backend. `virtualisation.oci-containers.backend` defaults to `podman`; set
+it to `docker` if that is what the host already runs.
+
+```nix
+services.auxide.poTokenProvider = {
+  enable = true;          # the default
+  port = 4416;            # loopback only, never published
+};
+```
+
+Two settings in Auxide's own configuration pair with it, and **neither works alone** — see
+`youtube.player_clients` and `youtube.po_token_base_url` in `config.example.toml`. Both have
+working defaults, so an existing configuration file needs no edit.
+
+When tracks start stopping partway again, this pairing is the first thing to check, and
+`youtube.player_clients` is the setting to change. YouTube decides per client what it will serve
+and what it demands first; when it tightens the one named here, naming a different one and
+restarting is the repair. Confirm what yt-dlp is doing before changing anything else:
+
+```bash
+yt-dlp -v --js-runtimes deno --skip-download -- VIDEO_ID 2>&1 | grep -i 'pot\]'
+```
+
+`PO Token Providers: none` means the plugin is not being found. `PO Token Providers:
+bgutil:http-…` means it is, and the next suspect is the provider itself:
+
+```bash
+curl -s http://127.0.0.1:4416/ping
+```
+
+These lines are `[debug]`, so they appear only under `-v`. Their absence without that flag says
+nothing at all — a point that cost a full afternoon of misdiagnosis once already.
+
 ## 3. Create persistent server-local state
 
 Create the configuration before the first switch if you already have the package available, or

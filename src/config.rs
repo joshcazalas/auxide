@@ -184,6 +184,31 @@ pub struct YouTubeConfig {
     pub search_results: usize,
     pub resolution_timeout_seconds: u64,
     pub max_output_bytes: usize,
+
+    /// Which `YouTube` player clients yt-dlp may extract as, best first.
+    ///
+    /// Configurable rather than fixed because this is the setting `YouTube`
+    /// breaks. Each client is a different pretend application, and `YouTube`
+    /// decides per client what it will serve and what it demands first. When it
+    /// tightens one, the repair is to name a different client here — which a
+    /// server operator can do the same hour, rather than waiting for a release.
+    ///
+    /// `default` is yt-dlp's own choice and belongs last, as the fallback for a
+    /// video the named clients cannot see.
+    pub player_clients: Vec<String>,
+
+    /// Where to reach a GVS proof-of-origin token provider, if one is running.
+    ///
+    /// `YouTube` serves roughly the first megabyte of a track to a client that
+    /// cannot present one of these, and refuses the rest — which arrives as a
+    /// song that stops a minute in. The token is what a real player attaches to
+    /// say it is a real player; yt-dlp asks a provider for one, and this is
+    /// where that provider listens.
+    ///
+    /// Left unset, nothing is asked for and nothing is passed, which is the
+    /// right behaviour for an installation that has no provider: the failure is
+    /// then `YouTube`'s answer rather than a connection refused.
+    pub po_token_base_url: Option<String>,
 }
 
 impl Default for YouTubeConfig {
@@ -195,6 +220,14 @@ impl Default for YouTubeConfig {
             search_results: 5,
             resolution_timeout_seconds: 20,
             max_output_bytes: 1024 * 1024,
+            // `tv_simply` first because it is the client that asks for a token
+            // at all. yt-dlp's own default pair does not: `web_safari` is
+            // refused outright and everything falls through to `android_vr`,
+            // which yt-dlp still believes needs no token, so it never requests
+            // one and never says so. Naming a client that does is half the fix;
+            // `po_token_base_url` is the other half, and neither works alone.
+            player_clients: vec!["tv_simply".to_owned(), "default".to_owned()],
+            po_token_base_url: Some("http://127.0.0.1:4416".to_owned()),
         }
     }
 }
@@ -309,6 +342,47 @@ impl Config {
                 return Err(ConfigError::Validation(
                     "youtube.max_output_bytes must not exceed 16777216".to_owned(),
                 ));
+            }
+            if self.youtube.player_clients.is_empty() {
+                return Err(ConfigError::Validation(
+                    "youtube.player_clients must name at least one client".to_owned(),
+                ));
+            }
+            // These are joined with commas into one `--extractor-args` value,
+            // so a name carrying a comma or a colon would not be a bad client
+            // name — it would be additional arguments, chosen by whoever can
+            // write this file rather than by the code that builds the command.
+            // Nothing yt-dlp calls a client needs anything outside this set.
+            for client in &self.youtube.player_clients {
+                if client.is_empty()
+                    || !client
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "youtube.player_clients contains {client:?}; names may use only letters, \
+                         digits, and underscores"
+                    )));
+                }
+            }
+            if let Some(base_url) = &self.youtube.po_token_base_url {
+                let parsed = url::Url::parse(base_url).map_err(|error| {
+                    ConfigError::Validation(format!(
+                        "youtube.po_token_base_url is not a URL: {error}"
+                    ))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err(ConfigError::Validation(
+                        "youtube.po_token_base_url must be http or https".to_owned(),
+                    ));
+                }
+                // Same reason as the client names: this becomes part of an
+                // `--extractor-args` value.
+                if base_url.contains([',', ';']) {
+                    return Err(ConfigError::Validation(
+                        "youtube.po_token_base_url must not contain ',' or ';'".to_owned(),
+                    ));
+                }
             }
         }
 
@@ -657,6 +731,82 @@ output_volume = {volume}
                 "accepted output_volume = {volume}"
             );
         }
+    }
+
+    #[test]
+    fn a_player_client_cannot_smuggle_further_arguments() {
+        // The names are joined with commas into one --extractor-args value, so
+        // a name carrying a separator would not be a bad client name — it would
+        // be extra arguments to yt-dlp, chosen by whoever can write this file.
+        for clients in [
+            r#"["tv_simply,youtube:po_token=stolen"]"#,
+            r#"["tv_simply;other"]"#,
+            r#"["tv simply"]"#,
+            r#"[""]"#,
+            "[]",
+        ] {
+            let source = format!(
+                r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+
+[youtube]
+player_clients = {clients}
+"#
+            );
+            let config: Config = toml::from_str(&source).unwrap();
+            assert!(
+                config.validate().is_err(),
+                "accepted player_clients = {clients}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_provider_has_to_be_somewhere_reachable() {
+        for base_url in [
+            r#""not a url""#,
+            r#""file:///etc/passwd""#,
+            r#""http://host/,youtube:player_client=web""#,
+        ] {
+            let source = format!(
+                r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+
+[youtube]
+po_token_base_url = {base_url}
+"#
+            );
+            let config: Config = toml::from_str(&source).unwrap();
+            assert!(
+                config.validate().is_err(),
+                "accepted po_token_base_url = {base_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configuration_written_before_tokens_existed_still_asks_for_one() {
+        // Every server running today has a [youtube] section without these two
+        // settings, and playback is broken until they are present. Defaulting
+        // them rather than requiring them is what makes the fix arrive with the
+        // binary instead of waiting on somebody editing a file on each host.
+        let source = r#"
+[discord]
+token_file = "/run/secrets/discord-token"
+
+[youtube]
+enabled = true
+search_results = 5
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.youtube.player_clients, ["tv_simply", "default"]);
+        assert_eq!(
+            config.youtube.po_token_base_url.as_deref(),
+            Some("http://127.0.0.1:4416")
+        );
     }
 
     #[test]

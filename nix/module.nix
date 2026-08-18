@@ -9,6 +9,9 @@ let
   cfg = config.services.auxide;
   credentialsDirectory = "/run/credentials/auxide.service";
   system = pkgs.stdenv.hostPlatform.system;
+  # Named by the backend actually in use, so this keeps working if a host is
+  # configured for podman rather than docker.
+  providerUnit = "${config.virtualisation.oci-containers.backend}-auxide-pot-provider.service";
 in
 {
   options.services.auxide = {
@@ -62,6 +65,40 @@ in
       default = "1G";
       description = "Hard systemd memory limit for Auxide and its media subprocesses.";
     };
+
+    poTokenProvider = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Run a GVS proof-of-origin token provider beside Auxide.
+
+          YouTube serves roughly the first megabyte of a track to a client that cannot present
+          one of these and refuses the rest, which reaches a listener as a song that stops about
+          a minute in rather than as an error. Turning this off is only sensible when a provider
+          is already running elsewhere, in which case point `youtube.po_token_base_url` in the
+          Auxide configuration at it.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 4416;
+        description = ''
+          Loopback port the provider listens on. Never published beyond 127.0.0.1: it issues
+          tokens on request and has no authentication of its own.
+        '';
+      };
+
+      image = lib.mkOption {
+        type = lib.types.str;
+        default = "docker.io/brainicism/bgutil-ytdlp-pot-provider:1.3.1";
+        description = ''
+          Provider image, pinned by tag so an upstream rebuild cannot change what runs here
+          without the change being visible in this file.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -97,12 +134,32 @@ in
       "d /var/lib/auxide 0700 root root -"
     ];
 
+    # Bound to loopback rather than published: the provider answers every
+    # request that reaches it, so what reaches it is the only control there is.
+    virtualisation.oci-containers.containers = lib.mkIf cfg.poTokenProvider.enable {
+      auxide-pot-provider = {
+        inherit (cfg.poTokenProvider) image;
+        ports = [ "127.0.0.1:${toString cfg.poTokenProvider.port}:4416" ];
+        extraOptions = [ "--init" ];
+      };
+    };
+
     systemd.services.auxide = {
       description = "Auxide Discord music bot";
       documentation = [ "https://github.com/joshcazalas/auxide" ];
       wantedBy = [ "multi-user.target" ];
-      wants = [ "network-online.target" ];
-      after = [ "network-online.target" ];
+      wants = [
+        "network-online.target"
+      ]
+      ++ lib.optional cfg.poTokenProvider.enable providerUnit;
+      # Wanted rather than required, and only ordered after: a provider that is
+      # slow to start or has fallen over should cost whole tracks, not the bot.
+      # Auxide answers commands, reports what YouTube said, and recovers on its
+      # own when the provider comes back.
+      after = [
+        "network-online.target"
+      ]
+      ++ lib.optional cfg.poTokenProvider.enable providerUnit;
 
       serviceConfig = {
         Type = "simple";
