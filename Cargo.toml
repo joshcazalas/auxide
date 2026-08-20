@@ -46,7 +46,7 @@ uuid = { version = "1.0", features = ["serde", "v4"] }
 tempfile = "3.0"
 # Serving the gateway side of a fake Discord. Pinned to the copy Songbird
 # already pulls in, so this adds no second WebSocket stack to the build.
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [profile.release]
 codegen-units = 1
