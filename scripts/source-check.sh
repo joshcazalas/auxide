@@ -16,10 +16,11 @@ set -Eeuo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
-# Long-lived and unlikely to disappear: the first video uploaded to YouTube, and
-# one of Google's own developer playlists. Neither is load-bearing — replace
-# them the day either stops being a fair canary.
-readonly PROBE_VIDEO="https://www.youtube.com/watch?v=jNQXAC9IVRw"
+# Long-lived and unlikely to disappear: one of Google's own developer
+# playlists. It is not load-bearing — replace it the day it stops being a fair
+# canary. The single-video target comes from the search below instead of being
+# fixed here: YouTube challenges well-known static probes from hosted-runner IPs
+# even while it serves other public videos from the same address.
 readonly PROBE_PLAYLIST="https://www.youtube.com/playlist?list=PLOU2XLYxmsIKpaV8h0AGE05so0fAwwfTw"
 readonly PROBE_SEARCH="rick astley never gonna give you up"
 
@@ -113,19 +114,27 @@ report_stderr() {
   fi
 }
 
-echo "==> Resolving a single video"
-if output="$(run_probe youtube-inspect "${PROBE_VIDEO}")"; then
-  check_track_lines inspect "${output}" 1
-else
-  fail "inspect: the probe exited non-zero"
-  report_stderr
-fi
-
 echo "==> Searching"
 if output="$(run_probe youtube-search "${PROBE_SEARCH}")"; then
   check_track_lines search "${output}" 1
+  # Search prepares each result fully rather than returning a flat list, so a
+  # result here is a video YouTube just allowed this runner to resolve. Reuse
+  # one for the direct probes below. This keeps them sensitive to extraction
+  # drift without confusing a challenge on one famous fixed ID for global
+  # breakage.
+  IFS=$'\t' read -r reachable _ <<<"${output}"
 else
   fail "search: the probe exited non-zero"
+  report_stderr
+fi
+
+echo "==> Resolving a single video"
+if [[ -z "${reachable:-}" ]]; then
+  fail "inspect: the search named nothing to inspect"
+elif output="$(run_probe youtube-inspect "https://www.youtube.com/watch?v=${reachable}")"; then
+  check_track_lines inspect "${output}" 1
+else
+  fail "inspect: the probe exited non-zero"
   report_stderr
 fi
 
@@ -137,10 +146,6 @@ if output="$(run_probe youtube-playlist "${PROBE_PLAYLIST}")"; then
     fail "playlist: no summary line, got '${summary}'"
   fi
   check_track_lines playlist "$(tail -n +2 <<<"${output}")" 2
-  # Whatever the playlist named first, to fetch below. Taken from here rather
-  # than hard-coded so there is one less identifier to go stale, and because a
-  # conference talk is comfortably longer than the bar a fetch has to clear.
-  reachable="$(tail -n +2 <<<"${output}" | head -n 1 | cut -f1)"
 else
   fail "playlist: the probe exited non-zero"
   report_stderr
@@ -148,7 +153,7 @@ fi
 
 echo "==> Fetching the start of a track"
 if [[ -z "${reachable:-}" ]]; then
-  fail "fetch: the playlist named nothing to fetch"
+  fail "fetch: the search named nothing to fetch"
 elif output="$(run_probe youtube-fetch "https://www.youtube.com/watch?v=${reachable}")"; then
   check_reach fetch "${output}"
 else
