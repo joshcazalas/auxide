@@ -20,8 +20,7 @@ jobs:
       contents: read
 
     steps:
-      # Gitleaks walks every reachable commit, so this job needs the history
-      # the other two do not.
+      # Gitleaks walks every reachable commit.
       - name: Check out the complete history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -69,7 +68,31 @@ jobs:
         run: nix develop --command ./scripts/check.sh rust
 
   nix:
-    name: Build every declared check
+    name: Evaluate and check Nix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Evaluate every output and require complete CI check coverage
+        run: |
+          nix flake check --no-build
+          ./scripts/build-ci-check-group.sh validate
+
+      - name: Build module and credential helper checks
+        run: ./scripts/build-ci-check-group.sh nix
+
+  container:
+    name: Build and test container
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -85,8 +108,6 @@ jobs:
         uses: wimpysworld/nothing-but-nix@687c797a730352432950c707ab493fcc951818d7 # v10
         with:
           hatchet-protocol: holster
-          # This job builds the release binary and a layered OCI image, so keep
-          # the same scratch reservation the combined job used.
           mnt-safe-haven: "12288"
 
       - name: Install Nix
@@ -98,21 +119,64 @@ jobs:
       - name: Cache the Auxide package
         uses: ./.github/actions/cache-auxide
 
-      - name: Evaluate and build every declared check
+      - name: Build the package and OCI image
         run: |
-          nix flake check --print-build-logs
+          ./scripts/build-ci-check-group.sh container
           nix build --out-link "${RUNNER_TEMP}/auxide-cache-root" .#auxide
 
+      - name: Test container startup with networking disabled
+        run: |
+          image="$(nix build --no-link --print-out-paths .#oci-image)"
+          nix develop .#container-test --command ./scripts/test-container.sh "${image}"
+
+  nixos:
+    name: Test NixOS service
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Test credentials, service startup, restart, and shutdown
+        run: ./scripts/build-ci-check-group.sh nixos
+
+  release_helpers:
+    name: Test release helpers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+
+      - name: Test artifact creation and publication using fake external tools
+        run: ./scripts/build-ci-check-group.sh release
+
   validate:
-    # Branch protection requires a check named "Validate". Keeping that name on
-    # a job that only aggregates the three real ones lets them run in parallel
-    # without repointing the protection rule, and keeps that rule correct if the
-    # set of jobs changes again.
+    # Branch protection requires this aggregate check name.
     name: Validate
     needs:
       - lint
       - rust
       - nix
+      - container
+      - nixos
+      - release_helpers
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

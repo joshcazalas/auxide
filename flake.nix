@@ -207,6 +207,29 @@
               WorkingDir = "/";
             };
           };
+
+          nixos-service = import ./nix/tests/service.nix {
+            inherit pkgs;
+            module = self.nixosModules.default;
+          };
+
+          release-helpers =
+            pkgs.runCommand "auxide-release-helper-tests"
+              {
+                nativeBuildInputs = [
+                  pkgs.bash
+                  pkgs.coreutils
+                  pkgs.findutils
+                  pkgs.git
+                  pkgs.jq
+                  pkgs.python3
+                ];
+              }
+              ''
+                python3 ${./nix/tests/release-helpers.py} \
+                  ${./scripts/build-release-artifacts.sh} ${./scripts/publish-release.sh}
+                touch "$out"
+              '';
         in
         {
           packages = {
@@ -225,40 +248,52 @@
               auxide
               module-evaluation
               oci-image
+              nixos-service
+              release-helpers
               ;
           };
 
-          devShells.default = pkgs.mkShell {
-            packages = [
-              pkgs.cargo
-              pkgs.clippy
-              pkgs.gitleaks
-              pkgs.actionlint
-              pkgs.deadnix
-              pkgs.deno
-              pkgs.ffmpeg-headless
-              pkgs.libopus
-              pkgs.pkg-config
-              pkgs.rustc
-              pkgs.rustfmt
-              pkgs.shellcheck
-              pkgs.statix
-              # The same yt-dlp the bot runs, plugin and all. Without it the
-              # daily probe cannot ask for a proof-of-origin token, so it would
-              # be checking a configuration nothing ships.
-              yt-dlp-with-pot
-            ];
+          devShells = {
+            default = pkgs.mkShell {
+              packages = [
+                pkgs.cargo
+                pkgs.clippy
+                pkgs.gitleaks
+                pkgs.actionlint
+                pkgs.deadnix
+                pkgs.deno
+                pkgs.ffmpeg-headless
+                pkgs.libopus
+                pkgs.pkg-config
+                pkgs.rustc
+                pkgs.rustfmt
+                pkgs.shellcheck
+                pkgs.statix
+                # The same yt-dlp the bot runs, plugin and all. Without it the
+                # daily probe cannot ask for a proof-of-origin token, so it would
+                # be checking a configuration nothing ships.
+                yt-dlp-with-pot
+              ];
 
-            RUST_BACKTRACE = "1";
-          };
+              RUST_BACKTRACE = "1";
+            };
 
-          devShells.release = pkgs.mkShell {
-            packages = [
-              pkgs.gh
-              pkgs.jq
-              pkgs.sbomnix
-              pkgs.skopeo
-            ];
+            release = pkgs.mkShell {
+              packages = [
+                pkgs.gh
+                pkgs.jq
+                pkgs.sbomnix
+                pkgs.skopeo
+              ];
+            };
+
+            container-test = pkgs.mkShell {
+              packages = [
+                pkgs.docker-client
+                pkgs.jq
+                pkgs.skopeo
+              ];
+            };
           };
 
           formatter = pkgs.nixfmt-tree;
