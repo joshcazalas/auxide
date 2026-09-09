@@ -34,7 +34,13 @@ readonly PROBE_SEARCH="rick astley never gonna give you up"
 # smallest thing that would have failed.
 readonly MUST_REACH=$((1536 * 1024))
 
-auxide=(cargo run --quiet -- --config "${AUXIDE_CONFIG:-config.toml}")
+# CI supplies the cached, wrapped Nix executable. Local development continues
+# to use Cargo unless an operator explicitly selects an installed binary.
+if [[ -n "${AUXIDE_BIN:-}" ]]; then
+  auxide=("${AUXIDE_BIN}" --config "${AUXIDE_CONFIG:-config.toml}")
+else
+  auxide=(cargo run --locked --quiet -- --config "${AUXIDE_CONFIG:-config.toml}")
+fi
 failures=0
 
 fail() {

@@ -25,8 +25,6 @@ jobs:
     name: Ask YouTube for real answers
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      CARGO_INCREMENTAL: "0"
     permissions:
       contents: read
       issues: write
@@ -57,6 +55,18 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: |
+            build-dir = /nix/build
+
+      - name: Cache the Auxide package
+        uses: ./.github/actions/cache-auxide
+
+      # Probe the same wrapped release binary that is shipped. A warm cache
+      # eliminates the daily Cargo build; a miss still builds the exact source.
+      # Keep build failures separate from the extraction-drift issue condition.
+      - name: Build and retain the packaged probe
+        run: nix build --out-link "${RUNNER_TEMP}/auxide-cache-root" .#auxide
 
       # The probes never read this — only the Discord commands load the token —
       # but configuration is parsed and validated before any subcommand runs.
@@ -71,8 +81,8 @@ jobs:
         id: probe
         env:
           AUXIDE_CONFIG: probe-config.toml
-          CARGO_TARGET_DIR: ${{ runner.temp }}/auxide-cargo-target
-        run: nix develop --command ./scripts/source-check.sh
+          AUXIDE_BIN: ${{ runner.temp }}/auxide-cache-root/bin/auxide
+        run: ./scripts/source-check.sh
 
       # One open issue at a time. A daily job that filed a new one every morning
       # would bury the first report, which is the one with the useful timestamp.
