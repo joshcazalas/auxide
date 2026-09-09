@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult, SeekFrom},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Read, Result as IoResult, Seek, SeekFrom},
     pin::Pin,
     sync::Arc,
     task::{Context as TaskContext, Poll},
@@ -10,20 +10,22 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, stream};
+use futures_util::{Stream, StreamExt as _, stream};
 use reqwest::{
     Client as HttpClient, StatusCode,
     header::{CONTENT_RANGE, HeaderMap, HeaderName, HeaderValue, RANGE},
 };
 use songbird::input::{
     AsyncAdapterStream, AsyncMediaSource, AudioStream, AudioStreamError, Compose, HlsRequest,
-    Input, core::io::MediaSource,
+    Input, LiveInput,
+    codecs::{get_codec_registry, get_probe},
+    core::io::MediaSource,
 };
 use tokio::{
     io::{AsyncRead, AsyncSeek, ReadBuf},
     time,
 };
-use tokio_util::io::StreamReader;
+use tokio_util::{io::StreamReader, sync::CancellationToken};
 
 use crate::source::{SourceResolver, TrackMetadata};
 
@@ -72,6 +74,12 @@ const RETRY_BACKOFF: Duration = Duration::from_secs(1);
 /// roughly a minute of Opus.
 const READ_AHEAD: usize = 1024 * 1024;
 
+/// Includes resolution, fetching the headers, and opening the decoder.
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A diagnostic reads at network speed, with no Discord connection or clocked playback.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How many times one stream may resolve a fresh media URL before giving up.
 ///
 /// A signed URL can be refused from the moment it is issued, and asking the
@@ -117,9 +125,9 @@ impl AudioPipeline {
     pub fn new(resolver: Arc<dyn SourceResolver>, output_volume: f32) -> Result<Self> {
         let http = HttpClient::builder()
             .connect_timeout(Duration::from_secs(10))
-            // No read timeout here: reqwest resets that timer per frame, which
-            // says nothing about whether a chunk as a whole is making progress.
-            // [`CHUNK_TIMEOUT`] bounds the entire request instead.
+            // Also bounds reads made by Songbird's HLS input. Ranged requests
+            // have an additional deadline covering the entire chunk.
+            .read_timeout(CHUNK_TIMEOUT)
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 let target = attempt.url();
                 if attempt.previous().len() >= 5 {
@@ -149,31 +157,95 @@ impl AudioPipeline {
         self.output_volume
     }
 
-    /// Resolves a queued track and creates its streaming input.
+    /// Resolves a queued track and opens its container and decoder before playback.
     ///
     /// # Errors
     ///
     /// Returns an error when the source cannot be refreshed, supplies invalid headers, or selects
-    /// a protocol outside Auxide's allowlist.
+    /// a protocol outside Auxide's allowlist, or the audio cannot be parsed in time.
     pub async fn prepare(&self, track: &TrackMetadata) -> Result<Input> {
+        let cancellation = CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
+        let input = self.prepare_bounded(track, cancellation).await?;
+        // A successful input belongs to playback now. A skipped or timed-out
+        // preparation instead cancels its network reads, including the ones
+        // owned by the blocking parser task.
+        guard.disarm();
+        Ok(input)
+    }
+
+    async fn prepare_bounded(
+        &self,
+        track: &TrackMetadata,
+        cancellation: CancellationToken,
+    ) -> Result<Input> {
+        time::timeout(PREPARE_TIMEOUT, self.prepare_input(track, cancellation))
+            .await
+            .context("audio preparation timed out")?
+    }
+
+    async fn prepare_input(
+        &self,
+        track: &TrackMetadata,
+        cancellation: CancellationToken,
+    ) -> Result<Input> {
         let audio = self.resolver.resolve(track).await?;
         let headers = convert_headers(&audio.headers)?;
-        match audio.protocol.as_deref() {
-            None | Some("https") => Ok(Input::Lazy(Box::new(ChunkedHttpRequest {
+        let input = match audio.protocol.as_deref() {
+            None | Some("https") => Input::Lazy(Box::new(ChunkedHttpRequest {
                 client: self.http.clone(),
                 resolver: Arc::clone(&self.resolver),
                 track: track.clone(),
                 url: audio.stream_url.to_string(),
                 headers,
-            }))),
-            Some("m3u8" | "m3u8_native") => Ok(HlsRequest::new_with_headers(
+                cancellation: cancellation.clone(),
+            })),
+            Some("m3u8" | "m3u8_native") => HlsRequest::new_with_headers(
                 self.http.clone(),
                 audio.stream_url.to_string(),
                 headers,
             )
-            .into()),
+            .into(),
             Some(protocol) => bail!("source selected unsupported media protocol {protocol:?}"),
+        };
+        let Input::Live(LiveInput::Raw(stream), recipe) = input.make_live_async().await? else {
+            bail!("audio source did not provide a raw stream");
+        };
+        let input = Input::Live(
+            LiveInput::Raw(AudioStream {
+                input: Box::new(SequentialInput {
+                    inner: stream.input,
+                    cancellation,
+                }),
+            }),
+            recipe,
+        );
+        input
+            .make_playable_async(get_codec_registry(), get_probe())
+            .await
+            .context("failed to open audio stream")
+    }
+
+    /// Fetches, parses, and decodes a bounded sample through the playback pipeline.
+    ///
+    /// No Discord token, gateway, voice connection, or audio output is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero packet limit, unplayable audio, or a timeout.
+    pub async fn probe(&self, track: &TrackMetadata, packets: u32) -> Result<AudioProbe> {
+        if packets == 0 {
+            bail!("the audio probe needs at least one packet");
         }
+        let cancellation = CancellationToken::new();
+        let _guard = cancellation.clone().drop_guard();
+        let input = self.prepare_bounded(track, cancellation.clone()).await?;
+        let decoding =
+            tokio::task::spawn_blocking(move || decode_sample(input, packets, &cancellation));
+        time::timeout(PROBE_TIMEOUT, decoding)
+            .await
+            .context("audio probe timed out")?
+            .context("audio probe task failed")?
     }
 
     /// Reads the first `wanted` bytes of a track, through the real media path.
@@ -208,9 +280,10 @@ impl AudioPipeline {
             track: track.clone(),
             url: audio.stream_url.to_string(),
             headers,
+            cancellation: CancellationToken::new(),
         };
         let total = request.probe_length().await;
-        let mut stream = request.open(0, total);
+        let mut stream = request.open(0);
         let mut fetched = 0;
         let mut buffer = vec![0_u8; 64 * 1024];
         while fetched < wanted {
@@ -222,6 +295,86 @@ impl AudioPipeline {
         }
         Ok(MediaReach { fetched, total })
     }
+}
+
+/// How much audio a diagnostic actually decoded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioProbe {
+    pub packets: u32,
+    pub frames: u64,
+    pub reached_end: bool,
+}
+
+/// Also checks cancellation during parsing HLS inputs, whose network reads are
+/// owned by Songbird. The client's read timeout bounds an in-flight HLS read.
+struct SequentialInput {
+    inner: Box<dyn MediaSource>,
+    cancellation: CancellationToken,
+}
+
+impl Read for SequentialInput {
+    fn read(&mut self, buffer: &mut [u8]) -> IoResult<usize> {
+        if self.cancellation.is_cancelled() {
+            return Err(IoErrorKind::ConnectionAborted.into());
+        }
+        self.inner.read(buffer)
+    }
+}
+
+impl Seek for SequentialInput {
+    fn seek(&mut self, _position: SeekFrom) -> IoResult<u64> {
+        Err(IoErrorKind::Unsupported.into())
+    }
+}
+
+impl MediaSource for SequentialInput {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+    fn byte_len(&self) -> Option<u64> {
+        None
+    }
+}
+
+fn decode_sample(
+    mut input: Input,
+    wanted: u32,
+    cancellation: &CancellationToken,
+) -> Result<AudioProbe> {
+    let parsed = input.parsed_mut().context("audio was not prepared")?;
+    let mut probe = AudioProbe {
+        packets: 0,
+        frames: 0,
+        reached_end: false,
+    };
+    while probe.packets < wanted {
+        if cancellation.is_cancelled() {
+            bail!("audio probe was cancelled");
+        }
+        let packet = match parsed.format.next_packet() {
+            Ok(packet) => packet,
+            Err(symphonia::core::errors::Error::IoError(error))
+                if error.kind() == IoErrorKind::UnexpectedEof =>
+            {
+                probe.reached_end = true;
+                break;
+            }
+            Err(error) => return Err(error).context("failed to read an audio packet"),
+        };
+        if packet.track_id() != parsed.track_id {
+            continue;
+        }
+        let decoded = parsed
+            .decoder
+            .decode(&packet)
+            .context("failed to decode an audio packet")?;
+        probe.frames += decoded.frames() as u64;
+        probe.packets += 1;
+    }
+    if probe.frames == 0 {
+        bail!("the stream produced no decoded audio");
+    }
+    Ok(probe)
 }
 
 /// What a media probe managed to get, and how much there was to get.
@@ -252,6 +405,7 @@ struct ChunkedHttpRequest {
     track: TrackMetadata,
     url: String,
     headers: HeaderMap,
+    cancellation: CancellationToken,
 }
 
 impl std::fmt::Debug for ChunkedHttpRequest {
@@ -330,6 +484,7 @@ impl ChunkedHttpRequest {
                 }
             }
         })
+        .take_until(self.cancellation.clone().cancelled_owned())
     }
 
     /// Fetches one chunk, giving the URL in hand a few spaced attempts first.
@@ -388,7 +543,9 @@ impl ChunkedHttpRequest {
             .send();
 
         let chunk = async {
-            let response = sent.await.map_err(IoError::other)?;
+            let response = sent
+                .await
+                .map_err(|error| IoError::other(error.without_url()))?;
             let status = response.status();
             // Past the end of the resource is not a failure, just the end.
             if status == StatusCode::RANGE_NOT_SATISFIABLE {
@@ -408,7 +565,10 @@ impl ChunkedHttpRequest {
                 ));
             }
             let total = content_range_total(response.headers());
-            let bytes = response.bytes().await.map_err(IoError::other)?;
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| IoError::other(error.without_url()))?;
             tracing::debug!(
                 position,
                 last,
@@ -439,27 +599,17 @@ impl ChunkedHttpRequest {
     /// worse than useless: a one-byte range is accepted even by a URL that
     /// refuses every real chunk, so it reported success and left the failure to
     /// surface later as a container that would not parse.
-    fn open(&self, offset: u64, total: Option<u64>) -> ChunkedHttpStream {
+    fn open(&self, offset: u64) -> ChunkedHttpStream {
         ChunkedHttpStream {
             stream: Box::pin(StreamReader::new(self.body(offset))),
             request: self.clone(),
             start: offset,
-            position: offset,
-            total,
-            pending_seek: None,
             refreshes: 0,
         }
     }
 
-    /// Asks the origin how long the resource is, before reading any of it.
-    ///
-    /// One byte is enough: a ranged response states the total in its
-    /// `Content-Range` regardless of how little was asked for. An origin that
-    /// answers `200` ignored the range and is telling us it cannot serve parts
-    /// of the file, which is the same thing as saying it cannot be seeked in.
-    ///
-    /// Returning `None` is not a failure. It costs seeking and nothing else,
-    /// which is exactly the behaviour every version before this one had.
+    /// Asks the origin for the resource length for the byte-fetch diagnostic.
+    /// Playback learns this from its first chunk and does not make a length probe.
     async fn probe_length(&self) -> Option<u64> {
         let response = self
             .client
@@ -471,12 +621,12 @@ impl ChunkedHttpRequest {
             .await
             .ok()?;
         if response.status() != StatusCode::PARTIAL_CONTENT {
-            tracing::debug!(status = %response.status(), "origin ignored a range request; seeking is off");
+            tracing::debug!(status = %response.status(), "origin ignored the length probe");
             return None;
         }
         let total = content_range_total(response.headers());
         if total.is_none() {
-            tracing::debug!("origin stated no length; seeking is off");
+            tracing::debug!("origin stated no length");
         }
         total
     }
@@ -510,16 +660,6 @@ struct ChunkedHttpStream {
     request: ChunkedHttpRequest,
     /// Offset in the resource this stream was opened at.
     start: u64,
-    /// Where reading has reached, counted from the start of the resource.
-    position: u64,
-    /// The resource's length, when the origin was willing to state one.
-    ///
-    /// Its presence is what makes the stream seekable: Symphonia turns a
-    /// timestamp into a byte offset, and it cannot do that without knowing how
-    /// many bytes there are.
-    total: Option<u64>,
-    /// Where a seek asked to go, until [`AsyncSeek::poll_complete`] takes it.
-    pending_seek: Option<u64>,
     refreshes: u32,
 }
 
@@ -529,88 +669,31 @@ impl AsyncRead for ChunkedHttpStream {
         context: &mut TaskContext<'_>,
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<IoResult<()>> {
-        let before = buffer.filled().len();
-        let polled = AsyncRead::poll_read(self.stream.as_mut(), context, buffer);
-        if polled.is_ready() {
-            let read = buffer.filled().len().saturating_sub(before) as u64;
-            self.position = self.position.saturating_add(read);
-        }
-        polled
+        AsyncRead::poll_read(self.stream.as_mut(), context, buffer)
     }
 }
 
 impl AsyncSeek for ChunkedHttpStream {
-    fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> IoResult<()> {
-        let target = match position {
-            SeekFrom::Start(offset) => offset,
-            SeekFrom::Current(delta) => offset_by(self.position, delta)?,
-            SeekFrom::End(delta) => {
-                let total = self
-                    .total
-                    .ok_or_else(|| IoError::from(IoErrorKind::Unsupported))?;
-                offset_by(total, delta)?
-            }
-        };
-        if let Some(total) = self.total {
-            if target > total {
-                return Err(IoError::new(
-                    IoErrorKind::InvalidInput,
-                    "seek past the end of the media",
-                ));
-            }
-        }
-        self.pending_seek = Some(target);
-        Ok(())
+    fn start_seek(self: Pin<&mut Self>, _position: SeekFrom) -> IoResult<()> {
+        Err(IoErrorKind::Unsupported.into())
     }
 
-    /// Reopens the resource at the requested offset.
-    ///
-    /// Nothing is fetched here: the body is a lazy stream of ranged requests,
-    /// so replacing it costs only the request the next read will make. That is
-    /// what lets a seek complete synchronously.
-    fn poll_complete(
-        mut self: Pin<&mut Self>,
-        _context: &mut TaskContext<'_>,
-    ) -> Poll<IoResult<u64>> {
-        if let Some(target) = self.pending_seek.take() {
-            self.stream = Box::pin(StreamReader::new(self.request.body(target)));
-            self.position = target;
-            // A seek is not a stream that faltered, so what it delivers from
-            // here counts as progress from here rather than from wherever the
-            // stream happened to open.
-            self.start = target;
-        }
-        Poll::Ready(Ok(self.position))
+    fn poll_complete(self: Pin<&mut Self>, _context: &mut TaskContext<'_>) -> Poll<IoResult<u64>> {
+        Poll::Ready(Err(IoErrorKind::Unsupported.into()))
     }
-}
-
-/// Applies a signed delta to an offset, refusing to go before the start.
-fn offset_by(from: u64, delta: i64) -> IoResult<u64> {
-    let target = i64::try_from(from)
-        .ok()
-        .and_then(|from| from.checked_add(delta))
-        .ok_or_else(|| IoError::new(IoErrorKind::InvalidInput, "seek offset overflowed"))?;
-    u64::try_from(target).map_err(|_| {
-        IoError::new(
-            IoErrorKind::InvalidInput,
-            "seek before the start of the media",
-        )
-    })
 }
 
 #[async_trait]
 impl AsyncMediaSource for ChunkedHttpStream {
-    /// Reports whether the origin gave enough to seek within.
-    ///
-    /// Read once when the stream is adapted rather than per seek, so it has to
-    /// be right before anything has been read — which is why the length is
-    /// probed when the request is created rather than learned on the way past.
+    // Songbird 0.6 retains pending read-ahead bytes across a seek. Symphonia
+    // can seek while opening a WebM, even without a user seek command, and then
+    // parse bytes from the wrong position. Network inputs are sequential only.
     fn is_seekable(&self) -> bool {
-        self.total.is_some()
+        false
     }
 
     async fn byte_len(&self) -> Option<u64> {
-        self.total
+        None
     }
 
     /// Continues the track after a read error, on a freshly resolved URL.
@@ -621,6 +704,19 @@ impl AsyncMediaSource for ChunkedHttpStream {
     /// URL rather than as an unplayable track. Songbird calls this on any read
     /// error, which is what makes it the right place to do it.
     async fn try_resume(
+        &mut self,
+        offset: u64,
+    ) -> Result<Box<dyn AsyncMediaSource>, AudioStreamError> {
+        let cancellation = self.request.cancellation.clone();
+        cancellation
+            .run_until_cancelled(self.resume_at(offset))
+            .await
+            .unwrap_or(Err(AudioStreamError::Unsupported))
+    }
+}
+
+impl ChunkedHttpStream {
+    async fn resume_at(
         &mut self,
         offset: u64,
     ) -> Result<Box<dyn AsyncMediaSource>, AudioStreamError> {
@@ -664,7 +760,7 @@ impl AsyncMediaSource for ChunkedHttpStream {
         request.url = audio.stream_url.to_string();
         request.headers = convert_headers(&audio.headers)
             .map_err(|error| AudioStreamError::Fail(error.into()))?;
-        let mut resumed = request.open(offset, self.total);
+        let mut resumed = request.open(offset);
         resumed.refreshes = refreshes;
         Ok(Box::new(resumed) as Box<dyn AsyncMediaSource>)
     }
@@ -679,10 +775,7 @@ impl Compose for ChunkedHttpRequest {
     async fn create_async(
         &mut self,
     ) -> Result<AudioStream<Box<dyn MediaSource>>, AudioStreamError> {
-        // Asked for before the stream is adapted, because the adapter reads
-        // seekability once and keeps the answer.
-        let total = self.probe_length().await;
-        let stream = self.open(0, total);
+        let stream = self.open(0);
         Ok(AudioStream {
             input: Box::new(AsyncAdapterStream::new(Box::new(stream), READ_AHEAD))
                 as Box<dyn MediaSource>,
@@ -808,6 +901,47 @@ mod tests {
     /// Stands in for the source, and fails the test if a stream reaches for it.
     struct UnusedResolver;
 
+    struct StaticResolver {
+        url: Url,
+    }
+
+    #[async_trait]
+    impl SourceResolver for StaticResolver {
+        async fn search(&self, _query: &str) -> Result<Vec<TrackMetadata>, SourceError> {
+            Err(SourceError::Disabled)
+        }
+        async fn inspect(&self, _url: &Url) -> Result<TrackMetadata, SourceError> {
+            Err(SourceError::Disabled)
+        }
+        async fn resolve(&self, track: &TrackMetadata) -> Result<ResolvedAudio, SourceError> {
+            Ok(ResolvedAudio {
+                metadata: track.clone(),
+                stream_url: self.url.clone(),
+                headers: BTreeMap::new(),
+                protocol: Some("https".to_owned()),
+            })
+        }
+        fn accepts(&self, _url: &Url) -> Result<(), SourceError> {
+            Ok(())
+        }
+        async fn playlist(
+            &self,
+            _url: &Url,
+        ) -> Result<Option<crate::source::Playlist>, SourceError> {
+            Err(SourceError::Disabled)
+        }
+    }
+
+    fn pipeline(url: &str) -> AudioPipeline {
+        AudioPipeline::new(
+            Arc::new(StaticResolver {
+                url: Url::parse(url).unwrap(),
+            }),
+            0.5,
+        )
+        .unwrap()
+    }
+
     #[async_trait]
     impl SourceResolver for UnusedResolver {
         async fn search(&self, _query: &str) -> Result<Vec<TrackMetadata>, SourceError> {
@@ -844,6 +978,7 @@ mod tests {
             },
             url: url.to_owned(),
             headers: HeaderMap::new(),
+            cancellation: CancellationToken::new(),
         }
     }
 
@@ -887,71 +1022,147 @@ mod tests {
     async fn play(request: &ChunkedHttpRequest) -> Vec<u8> {
         let mut played = Vec::new();
         request
-            .open(0, None)
+            .open(0)
             .read_to_end(&mut played)
             .await
             .expect("the stream must reach the end of the resource");
         played
     }
 
-    /// Seeking hangs entirely on whether the origin will state a length, and
-    /// the answer is read once before anything is played — so getting it wrong
-    /// is silent in both directions.
     #[tokio::test]
-    async fn a_stated_length_is_what_makes_a_stream_seekable() {
+    async fn a_known_length_never_enables_seeking() {
         let body = media(8192);
         let origin = origin(Arc::clone(&body), vec![Reply::Full; 2]).await;
         let request = request(&origin.url);
-
-        let total = request.probe_length().await;
-        assert_eq!(total, Some(8192));
-        let stream = request.open(0, total);
-        assert!(stream.is_seekable());
-        assert_eq!(stream.byte_len().await, Some(8192));
-
-        // A probe costs one request, and it asks for a single byte rather than
-        // pulling the resource down to find out how long it is.
-        assert_eq!(origin.ranges.lock().unwrap()[0], (0, 0));
-    }
-
-    /// An origin that ignores ranges is telling us it cannot serve parts of the
-    /// file, which is the same thing as saying it cannot be seeked in.
-    #[tokio::test]
-    async fn an_origin_that_ignores_ranges_is_not_seekable() {
-        let body = media(4096);
-        let origin = origin_ignoring_ranges(Arc::clone(&body)).await;
-        let request = request(&origin.url);
-
-        assert_eq!(request.probe_length().await, None);
-        let stream = request.open(0, None);
+        assert_eq!(request.probe_length().await, Some(8192));
+        let mut stream = request.open(0);
         assert!(!stream.is_seekable());
-        assert_eq!(stream.byte_len().await, None);
+        for position in [SeekFrom::Start(0), SeekFrom::Current(0), SeekFrom::End(-1)] {
+            assert_eq!(
+                stream.seek(position).await.unwrap_err().kind(),
+                IoErrorKind::Unsupported
+            );
+        }
+        let mut actual = Vec::new();
+        stream.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, *body, "refusing a seek must not disturb the stream");
+        assert_eq!(
+            *origin.ranges.lock().unwrap(),
+            [(0, 0), (0, CHUNK_SPAN - 1)]
+        );
     }
 
     #[tokio::test]
-    async fn seeking_reopens_the_resource_where_it_was_asked_to() {
-        let body = media(8192);
-        let origin = origin(Arc::clone(&body), vec![Reply::Full; 4]).await;
-        let request = request(&origin.url);
-        let mut stream = request.open(0, Some(8192));
+    async fn the_songbird_adapter_preserves_bytes_across_multiple_chunks() {
+        let body = media(2 * READ_AHEAD + 4096);
+        let origin = origin(Arc::clone(&body), vec![Reply::Full; 3]).await;
+        let mut input = request(&origin.url).create_async().await.unwrap().input;
+        assert!(!input.is_seekable());
+        let actual = tokio::task::spawn_blocking(move || {
+            assert_eq!(
+                input.seek(SeekFrom::Start(0)).unwrap_err().kind(),
+                IoErrorKind::Unsupported
+            );
+            let mut bytes = Vec::new();
+            input.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+        .await
+        .unwrap();
+        assert_eq!(actual, *body);
+    }
 
-        let mut opening = vec![0_u8; 16];
-        stream.read_exact(&mut opening).await.unwrap();
-        assert_eq!(opening, body[..16]);
+    #[tokio::test]
+    async fn network_audio_opens_and_decodes_without_seeking() {
+        let fixtures: [&[u8]; 3] = [
+            include_bytes!("../tests/fixtures/tone.webm"),
+            include_bytes!("../tests/fixtures/tone.m4a"),
+            include_bytes!("../tests/fixtures/tone-fragmented.m4a"),
+        ];
+        for fixture in fixtures {
+            let origin = origin(Arc::new(fixture.to_vec()), vec![Reply::Full; 2]).await;
+            let probe = pipeline(&origin.url)
+                .probe(&request(&origin.url).track, 250)
+                .await
+                .unwrap();
+            assert!(probe.packets > 0);
+            assert!(
+                probe.frames >= 10_000,
+                "a quarter-second tone must actually decode"
+            );
+            assert!(probe.reached_end);
+            assert_eq!(
+                *origin.ranges.lock().unwrap(),
+                [(0, CHUNK_SPAN - 1)],
+                "no length probe or container seeks"
+            );
+        }
+    }
 
-        // Nothing is fetched by the seek itself; the request it needs is made
-        // by the read that follows it.
-        let landed = stream.seek(SeekFrom::Start(4096)).await.unwrap();
-        assert_eq!(landed, 4096);
-        let mut after = vec![0_u8; 16];
-        stream.read_exact(&mut after).await.unwrap();
-        assert_eq!(after, body[4096..4112]);
+    #[tokio::test]
+    async fn an_origin_ignoring_ranges_still_plays_sequentially() {
+        let body = Arc::new(include_bytes!("../tests/fixtures/tone.webm").to_vec());
+        let origin = origin_ignoring_ranges(body).await;
+        let probe = pipeline(&origin.url)
+            .probe(&request(&origin.url).track, 250)
+            .await
+            .unwrap();
+        assert!(probe.frames >= 10_000);
+        assert!(probe.reached_end);
+    }
 
-        // Relative seeks count from where reading has actually reached.
-        assert_eq!(stream.seek(SeekFrom::Current(-112)).await.unwrap(), 4000);
-        assert_eq!(stream.seek(SeekFrom::End(-96)).await.unwrap(), 8096);
-        assert!(stream.seek(SeekFrom::Start(9000)).await.is_err());
-        assert!(stream.seek(SeekFrom::Current(-99_999)).await.is_err());
+    #[tokio::test]
+    async fn malformed_audio_is_rejected_during_preparation() {
+        let origin = origin(
+            Arc::new(b"not an audio container".to_vec()),
+            vec![Reply::Full; 2],
+        )
+        .await;
+        let error = pipeline(&origin.url)
+            .prepare(&request(&origin.url).track)
+            .await
+            .err()
+            .expect("malformed audio was accepted");
+        assert!(format!("{error:#}").contains("failed to open audio stream"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_preparation_closes_its_pending_network_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/media", listener.local_addr().unwrap());
+        let (requested, request_seen) = tokio::sync::oneshot::channel();
+        let origin = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+            }
+            requested.send(()).unwrap();
+            // Withhold the response. Cancellation must close this connection
+            // instead of leaving the blocking parser waiting for a chunk timeout.
+            socket.read(&mut byte).await.unwrap()
+        });
+        let prepare =
+            tokio::spawn(async move { pipeline(&url).prepare(&request(&url).track).await });
+        time::timeout(Duration::from_secs(2), request_seen)
+            .await
+            .unwrap()
+            .unwrap();
+        prepare.abort();
+        assert!(
+            prepare
+                .await
+                .err()
+                .expect("preparation was not cancelled")
+                .is_cancelled()
+        );
+        let read = time::timeout(Duration::from_secs(2), origin)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(read, 0);
     }
 
     /// The point of chunking at all: a resource larger than one request comes
@@ -1008,7 +1219,7 @@ mod tests {
 
         let mut played = Vec::new();
         let refused = request(&origin.url)
-            .open(0, None)
+            .open(0)
             .read_to_end(&mut played)
             .await
             .expect_err("a refused chunk must reach the reader as an error");

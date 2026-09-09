@@ -11,7 +11,6 @@ The production path now includes:
   that is not there;
 - vote-to-skip for the current track, and bulk removal of waiting ones by position or requester;
 - a bounded history of what already played, and a queue that survives a restart as a file;
-- seeking within a track — built, but withdrawn while it can take the process down;
 - search suggestions while typing `/play`, answered from memory so a keystroke never waits;
 - channel-visible results for what was queued, skipped, or stopped, with private search
   pickers and private refusals;
@@ -23,6 +22,7 @@ The production path now includes:
 - per-command restriction through Discord's own permission editor, over a host-owned allowlist
   for which servers and people may drive the bot at all;
 - bounded yt-dlp/Deno subprocesses and fresh audio URL resolution before playback;
+- sequential audio streaming with container and decoder validation before playback;
 - Songbird voice joining, playback, reconnect/session handling, and DAVE support;
 - a fifteen-minute hold on an emptied queue, a pause when the room empties that lifts when
   somebody comes back, and coordinated SIGINT/SIGTERM shutdown;
@@ -70,7 +70,12 @@ cargo run -- --config config.toml youtube-inspect \
   'https://www.youtube.com/watch?v=VIDEO_ID'
 cargo run -- --config config.toml youtube-playlist \
   'https://www.youtube.com/playlist?list=PLAYLIST_ID'
+cargo run -- --config config.toml youtube-probe \
+  'https://www.youtube.com/watch?v=VIDEO_ID'
 ```
+
+`youtube-probe` resolves, parses, and decodes up to 250 audio packets without loading a Discord
+token or connecting to Discord. `--packets N` changes the sample size. Seeking is not supported.
 
 ## Runtime model
 

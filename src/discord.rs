@@ -48,7 +48,7 @@ use crate::{
     },
     source::{Playlist, SourceResolver, TrackMetadata, YouTubeResolver},
     suggest::Suggestions,
-    voice::{SeekTo, SongbirdVoice, TrackEnded, VoiceError, VoiceGateway, VoiceGatewayFactory},
+    voice::{SongbirdVoice, TrackEnded, VoiceError, VoiceGateway, VoiceGatewayFactory},
 };
 
 const SEARCH_SELECTION_TTL: Duration = Duration::from_secs(120);
@@ -321,35 +321,12 @@ fn command_definitions() -> Vec<CreateCommand> {
         .chain([
             CreateCommand::new("help").description("What Auxide can do, and who sees each answer")
         ])
-        .filter(|command| {
-            described(command).is_none_or(|(name, _)| !DISABLED_COMMANDS.contains(&name.as_str()))
-        })
         .map(|command| command.dm_permission(false))
         .collect()
 }
 
-/// Commands built but not offered.
-///
-/// Moving the playhead is the one thing Auxide does that reaches into a
-/// half-decoded container rather than into its own state, and it is the only
-/// part that has taken the process down: seeking a `WebM` stream can trip an
-/// assertion inside Symphonia's Matroska reader, on a mixer thread, where a
-/// panic is nobody's to catch. The rest of the failures were milder but the
-/// same shape — a seek landing somewhere the decoder could not resume from,
-/// reported as a track that cannot be seeked in.
-///
-/// So they are withdrawn rather than repaired, for now. A queue that always
-/// plays is worth more than a playhead that sometimes moves, and every one of
-/// these is a convenience nobody had asked for. The handlers, the argument
-/// parsing, and their tests all stay: what is wrong is under them, in how a
-/// seek meets the decoder, and none of that is rediscovered by deleting the
-/// commands that reach it.
-///
-/// Naming them here is the whole switch. Registration filters on it, help is
-/// read back from what registration produced, and dispatch refuses anything
-/// listed — so there is no second place to remember, and re-offering one is
-/// this line and a release.
-const DISABLED_COMMANDS: [&str; 4] = ["seek", "forward", "rewind", "restart"];
+/// Retired commands can remain cached by Discord after an upgrade.
+const RETIRED_COMMANDS: [&str; 4] = ["seek", "forward", "rewind", "restart"];
 
 /// How `/help` groups commands, by name.
 ///
@@ -360,18 +337,7 @@ const DISABLED_COMMANDS: [&str; 4] = ["seek", "forward", "rewind", "restart"];
 const HELP_GROUPS: [(&str, &[&str]); 4] = [
     (
         "Playing",
-        &[
-            "play",
-            "now-playing",
-            "skip",
-            "pause",
-            "resume",
-            "volume",
-            "seek",
-            "forward",
-            "rewind",
-            "restart",
-        ],
+        &["play", "now-playing", "skip", "pause", "resume", "volume"],
     ),
     (
         "The queue",
@@ -499,35 +465,6 @@ fn playing_commands() -> Vec<CreateCommand> {
 /// Commands about the queue behind it.
 fn queue_commands() -> Vec<CreateCommand> {
     vec![
-        CreateCommand::new("seek")
-            .description("Move the playhead within the current track")
-            .add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "to",
-                    "Like 90, 2:30 or 1:02:03",
-                )
-                .required(true)
-                .min_length(1)
-                .max_length(16),
-            ),
-        CreateCommand::new("forward")
-            .description("Jump forward within the current track")
-            .add_option(
-                CreateCommandOption::new(CommandOptionType::String, "by", "Like 30 or 2:30")
-                    .required(true)
-                    .min_length(1)
-                    .max_length(16),
-            ),
-        CreateCommand::new("rewind")
-            .description("Jump back within the current track")
-            .add_option(
-                CreateCommandOption::new(CommandOptionType::String, "by", "Like 30 or 2:30")
-                    .required(true)
-                    .min_length(1)
-                    .max_length(16),
-            ),
-        CreateCommand::new("restart").description("Play the current track from the beginning"),
         CreateCommand::new("history")
             .description("Show what has already played, or queue one of them again")
             .add_option(
@@ -659,13 +596,6 @@ struct BotRuntime {
 #[derive(Clone)]
 struct GuildSession {
     player: GuildPlayerHandle,
-    /// Kept beside the player because moving the playhead is not queue state.
-    ///
-    /// Pausing and volume are properties of a session and so belong to the
-    /// actor that owns it. A seek is a one-shot act on the track that is
-    /// playing right now, and its answer — where it actually landed — has to
-    /// come back to the person who asked.
-    voice: Arc<dyn VoiceGateway>,
 }
 
 /// The part of a message that is the same whichever route it takes to Discord.
@@ -886,7 +816,7 @@ impl BotRuntime {
             tasks.push(worker_task);
         }
 
-        let session = GuildSession { player, voice };
+        let session = GuildSession { player };
         sessions.insert(guild_id, session.clone());
         self.observability
             .set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
@@ -1117,10 +1047,9 @@ impl BotRuntime {
         // so a withdrawn one stays clickable for a while after it stops being
         // registered. Refusing here is what makes the withdrawal true straight
         // away, and says so rather than failing somewhere further in.
-        if DISABLED_COMMANDS.contains(&command.data.name.as_str()) {
+        if RETIRED_COMMANDS.contains(&command.data.name.as_str()) {
             bail!(
-                "`/{}` is turned off in this version of Auxide. It could stop playback \
-                 altogether, so it has been withdrawn until that is fixed.",
+                "`/{}` has been removed. Auxide does not support seeking.",
                 command.data.name
             );
         }
@@ -1129,9 +1058,6 @@ impl BotRuntime {
             "play" => self.play(ctx, command, authorization).await,
             "queue" => self.queue(command, authorization).await,
             "clear" => self.clear(ctx, authorization).await,
-            "seek" | "forward" | "rewind" | "restart" => {
-                self.seek(ctx, command, authorization).await
-            }
             "history" => self.history(command, authorization).await,
             "export" => self.export(authorization).await,
             "import" => self.import(ctx, command, authorization).await,
@@ -1374,41 +1300,6 @@ impl BotRuntime {
             &track,
             authorization.user_id,
             Some(position),
-        )))
-    }
-
-    /// Moves the playhead within whatever is playing.
-    async fn seek(
-        &self,
-        ctx: &Context,
-        command: &CommandInteraction,
-        authorization: Authorization,
-    ) -> Result<InteractionReply> {
-        self.require_same_voice(ctx, &authorization).await?;
-        let to = match command.data.name.as_str() {
-            "restart" => SeekTo::Start,
-            "seek" => SeekTo::Position(parse_timestamp(
-                string_option(command, "to").context("a time is required")?,
-            )?),
-            "forward" => SeekTo::Forward(parse_timestamp(
-                string_option(command, "by").context("a duration is required")?,
-            )?),
-            other => {
-                debug_assert_eq!(other, "rewind");
-                SeekTo::Backward(parse_timestamp(
-                    string_option(command, "by").context("a duration is required")?,
-                )?)
-            }
-        };
-
-        // Songbird reports where it settled rather than where it was sent: a
-        // container seeks to a boundary it can resume decoding from, which is
-        // rarely the exact instant that was asked for.
-        let landed = authorization.session.voice.seek(to).await?;
-        Ok(InteractionReply::message(format!(
-            "{} moved the track to {}.",
-            mention(authorization.user_id),
-            format_duration(landed)
         )))
     }
 
@@ -2145,9 +2036,7 @@ fn audience_for(command: &str, argument: Option<&str>) -> Audience {
         // Queueing a whole file does; asking what already played, or saving it,
         // does not.
         "skip" | "stop" | "shuffle" | "repeat" | "pause" | "resume" | "clear" | "remove"
-        | "import" | "seek" | "forward" | "rewind" | "restart" | "join" | "leave" => {
-            Audience::Channel
-        }
+        | "import" | "join" | "leave" => Audience::Channel,
         _ => Audience::Requester,
     }
 }
@@ -2180,36 +2069,6 @@ fn parse_track_range(spec: &str) -> Result<(usize, usize)> {
         bail!("{spec:?} runs backwards");
     }
     Ok((first, last))
-}
-
-/// Reads `90`, `2:30`, or `1:02:03` as the duration it names.
-fn parse_timestamp(spec: &str) -> Result<Duration> {
-    let spec = spec.trim();
-    let mut seconds: u64 = 0;
-    let mut parts = 0;
-    for part in spec.split(':') {
-        let part = part.trim();
-        if part.is_empty() || parts == 3 {
-            bail!("{spec:?} is not a time like 90, 2:30 or 1:02:03");
-        }
-        let value: u64 = part
-            .parse()
-            .with_context(|| format!("{spec:?} is not a time like 90, 2:30 or 1:02:03"))?;
-        // Only the leading field may exceed its base, so 1:90 is a mistake
-        // rather than two and a half minutes.
-        if parts > 0 && value >= 60 {
-            bail!("{spec:?} has more than sixty in a minutes or seconds field");
-        }
-        seconds = seconds
-            .checked_mul(60)
-            .and_then(|seconds| seconds.checked_add(value))
-            .context("that time is too long")?;
-        parts += 1;
-    }
-    if parts == 0 {
-        bail!("a time is required");
-    }
-    Ok(Duration::from_secs(seconds))
 }
 
 /// How many people have to agree before one of them cuts a track short.
@@ -2639,30 +2498,7 @@ async fn start_track(
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            tracing::warn!(
-                %error,
-                guild_id,
-                queue_id = %item.queue_id,
-                source_id = %item.track.source_id,
-                "failed to prepare queued source; advancing"
-            );
-            // Without this the track simply is not there any more, and nothing
-            // in Discord distinguishes a video that went private from a bot
-            // that dropped the request. The reason is bounded and stripped of
-            // line breaks because it comes from a resolver reporting on input
-            // nobody here controls.
-            announcer
-                .announce(
-                    guild_id,
-                    Some(item.response_channel_id),
-                    Announcement::text(format!(
-                        "Skipping **{}** — {}.",
-                        single_line(&item.track.title, 150),
-                        single_line(&error.to_string(), 200)
-                    )),
-                )
-                .await;
-            let _ = player.track_finished(item.queue_id).await;
+            fail_track(guild_id, player, announcer, &item, &error.to_string()).await;
             return StartTrackOutcome::Failed;
         }
     };
@@ -2681,7 +2517,8 @@ async fn start_track(
     let ended = Arc::new(RuntimeTrackFinished {
         player: player.clone(),
         guild_id,
-        queue_id: item.queue_id,
+        item: item.clone(),
+        announcer: announcer.clone(),
     });
     if let Err(error) = voice.play(channel_id, prepared, volume, ended).await {
         // Whether the channel or the track is at fault decides what to do next,
@@ -2700,8 +2537,7 @@ async fn start_track(
             .await;
             return StartTrackOutcome::Failed;
         }
-        tracing::warn!(%error, guild_id, channel_id, "failed to start playback; advancing");
-        let _ = player.track_finished(item.queue_id).await;
+        fail_track(guild_id, player, announcer, &item, &error.to_string()).await;
         return StartTrackOutcome::Failed;
     }
     tracing::info!(
@@ -2710,7 +2546,7 @@ async fn start_track(
         queue_id = %item.queue_id,
         source_id = %item.track.source_id,
         title = %single_line(&item.track.title, 200),
-        "playback started"
+        "playback submitted"
     );
     // A track that started the moment somebody asked for it has already been
     // named, by the reply to the command that asked. Saying it again here put
@@ -2732,17 +2568,59 @@ async fn start_track(
     StartTrackOutcome::Started
 }
 
+/// Applies the failure atomically before reporting it. Late errors from a
+/// skipped track neither advance its replacement nor send a stale notice.
+async fn fail_track(
+    guild_id: u64,
+    player: &GuildPlayerHandle,
+    announcer: &Announcer,
+    item: &QueueItem,
+    error: &str,
+) {
+    let Ok(transition) = player.track_failed(item.queue_id).await else {
+        return;
+    };
+    if matches!(transition.directive, PlaybackDirective::None) {
+        return;
+    }
+    tracing::warn!(
+        error, guild_id, queue_id = %item.queue_id,
+        source_id = %item.track.source_id, "track failed; advancing"
+    );
+    announcer
+        .announce(
+            guild_id,
+            Some(item.response_channel_id),
+            Announcement::text(format!(
+                "Skipping **{}** — {}.",
+                single_line(&item.track.title, 150),
+                single_line(error, 200),
+            )),
+        )
+        .await;
+}
+
 struct RuntimeTrackFinished {
     player: GuildPlayerHandle,
     guild_id: u64,
-    queue_id: Uuid,
+    item: QueueItem,
+    announcer: Announcer,
 }
 
 #[async_trait]
 impl TrackEnded for RuntimeTrackFinished {
-    async fn ended(&self) {
-        if let Err(error) = self.player.track_finished(self.queue_id).await {
-            tracing::debug!(%error, guild_id = self.guild_id, queue_id = %self.queue_id, "track completion arrived after shutdown");
+    async fn ended(&self, result: Result<(), String>) {
+        if let Err(error) = result {
+            fail_track(
+                self.guild_id,
+                &self.player,
+                &self.announcer,
+                &self.item,
+                &error,
+            )
+            .await;
+        } else if let Err(error) = self.player.track_finished(self.item.queue_id).await {
+            tracing::debug!(%error, guild_id = self.guild_id, queue_id = %self.item.queue_id, "track completion arrived after shutdown");
         }
     }
 }
@@ -2962,7 +2840,6 @@ mod playback_tests {
     use url::Url;
 
     use super::{Announcer, playback_worker};
-    use crate::voice::VoiceGateway as _;
     use crate::{
         config::Config,
         observability::ObservabilityState,
@@ -2970,7 +2847,6 @@ mod playback_tests {
         source::TrackMetadata,
         voice::fake::{FakeVoice, VoiceAction},
     };
-    use serenity::http::Http;
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -3016,18 +2892,23 @@ idle_timeout_seconds = 900
         voice: FakeVoice,
         cancellation: CancellationToken,
         worker: tokio::task::JoinHandle<()>,
+        discord: Arc<crate::fake_discord::FakeDiscord>,
     }
 
     impl Session {
-        fn start(idle_timeout: Duration) -> Self {
+        async fn start(idle_timeout: Duration) -> Self {
             let (player, transitions, _actor) =
                 spawn_guild_player(GUILD, 100, 128, 1, idle_timeout, 50);
             let voice = FakeVoice::new();
             let cancellation = CancellationToken::new();
-            // No announcement channel is configured and no request has been
-            // answered, so the announcer stays silent and never reaches Discord.
+            // Every announcement goes to a loopback fake, including failures
+            // which fall back to the queue item's response channel.
+            let discord = crate::fake_discord::FakeDiscord::start().await.unwrap();
             let announcer = Announcer {
-                http: Arc::new(Http::new("not-a-real-token")),
+                http: Arc::new(super::build_http(
+                    "not-a-real-token",
+                    Some(&discord.api_base),
+                )),
                 config: config(),
             };
             let worker = tokio::spawn(playback_worker(
@@ -3044,6 +2925,7 @@ idle_timeout_seconds = 900
                 voice,
                 cancellation,
                 worker,
+                discord,
             }
         }
 
@@ -3063,7 +2945,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_channel_that_refuses_leaves_the_session_holding_nothing() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session.voice.refuse_the_channel();
 
         session
@@ -3094,7 +2976,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_refused_channel_is_not_worked_through_a_whole_queue() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session.voice.refuse_the_channel();
         for id in 1..=3 {
             session
@@ -3126,7 +3008,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_queued_track_reaches_the_voice_channel_at_the_session_level() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3145,7 +3027,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_whole_playlist_produces_one_join_and_one_play() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         let items = (1..=5).map(item).collect::<Vec<_>>();
         let bulk = session
             .player
@@ -3167,16 +3049,11 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_track_that_cannot_be_prepared_is_skipped_rather_than_stalling() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session.voice.refuse("source-1");
         session
             .player
-            .enqueue(item(1), VOICE_CHANNEL)
-            .await
-            .unwrap();
-        session
-            .player
-            .enqueue(item(2), VOICE_CHANNEL)
+            .enqueue_all(vec![item(1), item(2)], VOICE_CHANNEL)
             .await
             .unwrap();
         session.voice.settle(3).await;
@@ -3191,7 +3068,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn holding_and_continuing_reach_the_track_that_is_playing() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3219,7 +3096,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_level_set_mid_session_applies_to_the_next_track_too() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3245,7 +3122,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn an_exhausted_queue_stops_playing_but_keeps_the_channel() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3262,8 +3139,116 @@ idle_timeout_seconds = 900
     }
 
     #[tokio::test]
+    async fn playback_errors_are_announced_once_and_never_repeated() {
+        for mode in [RepeatMode::Single, RepeatMode::All] {
+            let session = Session::start(Duration::from_secs(900)).await;
+            session
+                .player
+                .enqueue_all(vec![item(1), item(2)], VOICE_CHANNEL)
+                .await
+                .unwrap();
+            session.voice.settle(2).await;
+            session.player.set_repeat(mode).await.unwrap();
+            let completion = session.voice.completion().unwrap();
+
+            session
+                .voice
+                .fail_track("malformed stream: unexpected EBML element\n@everyone")
+                .await;
+            session.voice.settle(4).await;
+            let snapshot = session.player.snapshot().await.unwrap();
+            assert_eq!(snapshot.current.unwrap().queue_id, item(2).queue_id);
+            assert!(
+                snapshot.pending.is_empty(),
+                "a failed track must not cycle under repeat all"
+            );
+            assert!(session.player.history().await.unwrap().is_empty());
+            assert_eq!(
+                session.voice.actions()[2..],
+                [VoiceAction::Stopped, played(2, 50)]
+            );
+
+            let requests = session.discord.requests();
+            let notices: Vec<_> = requests
+                .iter()
+                .filter(|request| request.path.ends_with("/channels/99/messages"))
+                .collect();
+            assert_eq!(notices.len(), 1);
+            let notice = &notices[0].body;
+            assert!(
+                notice["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Skipping **Track 1**")
+            );
+            assert!(
+                notice["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unexpected EBML element")
+            );
+            assert!(!notice["content"].as_str().unwrap().contains('\n'));
+            assert_eq!(notice["allowed_mentions"]["parse"], serde_json::json!([]));
+
+            completion.ended(Err("duplicate failure".to_owned())).await;
+            assert_eq!(session.discord.requests().len(), requests.len());
+            session.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_after_skip_does_not_touch_or_announce_the_replacement() {
+        let session = Session::start(Duration::from_secs(900)).await;
+        session
+            .player
+            .enqueue_all(vec![item(1), item(2)], VOICE_CHANNEL)
+            .await
+            .unwrap();
+        session.voice.settle(2).await;
+        let stale = session.voice.completion().unwrap();
+        session.player.skip().await.unwrap();
+        session.voice.settle(4).await;
+        stale.ended(Err("late error".to_owned())).await;
+        assert_eq!(
+            session
+                .player
+                .snapshot()
+                .await
+                .unwrap()
+                .current
+                .unwrap()
+                .queue_id,
+            item(2).queue_id
+        );
+        assert!(session.discord.requests().is_empty());
+        session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn preparation_errors_advance_even_with_repeat_enabled() {
+        for mode in [RepeatMode::Single, RepeatMode::All] {
+            let session = Session::start(Duration::from_secs(900)).await;
+            session.voice.refuse("source-1");
+            session.player.set_repeat(mode).await.unwrap();
+            session
+                .player
+                .enqueue_all(vec![item(1), item(2)], VOICE_CHANNEL)
+                .await
+                .unwrap();
+            time::timeout(Duration::from_secs(2), session.voice.settle(3))
+                .await
+                .unwrap();
+            let snapshot = session.player.snapshot().await.unwrap();
+            assert_eq!(snapshot.current.unwrap().queue_id, item(2).queue_id);
+            assert!(snapshot.pending.is_empty());
+            assert_eq!(session.discord.requests().len(), 1);
+            session.finish().await;
+        }
+    }
+
+    #[tokio::test]
     async fn an_expired_idle_hold_gives_up_the_channel() {
-        let session = Session::start(Duration::from_millis(80));
+        let session = Session::start(Duration::from_millis(80)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3284,7 +3269,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_track_queued_inside_the_idle_window_keeps_the_channel() {
-        let session = Session::start(Duration::from_millis(200));
+        let session = Session::start(Duration::from_millis(200)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3310,7 +3295,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn clearing_the_queue_never_reaches_the_voice_channel() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3343,7 +3328,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn removing_a_waiting_track_never_reaches_the_voice_channel() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         for id in 1..=3 {
             session
                 .player
@@ -3373,7 +3358,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn a_repeating_queue_plays_the_same_track_again() {
-        let session = Session::start(Duration::from_millis(80));
+        let session = Session::start(Duration::from_millis(80)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3396,37 +3381,8 @@ idle_timeout_seconds = 900
     }
 
     #[tokio::test]
-    async fn moving_the_playhead_reaches_the_track_that_is_playing() {
-        use crate::voice::SeekTo;
-
-        let session = Session::start(Duration::from_secs(900));
-        session
-            .player
-            .enqueue(item(1), VOICE_CHANNEL)
-            .await
-            .unwrap();
-        session.voice.settle(2).await;
-
-        // The gateway is asked where to go rather than told an offset, because
-        // only it knows where the playhead currently is.
-        session
-            .voice
-            .seek(SeekTo::Forward(Duration::from_secs(30)))
-            .await
-            .unwrap();
-        session.voice.settle(3).await;
-        assert_eq!(
-            session.voice.actions()[2..],
-            [VoiceAction::Sought(SeekTo::Forward(Duration::from_secs(
-                30
-            )))]
-        );
-        session.finish().await;
-    }
-
-    #[tokio::test]
     async fn an_empty_room_pauses_and_a_return_continues() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3456,7 +3412,7 @@ idle_timeout_seconds = 900
 
     #[tokio::test]
     async fn stopping_gives_up_the_channel_where_an_empty_queue_does_not() {
-        let session = Session::start(Duration::from_secs(900));
+        let session = Session::start(Duration::from_secs(900)).await;
         session
             .player
             .enqueue(item(1), VOICE_CHANNEL)
@@ -3651,23 +3607,6 @@ mod tests {
     }
 
     #[test]
-    fn a_time_reads_the_way_a_track_length_is_written() {
-        let at = |spec| parse_timestamp(spec).unwrap();
-        assert_eq!(at("90"), Duration::from_secs(90));
-        assert_eq!(at("2:30"), Duration::from_secs(150));
-        assert_eq!(at("1:02:03"), Duration::from_secs(3_723));
-        assert_eq!(at(" 2:30 "), Duration::from_secs(150));
-        // The leading field carries the overflow, so a long track can be
-        // seeked into by seconds alone.
-        assert_eq!(at("5000"), Duration::from_secs(5_000));
-        assert_eq!(at("90:00"), Duration::from_secs(5_400));
-
-        for bad in ["", ":", "2:", ":30", "1:90", "1:2:3:4", "two", "-5", "1:60"] {
-            assert!(parse_timestamp(bad).is_err(), "accepted {bad:?}");
-        }
-    }
-
-    #[test]
     fn a_vote_needs_half_the_room_and_never_fewer_than_two() {
         // Alone, there is nobody to agree with.
         assert_eq!(votes_needed(0), 1);
@@ -3756,7 +3695,7 @@ mod tests {
             .filter_map(described)
             .map(|(name, _)| name)
             .collect();
-        for name in DISABLED_COMMANDS {
+        for name in RETIRED_COMMANDS {
             assert!(
                 !registered.iter().any(|listed| listed == name),
                 "/{name} is disabled but still registered"
@@ -3805,10 +3744,7 @@ mod tests {
     #[test]
     fn a_command_nobody_grouped_still_appears() {
         // Every name in the grouping table has to be a command that exists, or
-        // the heading it sits under is describing something imaginary. A
-        // withdrawn one is allowed to stay in the table and is skipped when
-        // help is rendered, so that re-offering it stays a one-line change
-        // rather than a hunt for where its heading used to be.
+        // the heading it sits under is describing something imaginary.
         let registered = command_definitions()
             .iter()
             .filter_map(described)
@@ -3817,7 +3753,7 @@ mod tests {
         for (heading, names) in HELP_GROUPS {
             for name in names {
                 assert!(
-                    registered.contains(*name) || DISABLED_COMMANDS.contains(name),
+                    registered.contains(*name),
                     "help groups /{name} under {heading}, but nothing registers it"
                 );
             }

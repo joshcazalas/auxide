@@ -199,6 +199,7 @@ impl RepeatMode {
 enum Departure {
     Finished,
     Skipped,
+    Failed,
 }
 
 /// What a shuffle request asks for.
@@ -542,8 +543,27 @@ impl GuildPlayerHandle {
     ///
     /// Returns an error if the actor has stopped.
     pub async fn track_finished(&self, queue_id: Uuid) -> Result<PlayerTransition, PlayerError> {
-        self.request(|reply| PlayerCommand::TrackFinished { queue_id, reply })
-            .await
+        self.request(|reply| PlayerCommand::TrackFinished {
+            queue_id,
+            reason: Departure::Finished,
+            reply,
+        })
+        .await
+    }
+
+    /// Removes a failed current track without repeating it or filing it in history.
+    /// Stale failures leave the current track untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the actor has stopped.
+    pub async fn track_failed(&self, queue_id: Uuid) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::TrackFinished {
+            queue_id,
+            reason: Departure::Failed,
+            reply,
+        })
+        .await
     }
 
     /// Stops the actor after clearing its state.
@@ -695,6 +715,7 @@ enum PlayerCommand {
     },
     TrackFinished {
         queue_id: Uuid,
+        reason: Departure,
         reply: oneshot::Sender<PlayerTransition>,
     },
     Shutdown {
@@ -902,8 +923,12 @@ impl GuildPlayer {
             PlayerCommand::Snapshot { reply } => {
                 let _ = reply.send(self.snapshot());
             }
-            PlayerCommand::TrackFinished { queue_id, reply } => {
-                let transition = self.track_finished(queue_id);
+            PlayerCommand::TrackFinished {
+                queue_id,
+                reason,
+                reply,
+            } => {
+                let transition = self.track_finished(queue_id, reason);
                 self.emit(transition.clone()).await;
                 let _ = reply.send(transition);
             }
@@ -1248,13 +1273,13 @@ impl GuildPlayer {
         Ok(self.transition(PlaybackDirective::SetVolume))
     }
 
-    fn track_finished(&mut self, queue_id: Uuid) -> PlayerTransition {
+    fn track_finished(&mut self, queue_id: Uuid, reason: Departure) -> PlayerTransition {
         if self.current.as_ref().map(|item| item.queue_id) != Some(queue_id) {
             return self.transition(PlaybackDirective::None);
         }
         let finished = self.current.take();
         let directive = self
-            .advance(finished, Departure::Finished)
+            .advance(finished, reason)
             .map_or(PlaybackDirective::Stop, PlaybackDirective::Play);
         self.transition(directive)
     }
@@ -1272,8 +1297,10 @@ impl GuildPlayer {
         // they were placed on rather than to the session.
         self.hold = None;
         self.votes.clear();
-        if let Some(left) = &left {
-            self.remember(left.clone());
+        if reason != Departure::Failed {
+            if let Some(left) = &left {
+                self.remember(left.clone());
+            }
         }
         if let Some(left) = left {
             match (self.repeat, reason) {
@@ -1287,7 +1314,9 @@ impl GuildPlayer {
                 }
                 // Repeating everything means the rotation survives a skip too,
                 // so a skipped track comes round again rather than being lost.
-                (RepeatMode::All, _) => self.pending.push_back(left),
+                (RepeatMode::All, Departure::Finished | Departure::Skipped) => {
+                    self.pending.push_back(left);
+                }
                 _ => {}
             }
         }

@@ -30,9 +30,8 @@ one of them costs more than it looks like it costs:
 
 ### Small
 
-A playhead on `/now-playing`. The position is already read out of Songbird by
-`VoiceWorker::seek` to compute relative moves; it just never reaches the card.
-Every other bot in the field shows elapsed against total.
+A playhead on `/now-playing`. This would need a read-only position query from
+Songbird to show elapsed against total. Seeking itself has been retired.
 
 Buttons on the now-playing card. `handle_component` and the `auxide:select:…`
 custom-ID scheme already exist for search pickers. The detail worth keeping: a
