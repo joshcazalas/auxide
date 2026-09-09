@@ -115,7 +115,10 @@
               pkgs.makeWrapper
               pkgs.pkg-config
             ];
-            buildInputs = [ pkgs.libopus ];
+            buildInputs = [
+              pkgs.libopus
+              pkgs.openssl
+            ];
 
             postInstall = ''
               wrapProgram "$out/bin/auxide" \
@@ -260,6 +263,7 @@
                 pkgs.deno
                 pkgs.ffmpeg-headless
                 pkgs.libopus
+                pkgs.openssl
                 pkgs.pkg-config
                 pkgs.rustc
                 pkgs.rustfmt

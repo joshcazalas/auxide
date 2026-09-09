@@ -2,7 +2,7 @@
 name = "auxide"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A self-hosted, guild-scoped Discord music bot with current encrypted voice support"
 license = "MIT"
 publish = false
@@ -12,12 +12,14 @@ anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 rand = "0.9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "stream"] }
 secrecy = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serenity = { version = "=0.12.5", default-features = false, features = ["builder", "cache", "client", "gateway", "http", "model", "rustls_backend", "voice"] }
-songbird = { version = "=0.6.0", features = ["builtin-queue"] }
+# Serenity's Rustls backend depends on an unpatched webpki release.
+# Select native TLS in both libraries so Songbird cannot re-enable that backend.
+serenity = { version = "=0.12.5", default-features = false, features = ["builder", "cache", "client", "gateway", "http", "model", "native_tls_backend", "voice"] }
+songbird = { version = "=0.6.0", default-features = false, features = ["builtin-queue", "driver", "gateway", "native", "serenity", "tungstenite"] }
 # Songbird depends on Symphonia with default-features = false and enables no
 # formats, so its probe knows only DCA and raw PCM and every real stream fails
 # the moment it is probed. Symphonia registers a demuxer only when its feature
