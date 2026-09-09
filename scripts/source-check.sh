@@ -33,6 +33,7 @@ readonly PROBE_SEARCH="rick astley never gonna give you up"
 # Every metadata probe passed throughout. Clearing a mebibyte and a half is the
 # smallest thing that would have failed.
 readonly MUST_REACH=$((1536 * 1024))
+readonly PROBE_PACKETS=250
 
 # CI supplies the cached, wrapped Nix executable. Local development continues
 # to use Cargo unless an operator explicitly selects an installed binary.
@@ -77,23 +78,61 @@ check_track_lines() {
   fi
 }
 
+# Counts come from the CLI. Keep them canonical and within Bash's arithmetic range.
+is_count() {
+  [[ "$1" =~ ^(0|[1-9][0-9]{0,17})$ ]]
+}
+
 # `fetched<TAB>total`, where the length may be empty if the origin stated none.
 check_reach() {
-  local what="$1" output="$2" fetched total
-  IFS=$'\t' read -r fetched total <<<"${output}"
-
-  if [[ ! "${fetched}" =~ ^[0-9]+$ ]]; then
-    fail "${what}: no byte count, got '${output}'"
+  local what="$1" output="$2" fetched total required="${MUST_REACH}"
+  if [[ ! "${output}" =~ ^([0-9]+)$'\t'([0-9]*)$ ]]; then
+    fail "${what}: invalid byte counts, got '${output}'"
     return
   fi
-  # A track shorter than the bar is not a refusal to serve it.
-  if [[ "${total}" =~ ^[0-9]+$ ]] && ((total <= MUST_REACH)); then
-    printf 'ok   %s (%d byte(s), the whole track)\n' "${what}" "${fetched}"
-  elif ((fetched < MUST_REACH)); then
-    fail "${what}: got ${fetched} of ${MUST_REACH} bytes — YouTube is answering questions about tracks but not handing them over"
-  else
-    printf 'ok   %s (%d byte(s))\n' "${what}" "${fetched}"
+  IFS=$'\t' read -r fetched total <<<"${output}"
+
+  if ! is_count "${fetched}"; then
+    fail "${what}: invalid fetched byte count '${fetched}'"
+    return
   fi
+  if [[ -n "${total}" ]]; then
+    if ! is_count "${total}" || ((total == 0 || fetched > total)); then
+      fail "${what}: inconsistent byte counts, got '${output}'"
+      return
+    fi
+    if ((total < required)); then
+      required="${total}"
+    fi
+  fi
+  if ((fetched < required)); then
+    fail "${what}: got ${fetched} of ${required} required bytes — the track was not fully served up to the probe limit"
+    return
+  fi
+  printf 'ok   %s (%d byte(s))\n' "${what}" "${fetched}"
+}
+
+# `id<TAB>packets<TAB>frames<TAB>reached_end`, from the actual audio decoder.
+check_decode() {
+  local output="$1" expected_id="$2" id packets frames reached_end
+  if [[ ! "${output}" =~ ^([A-Za-z0-9_-]+)$'\t'([0-9]+)$'\t'([0-9]+)$'\t'(true|false)$ ]]; then
+    fail "decode: invalid audio probe result, got '${output}'"
+    return
+  fi
+  IFS=$'\t' read -r id packets frames reached_end <<<"${output}"
+  if [[ "${id}" != "${expected_id}" ]] || ! is_count "${packets}" || ! is_count "${frames}"; then
+    fail "decode: invalid track or counters, got '${output}'"
+    return
+  fi
+  if ((packets == 0 || packets > PROBE_PACKETS || frames == 0)); then
+    fail "decode: expected decoded audio within ${PROBE_PACKETS} packets, got '${output}'"
+    return
+  fi
+  if [[ "${reached_end}" == false ]] && ((packets < PROBE_PACKETS)); then
+    fail "decode: stopped before the packet limit without reaching the end of the track"
+    return
+  fi
+  printf 'ok   decode (%d packet(s), %d frame(s))\n' "${packets}" "${frames}"
 }
 
 # Only ever writes to stdout. Counting a failure here would be counting it in
@@ -167,8 +206,18 @@ else
   report_stderr
 fi
 
+echo "==> Decoding the start of a track"
+if [[ -z "${reachable:-}" ]]; then
+  fail "decode: the search named nothing to decode"
+elif output="$(run_probe youtube-probe "https://www.youtube.com/watch?v=${reachable}" --packets "${PROBE_PACKETS}")"; then
+  check_decode "${output}" "${reachable}"
+else
+  fail "decode: the probe exited non-zero"
+  report_stderr
+fi
+
 if ((failures > 0)); then
-  echo "==> ${failures} check(s) failed; YouTube extraction has probably moved" >&2
+  echo "==> ${failures} check(s) failed; inspect the metadata, delivery, and decoding results above" >&2
   exit 1
 fi
 echo "==> Every probe answered"

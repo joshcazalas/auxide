@@ -10,7 +10,7 @@ usage() {
 usage: check.sh [all|lint|rust]
 
   all   every check (default)
-  lint  Rust and Nix formatting, Nix, shell, and workflow linters
+  lint  Formatting, Nix/shell/workflow linters, and offline source-canary checks
   rust  Rust tests and Clippy
 
 CI runs lint and rust as separate jobs so a four-second linter failure does not
@@ -39,6 +39,9 @@ check_lint() {
 
   echo "==> Linting GitHub Actions workflows"
   actionlint
+
+  echo "==> Checking source-canary behavior offline"
+  ./scripts/test-source-check.sh
 }
 
 check_rust() {

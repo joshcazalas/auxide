@@ -108,6 +108,8 @@ jobs:
 
           \`fetch\` means the answers are fine and YouTube will no longer hand the track over. That is the failure that sounds like music stopping a minute in rather than like anything being broken, and it is almost always the proof-of-origin token: either the provider is not answering, or \`youtube.player_clients\` names a client YouTube has since tightened and a different one is needed. Metadata probes cannot see it, which is why this one exists.
 
+          \`decode\` resolves the selected video again and parses and decodes a short audio sample. If \`fetch\` passed, inspect the decoder's error for a container or codec failure; the second resolution or network request can also fail independently. Receiving bytes alone does not establish that the track is playable.
+
           Run: ${RUN_URL}
 
           Reproduce locally with \`nix develop --command ./scripts/source-check.sh\`.
