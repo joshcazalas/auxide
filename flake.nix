@@ -108,11 +108,7 @@
             };
             cargoLock.lockFile = ./Cargo.lock;
 
-            # scripts/check.sh already runs this crate's tests. Leaving the
-            # default check phase on rebuilt every test target a second time
-            # under the release profile's codegen-units = 1 and thin LTO, which
-            # spent three and a quarter minutes compiling in order to run
-            # twenty-seven tests that finish in twenty-four milliseconds.
+            # scripts/check.sh runs the tests separately in CI.
             doCheck = false;
 
             nativeBuildInputs = [
