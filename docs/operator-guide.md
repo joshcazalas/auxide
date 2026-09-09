@@ -239,6 +239,35 @@ curl --fail http://127.0.0.1:9090/health/ready
 curl --fail http://127.0.0.1:9090/metrics
 ```
 
+### Diagnose an audio stream without Discord
+
+Use `youtube-probe` before asking anyone to test in a voice channel. It uses the same resolver,
+ranged reader, container parser, and decoder as playback, but never loads the Discord token,
+connects to Discord, or sends messages:
+
+```console
+auxide --config /path/to/config.toml youtube-probe \
+  'https://www.youtube.com/watch?v=hLOheGDwD_0'
+```
+
+Use the host's existing YouTube client and token-provider settings. The configuration must be
+readable, but the Discord token file need not exist. Run a locally built version with
+`cargo run -- --config /path/to/config.toml youtube-probe ...` inside `nix develop`.
+
+The default sample is at most 250 audio packets. Standard output contains four tab-separated
+fields: video ID, packets decoded, audio frames decoded, and whether the parser reached the end
+of the stream. Logs go to standard error. `--packets 20000` requests a larger sample. Preparation
+and decoding each have a 60-second deadline; decoding runs at network speed rather than waiting
+for the song's playback duration. A successful sample proves those packets decoded, not that
+the rest of the track or Discord voice will work.
+
+`youtube-fetch` only checks delivery of bytes and cannot detect container or codec failures.
+Playback now opens the container and decoder before submitting a track to Songbird; the
+`playback submitted` log means that handoff succeeded, not that listeners heard audio. Errors
+during preparation or playback produce a bounded, mention-free failure notice and advance the
+queue. A failed track is excluded from repeat rotation and playback history. Network inputs are
+sequential only: seeking was retired, including the internal seeks that could corrupt parsing.
+
 ## 5. Private-guild acceptance gate
 
 Run this against a private test server after any change to resolution, voice, or the session
@@ -291,11 +320,8 @@ concurrently, and run every control command. Acceptance requires:
 12. `/history` lists what already played newest first and `/history replay:` queues one again
     without resolving anything, while `/export` and `/import` round-trip a queue through a file
     whose links are re-checked on the way back in; and
-13. `/seek`, `/forward`, `/rewind`, and `/restart` are not offered — Discord's picker does not
-    list them and `/help` does not describe them. They are built and withdrawn: moving the
-    playhead could trip an assertion inside the Matroska reader, on a mixer thread, and take
-    the process down with it. A queue that always plays is worth more than a playhead that
-    sometimes moves; and
+13. `/seek`, `/forward`, `/rewind`, and `/restart` have been removed. Discord's picker does not
+    list them, `/help` does not describe them, and cached invocations are refused; and
 14. typing into `/play` offers suggestions without ever making a keystroke wait, choosing one
     queues it as a link rather than a fresh search, and a burst of typing never leaves a track
     waiting behind it; and

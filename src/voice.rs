@@ -10,7 +10,7 @@
 //! because a worker is per guild too — it removes the guild id from every
 //! method and gives the implementation somewhere to keep the track it started.
 
-use std::{any::Any, fmt::Write as _, sync::Arc, time::Duration};
+use std::{any::Any, fmt::Write as _, sync::Arc};
 
 use async_trait::async_trait;
 use serenity::model::id::{ChannelId, GuildId};
@@ -27,7 +27,7 @@ use crate::{audio::AudioPipeline, source::TrackMetadata};
 /// Told once when the track it was given to finishes.
 #[async_trait]
 pub trait TrackEnded: Send + Sync + 'static {
-    async fn ended(&self);
+    async fn ended(&self, result: Result<(), String>);
 }
 
 /// Everything the playback worker does to a voice channel.
@@ -56,12 +56,6 @@ pub trait VoiceGateway: Send + Sync + 'static {
     async fn pause(&self);
     async fn resume(&self);
     async fn set_volume(&self, volume: f32);
-
-    /// Moves the playhead within the current track.
-    ///
-    /// Where to go is worked out here rather than by the caller, because only
-    /// a gateway knows where the playhead currently is.
-    async fn seek(&self, to: SeekTo) -> Result<Duration, VoiceError>;
 
     /// Stops what is playing and keeps the channel.
     async fn stop(&self);
@@ -106,31 +100,16 @@ impl std::fmt::Debug for Prepared {
     }
 }
 
-/// Where a seek should land.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SeekTo {
-    Position(Duration),
-    Forward(Duration),
-    Backward(Duration),
-    Start,
-}
-
 #[derive(Debug, Error)]
 pub enum VoiceError {
     /// The source could not be made playable, which is the track's fault.
-    ///
-    /// Distinct from the rest because it is the only one worth telling a
-    /// channel about: a video went private, or is live, or is too long.
+    /// Includes resolution, container parsing, and decoder initialization.
     #[error("{0}")]
     Prepare(String),
     #[error("failed to join voice: {0}")]
     Join(String),
     #[error("failed to start playback: {0}")]
     Play(String),
-    #[error("nothing is playing")]
-    NothingPlaying,
-    #[error("this track cannot be seeked in")]
-    NotSeekable,
 }
 
 /// Everything an error has to say, not only its outermost sentence.
@@ -305,13 +284,7 @@ impl VoiceGateway for SongbirdGateway {
         if let Err(error) = handle.set_volume(volume) {
             tracing::warn!(%error, guild_id = self.guild_id, "failed to set playback volume");
         }
-        if let Err(error) = handle.add_event(
-            Event::Track(TrackEvent::End),
-            EndedEvent {
-                guild_id: self.guild_id,
-                ended,
-            },
-        ) {
+        if let Err(error) = handle.add_event(Event::Track(TrackEvent::End), EndedEvent { ended }) {
             let _ = handle.stop();
             return Err(VoiceError::Play(full_cause(&error)));
         }
@@ -332,33 +305,6 @@ impl VoiceGateway for SongbirdGateway {
             .await;
     }
 
-    async fn seek(&self, to: SeekTo) -> Result<Duration, VoiceError> {
-        let handle = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or(VoiceError::NothingPlaying)?;
-        let now = handle
-            .get_info()
-            .await
-            .map_err(|_| VoiceError::NothingPlaying)?
-            .position;
-        let target = match to {
-            SeekTo::Position(at) => at,
-            SeekTo::Forward(by) => now.saturating_add(by),
-            SeekTo::Backward(by) => now.saturating_sub(by),
-            SeekTo::Start => Duration::ZERO,
-        };
-        // Songbird reports the position it settled on, which need not be the
-        // one asked for: a container seeks to a boundary it can resume from.
-        handle
-            .seek(target)
-            .result_async()
-            .await
-            .map_err(|_| VoiceError::NotSeekable)
-    }
-
     async fn stop(&self) {
         if let Some(handle) = self.active.lock().await.take() {
             let _ = handle.stop();
@@ -375,19 +321,25 @@ impl VoiceGateway for SongbirdGateway {
 
 /// Bridges Songbird's completion event onto [`TrackEnded`].
 struct EndedEvent {
-    guild_id: u64,
     ended: Arc<dyn TrackEnded>,
 }
 
 #[async_trait]
 impl VoiceEventHandler for EndedEvent {
     async fn act(&self, context: &EventContext<'_>) -> Option<Event> {
-        if let EventContext::Track([(state, _)]) = context {
-            if let PlayMode::Errored(error) = &state.playing {
-                tracing::warn!(%error, guild_id = self.guild_id, "track ended with an error");
-            }
-        }
-        self.ended.ended().await;
+        let result = match context {
+            EventContext::Track([(state, _)]) => match &state.playing {
+                PlayMode::Errored(error) => Err(error.to_string()),
+                _ => Ok(()),
+            },
+            _ => Err("unexpected track completion event".to_owned()),
+        };
+        // Reporting an error can send an HTTP message. Keep that work off
+        // Songbird's event loop so it cannot delay other track events.
+        let ended = Arc::clone(&self.ended);
+        tokio::spawn(async move {
+            ended.ended(result).await;
+        });
         Some(Event::Cancel)
     }
 }
@@ -409,6 +361,56 @@ mod tests {
 
     const GUILD: u64 = 730_675_093_197_422_623;
     const VOICE_CHANNEL: u64 = 222;
+
+    struct Finished(tokio::sync::mpsc::UnboundedSender<Result<(), String>>);
+
+    #[async_trait]
+    impl super::TrackEnded for Finished {
+        async fn ended(&self, result: Result<(), String>) {
+            self.0.send(result).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn songbird_completion_preserves_errors_and_normal_endings() {
+        use songbird::{
+            Driver, Event, EventContext, EventHandler as _,
+            input::Input,
+            tracks::{PlayError, PlayMode, Track, TrackState},
+        };
+
+        // The driver stays disconnected. Its paused track supplies a handle
+        // for the event context without opening or playing any audio.
+        let mut driver = Driver::default();
+        let handle = driver.play(Track::new(Input::from(Vec::<u8>::new())).pause());
+        let error = PlayError::Parse(Arc::new(symphonia::core::errors::Error::DecodeError(
+            "mkv: unexpected EBML element",
+        )));
+        for playing in [PlayMode::End, PlayMode::Errored(error)] {
+            let expected_error = matches!(playing, PlayMode::Errored(_));
+            let state = TrackState {
+                playing,
+                ..TrackState::default()
+            };
+            let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+            let handler = super::EndedEvent {
+                ended: Arc::new(Finished(sent)),
+            };
+            let event = handler
+                .act(&EventContext::Track(&[(&state, &handle)]))
+                .await;
+            assert!(matches!(event, Some(Event::Cancel)));
+            let result = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if expected_error {
+                assert!(result.unwrap_err().contains("mkv: unexpected EBML element"));
+            } else {
+                assert_eq!(result, Ok(()));
+            }
+        }
+    }
 
     /// A resolver that is never reached.
     ///
@@ -506,10 +508,7 @@ pub mod fake {
     // nothing a reader of a test double needs.
     #![allow(clippy::missing_panics_doc)]
 
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use tokio::sync::Notify;
@@ -529,7 +528,6 @@ pub mod fake {
         Paused,
         Resumed,
         VolumeSet(u16),
-        Sought(super::SeekTo),
         Stopped,
         Left,
     }
@@ -599,6 +597,23 @@ pub mod fake {
 
         /// Ends whatever is playing, as Songbird would at the end of a track.
         pub async fn finish_track(&self) {
+            self.end_track(Ok(())).await;
+        }
+
+        pub async fn fail_track(&self, error: &str) {
+            self.end_track(Err(error.to_owned())).await;
+        }
+
+        #[must_use]
+        pub fn completion(&self) -> Option<Arc<dyn TrackEnded>> {
+            self.state
+                .lock()
+                .expect("fake voice state is not poisoned")
+                .ended
+                .clone()
+        }
+
+        async fn end_track(&self, result: Result<(), String>) {
             let ended = self
                 .state
                 .lock()
@@ -606,7 +621,7 @@ pub mod fake {
                 .ended
                 .take();
             if let Some(ended) = ended {
-                ended.ended().await;
+                ended.ended(result).await;
             }
         }
 
@@ -698,11 +713,6 @@ pub mod fake {
 
         async fn set_volume(&self, volume: f32) {
             self.record(VoiceAction::VolumeSet(percent(volume)));
-        }
-
-        async fn seek(&self, to: super::SeekTo) -> Result<Duration, VoiceError> {
-            self.record(VoiceAction::Sought(to));
-            Ok(Duration::ZERO)
         }
 
         async fn stop(&self) {

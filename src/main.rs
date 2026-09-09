@@ -61,6 +61,15 @@ enum Command {
         #[arg(long, default_value_t = 2 * 1024 * 1024)]
         bytes: u64,
     },
+    /// Resolve, parse, and decode an audio sample without connecting to Discord.
+    #[command(name = "youtube-probe")]
+    YouTubeProbe {
+        #[arg(value_parser = parse_url)]
+        url: Url,
+        /// Maximum audio packets to decode, stopping earlier at end of stream.
+        #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u32).range(1..))]
+        packets: u32,
+    },
     /// Join an existing voice channel and play one source without registering commands.
     VoiceSpike {
         #[arg(long)]
@@ -161,6 +170,19 @@ async fn main() -> Result<()> {
                 "{}\t{}",
                 reach.fetched,
                 reach.total.map_or(String::new(), |total| total.to_string())
+            );
+        }
+        Command::YouTubeProbe { url, packets } => {
+            let resolver = Arc::new(YouTubeResolver::new(
+                config.youtube.clone(),
+                &config.playback,
+            ));
+            let track = resolver.inspect(&url).await?;
+            let pipeline = AudioPipeline::new(resolver, config.playback.output_volume)?;
+            let probe = pipeline.probe(&track, packets).await?;
+            println!(
+                "{}\t{}\t{}\t{}",
+                track.source_id, probe.packets, probe.frames, probe.reached_end
             );
         }
         Command::VoiceSpike {
