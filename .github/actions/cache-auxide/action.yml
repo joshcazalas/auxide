@@ -1,0 +1,29 @@
+name: Cache the Auxide package
+description: Restore and retain the exact Nix package across CI, releases, and source probes
+
+runs:
+  using: composite
+  steps:
+    - name: Identify the exact package and Nix version
+      id: key
+      shell: bash
+      run: |
+        derivation="$(nix eval --raw .#auxide.drvPath)"
+        digest="$(printf '%s' "${derivation}" | sha256sum | cut -d ' ' -f 1)"
+        echo "Auxide derivation: ${derivation}"
+        echo "derivation=${digest}" >> "${GITHUB_OUTPUT}"
+        echo "nix-version=$(nix --version | awk '{print $NF}')" >> "${GITHUB_OUTPUT}"
+
+    # Only main seeds package caches. GitHub cannot restore PR merge-ref
+    # caches on main, and saving them would compete for the repository quota.
+    # Callers must retain .#auxide with --out-link before this action's post
+    # step collects garbage. Restoring never substitutes for running checks.
+    - name: Restore and save the Nix package
+      uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7.0.2
+      with:
+        primary-key: >-
+          nix-auxide-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.nix-version }}-${{ steps.key.outputs.derivation }}
+        save: ${{ github.ref == 'refs/heads/main' }}
+        # GC stops at this target or when only rooted paths remain. This is
+        # not a hard archive-size limit; monitor actual cache usage on GitHub.
+        gc-max-store-size-linux: 2G

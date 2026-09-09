@@ -43,10 +43,10 @@ check_lint() {
 
 check_rust() {
   echo "==> Running Rust tests"
-  cargo test --all-targets
+  cargo test --locked --all-targets
 
   echo "==> Running strict Rust lints"
-  cargo clippy --all-targets -- -D warnings
+  cargo clippy --locked --all-targets -- -D warnings
 }
 
 if (($# > 1)); then

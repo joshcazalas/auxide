@@ -94,7 +94,18 @@
           auxide = pkgs.rustPlatform.buildRustPackage {
             pname = "auxide";
             version = "0.1.0";
-            src = pkgs.lib.cleanSource ./.;
+            # Only Rust build inputs affect this derivation. Editing a workflow,
+            # runbook, or NixOS module must not invalidate the release binary.
+            # Add any future build scripts/assets here when Cargo consumes them.
+            src = pkgs.lib.fileset.toSource {
+              root = ./.;
+              fileset = pkgs.lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./src
+                ./tests
+              ];
+            };
             cargoLock.lockFile = ./Cargo.lock;
 
             # scripts/check.sh already runs this crate's tests. Leaving the

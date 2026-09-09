@@ -1,0 +1,35 @@
+name: Cache Rust dependencies
+description: Reuse compiled test and Clippy dependencies using the Nix toolchain
+
+runs:
+  using: composite
+  steps:
+    - name: Select a consistent target directory and build environment
+      id: key
+      shell: bash
+      run: |
+        echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/auxide-cargo-target" >> "${GITHUB_ENV}"
+        target="$(realpath --canonicalize-missing --relative-to="${GITHUB_WORKSPACE}" "${RUNNER_TEMP}/auxide-cargo-target")"
+        echo "target=${target}" >> "${GITHUB_OUTPUT}"
+        # rustc's version alone cannot identify native dependencies such as
+        # libopus or the linker. Include the complete development derivation.
+        derivation="$(nix eval --raw .#devShells.x86_64-linux.default.drvPath)"
+        digest="$(printf '%s' "${derivation}" | sha256sum | cut -d ' ' -f 1)"
+        echo "environment=${digest}" >> "${GITHUB_OUTPUT}"
+
+    - name: Restore and save compiled Rust dependencies
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        prefix-key: auxide-rust-v1
+        shared-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.environment }}
+        workspaces: . -> ${{ steps.key.outputs.target }}
+        # Query the compiler/metadata inside Nix, not the runner's Rust install.
+        cmd-format: nix develop --command {0}
+        cache-bin: false
+        # PR caches speed up subsequent pushes to that PR. A manual CI run on
+        # main seeds a base cache all PRs can read, without adding post-merge
+        # Rust checks to Release. Forks only read to limit quota consumption.
+        save-if: >-
+          ${{ github.ref == 'refs/heads/main' ||
+              (github.event_name == 'pull_request' &&
+               github.event.pull_request.head.repo.full_name == github.repository) }}

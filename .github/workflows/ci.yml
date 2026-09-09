@@ -62,10 +62,11 @@ jobs:
       - name: Install Nix
         uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
 
+      - name: Cache Rust dependencies
+        uses: ./.github/actions/cache-rust
+
       - name: Run the test suite and Clippy
-        run: |
-          export CARGO_TARGET_DIR="${RUNNER_TEMP}/auxide-cargo-target"
-          nix develop --command ./scripts/check.sh rust
+        run: nix develop --command ./scripts/check.sh rust
 
   nix:
     name: Build every declared check
@@ -94,8 +95,13 @@ jobs:
           extra_nix_config: |
             build-dir = /nix/build
 
+      - name: Cache the Auxide package
+        uses: ./.github/actions/cache-auxide
+
       - name: Evaluate and build every declared check
-        run: nix flake check --print-build-logs
+        run: |
+          nix flake check --print-build-logs
+          nix build --out-link "${RUNNER_TEMP}/auxide-cache-root" .#auxide
 
   validate:
     # Branch protection requires a check named "Validate". Keeping that name on
