@@ -5,6 +5,12 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # Songbird 0.6 exposes Reqwest 0.12 clients in its HLS API. Upgrade
+      # them together when Songbird supports a newer Reqwest release.
+      # Keep 0.12 patch updates enabled; 0.x minor bumps can break Rust APIs.
+      - dependency-name: reqwest
+        versions: [">=0.13"]
 
   - package-ecosystem: github-actions
     # Local composite actions need their own discovery directories.
