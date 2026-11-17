@@ -61,6 +61,13 @@ an issue when it stops answering.
 and release bundles are ignored by Git. These checks do not need a Discord token; only command
 registration, the long-running bot, and the explicit voice spike contact Discord.
 
+Check the locked dependencies against the current RustSec advisory database with
+the audit tool from the project's pinned Nix input:
+
+```console
+nix shell --inputs-from . nixpkgs#cargo-audit --command cargo-audit audit
+```
+
 Useful offline commands:
 
 ```console
