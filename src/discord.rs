@@ -2403,13 +2403,12 @@ async fn playback_worker(
             }
             PlaybackDirective::Play(item) | PlaybackDirective::Replace(item) => {
                 voice.stop().await;
-                let Some(channel_id) = transition.snapshot.voice_channel_id else {
+                if transition.snapshot.voice_channel_id.is_none() {
                     tracing::warn!(guild_id, queue_id = %item.queue_id, "play directive had no voice channel");
                     continue;
-                };
+                }
                 match start_track(
                     guild_id,
-                    channel_id,
                     &player,
                     &mut transitions,
                     voice.as_ref(),
@@ -2485,7 +2484,6 @@ enum StartTrackOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn start_track(
     guild_id: u64,
-    requested_channel: u64,
     player: &GuildPlayerHandle,
     transitions: &mut mpsc::Receiver<PlayerTransition>,
     voice: &dyn VoiceGateway,
@@ -2547,15 +2545,6 @@ async fn start_track(
     let Some(channel_id) = snapshot.voice_channel_id else {
         return StartTrackOutcome::Failed;
     };
-
-    if channel_id != requested_channel {
-        tracing::debug!(
-            guild_id,
-            requested_channel,
-            channel_id,
-            "voice channel moved during preparation"
-        );
-    }
 
     let ended = Arc::new(RuntimeTrackFinished {
         player: player.clone(),
@@ -3105,7 +3094,6 @@ idle_timeout_seconds = 900
         let cancellation = CancellationToken::new();
         let start = super::start_track(
             GUILD,
-            VOICE_CHANNEL,
             &player,
             &mut transitions,
             &voice,
