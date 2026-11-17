@@ -2917,6 +2917,30 @@ idle_timeout_seconds = 900
         )
     }
 
+    #[tokio::test]
+    async fn retiring_a_guild_stops_its_player_and_releases_its_slot() {
+        let mut config = config();
+        Arc::make_mut(&mut config).discord.max_guilds = 1;
+        let resolver = Arc::new(super::YouTubeResolver::new(
+            config.youtube.clone(),
+            &config.playback,
+        ));
+        let runtime = super::BotRuntime::new(
+            config,
+            resolver,
+            Arc::new(FakeVoice::new()),
+            ObservabilityState::default(),
+            CancellationToken::new(),
+        );
+        let http = Arc::new(super::build_http("test-token", None));
+        let first = runtime.session(GUILD, &http).await.unwrap();
+        assert!(runtime.session(GUILD + 1, &http).await.is_err());
+        runtime.retire_session(GUILD).await;
+        assert!(first.player.snapshot().await.is_err());
+        assert!(runtime.session(GUILD + 1, &http).await.is_ok());
+        runtime.shutdown().await;
+    }
+
     fn item(id: u128) -> QueueItem {
         QueueItem {
             queue_id: uuid::Uuid::from_u128(id),
