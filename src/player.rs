@@ -576,6 +576,11 @@ impl GuildPlayerHandle {
             .await
     }
 
+    pub(crate) async fn voice_moved(&self, from: u64, to: Option<u64>) -> Result<(), PlayerError> {
+        self.request(|reply| PlayerCommand::VoiceMoved { from, to, reply })
+            .await
+    }
+
     async fn request<T>(
         &self,
         command: impl FnOnce(oneshot::Sender<T>) -> PlayerCommand,
@@ -717,6 +722,11 @@ enum PlayerCommand {
         queue_id: Uuid,
         reason: Departure,
         reply: oneshot::Sender<PlayerTransition>,
+    },
+    VoiceMoved {
+        from: u64,
+        to: Option<u64>,
+        reply: oneshot::Sender<()>,
     },
     Shutdown {
         reply: oneshot::Sender<PlayerTransition>,
@@ -931,6 +941,16 @@ impl GuildPlayer {
                 let transition = self.track_finished(queue_id, reason);
                 self.emit(transition.clone()).await;
                 let _ = reply.send(transition);
+            }
+            PlayerCommand::VoiceMoved { from, to, reply } => {
+                if self.voice_channel_id == Some(from) {
+                    if let Some(channel) = to {
+                        self.voice_channel_id = Some(channel);
+                    } else if let Ok(transition) = self.park() {
+                        self.emit(transition).await;
+                    }
+                }
+                let _ = reply.send(());
             }
             PlayerCommand::Shutdown { reply } => {
                 let transition = self.stop();
@@ -1885,6 +1905,25 @@ mod tests {
 
         player.shutdown().await.unwrap();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_external_move_changes_the_room_for_queue_operations() {
+        let (player, mut transitions, _task) =
+            spawn_guild_player(7, 5, 8, 1, Duration::from_secs(60), 50);
+        player.enqueue(item(1), 10).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.voice_moved(10, Some(20)).await.unwrap();
+        player.voice_moved(10, None).await.unwrap();
+        assert!(matches!(
+            player.enqueue(item(2), 10).await,
+            Err(PlayerError::VoiceChannelConflict { channel_id: 20 })
+        ));
+        player.enqueue(item(2), 20).await.unwrap();
+        player.voice_moved(20, None).await.unwrap();
+        let parked = player.snapshot().await.unwrap();
+        assert_eq!(parked.voice_channel_id, None);
+        assert_eq!(parked.len(), 2);
     }
 
     #[tokio::test]

@@ -571,6 +571,15 @@ impl EventHandler for DiscordHandler {
         else {
             return;
         };
+        let bot = ctx.cache.current_user().id;
+        if new.user_id == bot
+            && let Some(from) = old.and_then(|state| state.channel_id)
+            && Some(from) != new.channel_id
+            && let Some(session) = self.runtime.existing_session(guild_id.get()).await
+        {
+            let observed = requester_voice_channel(&ctx, guild_id.get(), bot);
+            let _ = session.player.voice_moved(from.get(), observed).await;
+        }
         self.runtime.handle_voice_state_update(&ctx, guild_id).await;
     }
 }
@@ -1838,11 +1847,7 @@ impl BotRuntime {
         )))
     }
 
-    async fn require_same_voice(
-        &self,
-        _ctx: &Context,
-        authorization: &Authorization,
-    ) -> Result<()> {
+    async fn require_same_voice(&self, ctx: &Context, authorization: &Authorization) -> Result<()> {
         let requester = authorization
             .voice_channel_id
             .context("join Auxide's voice channel before using that command")?;
@@ -1850,6 +1855,8 @@ impl BotRuntime {
         let current = snapshot
             .voice_channel_id
             .context("Auxide is not connected to voice in this server")?;
+        let bot = ctx.cache.current_user().id;
+        let current = requester_voice_channel(ctx, authorization.guild_id, bot).unwrap_or(current);
         if current != requester {
             bail!("join Auxide's current voice channel before using that command");
         }
@@ -2466,7 +2473,7 @@ enum StartTrackOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn start_track(
     guild_id: u64,
-    channel_id: u64,
+    requested_channel: u64,
     player: &GuildPlayerHandle,
     transitions: &mut mpsc::Receiver<PlayerTransition>,
     voice: &dyn VoiceGateway,
@@ -2500,16 +2507,24 @@ async fn start_track(
             return StartTrackOutcome::Failed;
         }
     };
-    let current = match player.snapshot().await {
-        Ok(snapshot) => snapshot.current.map(|queued| queued.queue_id),
+    let snapshot = match player.snapshot().await {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::warn!(%error, guild_id, "failed to verify queued track");
             return StartTrackOutcome::Failed;
         }
     };
-    if current != Some(item.queue_id) {
+    if snapshot.current.as_ref().map(|queued| queued.queue_id) != Some(item.queue_id) {
         tracing::debug!(guild_id, queue_id = %item.queue_id, "discarding stale prepared source");
         return StartTrackOutcome::Failed;
+    }
+
+    let Some(channel_id) = snapshot.voice_channel_id else {
+        return StartTrackOutcome::Failed;
+    };
+
+    if channel_id != requested_channel {
+        tracing::debug!(guild_id, requested_channel, channel_id, "voice channel moved during preparation");
     }
 
     let ended = Arc::new(RuntimeTrackFinished {
