@@ -2549,7 +2549,12 @@ async fn start_track(
     };
 
     if channel_id != requested_channel {
-        tracing::debug!(guild_id, requested_channel, channel_id, "voice channel moved during preparation");
+        tracing::debug!(
+            guild_id,
+            requested_channel,
+            channel_id,
+            "voice channel moved during preparation"
+        );
     }
 
     let ended = Arc::new(RuntimeTrackFinished {
