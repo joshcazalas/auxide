@@ -329,6 +329,7 @@ impl VoiceEventHandler for EndedEvent {
     async fn act(&self, context: &EventContext<'_>) -> Option<Event> {
         let result = match context {
             EventContext::Track([(state, _)]) => match &state.playing {
+                PlayMode::Stop => return Some(Event::Cancel),
                 PlayMode::Errored(error) => Err(error.to_string()),
                 _ => Ok(()),
             },
@@ -386,7 +387,8 @@ mod tests {
         let error = PlayError::Parse(Arc::new(symphonia::core::errors::Error::DecodeError(
             "mkv: unexpected EBML element",
         )));
-        for playing in [PlayMode::End, PlayMode::Errored(error)] {
+        for playing in [PlayMode::Stop, PlayMode::End, PlayMode::Errored(error)] {
+            let manually_stopped = matches!(playing, PlayMode::Stop);
             let expected_error = matches!(playing, PlayMode::Errored(_));
             let state = TrackState {
                 playing,
@@ -400,6 +402,11 @@ mod tests {
                 .act(&EventContext::Track(&[(&state, &handle)]))
                 .await;
             assert!(matches!(event, Some(Event::Cancel)));
+            drop(handler);
+            if manually_stopped {
+                assert!(received.recv().await.is_none());
+                continue;
+            }
             let result = tokio::time::timeout(Duration::from_secs(2), received.recv())
                 .await
                 .unwrap()
