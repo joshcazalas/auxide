@@ -1074,20 +1074,17 @@ impl GuildPlayer {
         let mut items = items;
         items.truncate(room);
         let accepted = items.len();
-        let mut directive = PlaybackDirective::None;
-        for item in items {
-            // Reusing the single-item path keeps one description of what
-            // enqueueing means, including which addition starts playback and
-            // what that does to the idle countdown.
-            let transition = self.enqueue(item, voice_channel_id)?;
-            // Only the first item of a batch can start playback; every one
-            // after it joins a queue that is no longer empty. Pairing that
-            // directive with the snapshot taken after the whole batch is what
-            // makes this one addition rather than fifty.
-            if directive == PlaybackDirective::None {
-                directive = transition.directive;
+        let mut items = items.into_iter();
+        let directive = if let Some(first) = items.next() {
+            let directive = self.enqueue(first, voice_channel_id)?.directive;
+            if let Some(last) = items.as_slice().last() {
+                self.text_channel_id = Some(last.response_channel_id);
             }
-        }
+            self.pending.extend(items);
+            directive
+        } else {
+            PlaybackDirective::None
+        };
         Ok(BulkEnqueue {
             accepted,
             refused: offered - accepted,
@@ -1339,7 +1336,9 @@ impl GuildPlayer {
     }
 
     fn track_finished(&mut self, queue_id: Uuid, reason: Departure) -> PlayerTransition {
-        if self.current.as_ref().map(|item| item.queue_id) != Some(queue_id) {
+        if self.voice_channel_id.is_none()
+            || self.current.as_ref().map(|item| item.queue_id) != Some(queue_id)
+        {
             return self.transition(PlaybackDirective::None);
         }
         let finished = self.current.take();

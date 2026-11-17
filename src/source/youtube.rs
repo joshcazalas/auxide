@@ -97,7 +97,11 @@ impl YouTubeResolver {
     }
 
     fn validate_youtube_url(url: &Url) -> Result<(), SourceError> {
-        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        if url.scheme() != "https"
+            || url.port().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
             return Err(SourceError::InvalidRequest(
                 "YouTube URLs must use HTTPS and must not contain credentials".to_owned(),
             ));
@@ -118,6 +122,27 @@ impl YouTubeResolver {
             )));
         }
         Ok(())
+    }
+
+    fn video_url(url: &Url) -> Result<Url, SourceError> {
+        Self::validate_youtube_url(url)?;
+        let path = url.path().trim_end_matches('/');
+        let id = if url.host_str() == Some("youtu.be") {
+            path.strip_prefix('/').map(str::to_owned)
+        } else if path == "/watch" {
+            url.query_pairs()
+                .find(|(key, _)| key == "v")
+                .map(|(_, id)| id.into_owned())
+        } else {
+            ["/shorts/", "/embed/", "/live/", "/v/"]
+                .iter()
+                .find_map(|prefix| path.strip_prefix(prefix))
+                .map(str::to_owned)
+        };
+        let id = id
+            .filter(|id| id.len() == 11 && valid_identifier(id))
+            .ok_or_else(|| SourceError::InvalidRequest("expected a YouTube video link".into()))?;
+        Ok(canonical_url("watch", "v", &id))
     }
 
     async fn query(&self, target: &str) -> Result<Vec<YtDlpEntry>, SourceError> {
@@ -164,6 +189,9 @@ impl YouTubeResolver {
         })?;
         let runtime = format!("deno:{}", self.config.deno_path.display());
         let args = [
+            OsString::from("--ignore-config"),
+            OsString::from("--use-extractors"),
+            OsString::from("youtube,youtube:tab,youtube:search"),
             OsString::from("--print"),
             OsString::from(ENTRY_TEMPLATE),
             OsString::from("--skip-download"),
@@ -263,9 +291,7 @@ impl YouTubeResolver {
             return Err(SourceError::DurationLimit);
         }
 
-        let mut canonical_url =
-            Url::parse("https://www.youtube.com/watch").expect("the static YouTube URL is valid");
-        canonical_url.query_pairs_mut().append_pair("v", &entry.id);
+        let canonical_url = canonical_url("watch", "v", &entry.id);
         let thumbnail_url = entry
             .thumbnail
             .as_deref()
@@ -298,12 +324,12 @@ impl SourceResolver for YouTubeResolver {
     }
 
     fn accepts(&self, url: &Url) -> Result<(), SourceError> {
-        Self::validate_youtube_url(url)
+        Self::video_url(url).map(|_| ())
     }
 
     async fn inspect(&self, url: &Url) -> Result<TrackMetadata, SourceError> {
-        Self::validate_youtube_url(url)?;
-        let entries = self.query(url.as_str()).await?;
+        let video = Self::video_url(url)?;
+        let entries = self.query(video.as_str()).await?;
         self.metadata(&entries[0])
     }
 
@@ -321,7 +347,13 @@ impl SourceResolver for YouTubeResolver {
             )));
         }
 
-        let entries = self.query_playlist(url.as_str()).await?;
+        if !valid_identifier(&list_id) {
+            return Err(SourceError::InvalidRequest(
+                "invalid YouTube playlist ID".into(),
+            ));
+        }
+        let playlist_url = canonical_url("playlist", "list", &list_id);
+        let entries = self.query_playlist(playlist_url.as_str()).await?;
         let total = entries
             .iter()
             .find_map(|entry| entry.playlist_count)
@@ -340,8 +372,8 @@ impl SourceResolver for YouTubeResolver {
     }
 
     async fn resolve(&self, track: &TrackMetadata) -> Result<ResolvedAudio, SourceError> {
-        Self::validate_youtube_url(&track.canonical_url)?;
-        let entries = self.query(track.canonical_url.as_str()).await?;
+        let video = Self::video_url(&track.canonical_url)?;
+        let entries = self.query(video.as_str()).await?;
         let entry = &entries[0];
         let fresh_metadata = self.metadata(entry)?;
         if fresh_metadata.source_id != track.source_id {
@@ -355,12 +387,9 @@ impl SourceResolver for YouTubeResolver {
         .map_err(|error| {
             SourceError::InvalidResponse(format!("yt-dlp returned an invalid media URL: {error}"))
         })?;
-        if stream_url.scheme() != "https"
-            || !stream_url.username().is_empty()
-            || stream_url.password().is_some()
-        {
+        if !media_url_allowed(&stream_url) {
             return Err(SourceError::InvalidResponse(
-                "resolved media URL is not credential-free HTTPS".to_owned(),
+                "resolved URL is outside the YouTube media CDN".to_owned(),
             ));
         }
 
@@ -371,6 +400,30 @@ impl SourceResolver for YouTubeResolver {
             protocol: entry.protocol.clone(),
         })
     }
+}
+
+fn valid_identifier(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+}
+
+fn canonical_url(path: &str, key: &str, id: &str) -> Url {
+    let mut url = Url::parse("https://www.youtube.com").expect("valid static YouTube URL");
+    url.set_path(path);
+    url.query_pairs_mut().append_pair(key, id);
+    url
+}
+
+pub(crate) fn media_url_allowed(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| host == "googlevideo.com" || host.ends_with(".googlevideo.com"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -525,6 +578,41 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn share_links_are_rebuilt_from_the_video_id() {
+        for raw in [
+            "https://youtu.be/hLOheGDwD_0?t=10",
+            "https://music.youtube.com/watch?v=hLOheGDwD_0&list=PL123",
+            "https://www.youtube-nocookie.com/embed/hLOheGDwD_0",
+            "https://www.youtube.com/shorts/hLOheGDwD_0",
+        ] {
+            let video = YouTubeResolver::video_url(&Url::parse(raw).unwrap()).unwrap();
+            assert_eq!(
+                video.as_str(),
+                "https://www.youtube.com/watch?v=hLOheGDwD_0"
+            );
+        }
+        assert!(
+            YouTubeResolver::video_url(
+                &Url::parse("https://www.youtube.com/feed/trending").unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn media_requests_remain_on_the_https_cdn() {
+        assert!(media_url_allowed(
+            &Url::parse("https://media.googlevideo.com/audio").unwrap()
+        ));
+        assert!(!media_url_allowed(
+            &Url::parse("https://example.org/audio").unwrap()
+        ));
+        assert!(!media_url_allowed(
+            &Url::parse("http://media.googlevideo.com/audio").unwrap()
+        ));
     }
 
     #[test]

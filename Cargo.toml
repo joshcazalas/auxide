@@ -44,6 +44,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 url = { version = "2.5", features = ["serde"] }
 uuid = { version = "1.0", features = ["serde", "v4"] }
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 tempfile = "3.0"
 # Serving the gateway side of a fake Discord. Pinned to the copy Songbird

@@ -1,3 +1,4 @@
+use crate::shutdown::shutdown_signal;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write as _,
@@ -833,18 +834,10 @@ impl BotRuntime {
         Ok(session)
     }
 
-    /// Offers what has already been searched for, and never waits.
-    ///
-    /// Deliberately unauthorized: a suggestion reveals only what `YouTube`
-    /// would return for words the person typed themselves, changes nothing, and
-    /// costs nothing beyond a cache lookup. Refusing here would mean answering
-    /// a keystroke with a permission check.
     async fn suggest(&self, ctx: &Context, autocomplete: &CommandInteraction) {
-        let choices = match autocomplete
-            .data
-            .autocomplete()
-            .filter(|option| option.name == "query")
-        {
+        let choices = match autocomplete.data.autocomplete().filter(|option| {
+            option.name == "query" && self.check_command_access(autocomplete).is_ok()
+        }) {
             Some(option) => self.suggestions.for_query(option.value).await,
             None => Vec::new(),
         };
@@ -1091,16 +1084,22 @@ impl BotRuntime {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<Authorization> {
+        let guild_id = self.check_command_access(command)?;
+        self.authorization(ctx, guild_id, command.channel_id.get(), command.user.id)
+            .await
+    }
+
+    fn check_command_access(&self, command: &CommandInteraction) -> Result<u64> {
         let guild_id = command
             .guild_id
-            .context("Auxide commands are available only in configured servers")?;
+            .context("Auxide commands are available only in configured servers")?
+            .get();
         let member = command
             .member
             .as_deref()
             .context("Discord did not supply server membership for this request")?;
-        self.authorize(
-            ctx,
-            guild_id.get(),
+        self.check_access(
+            guild_id,
             command.channel_id.get(),
             command.user.id,
             &member
@@ -1108,8 +1107,8 @@ impl BotRuntime {
                 .iter()
                 .map(|role| role.get())
                 .collect::<Vec<_>>(),
-        )
-        .await
+        )?;
+        Ok(guild_id)
     }
 
     async fn authorize_component(
@@ -1124,8 +1123,7 @@ impl BotRuntime {
             .member
             .as_ref()
             .context("Discord did not supply server membership for this request")?;
-        self.authorize(
-            ctx,
+        self.check_access(
             guild_id.get(),
             component.channel_id.get(),
             component.user.id,
@@ -1134,18 +1132,23 @@ impl BotRuntime {
                 .iter()
                 .map(|role| role.get())
                 .collect::<Vec<_>>(),
+        )?;
+        self.authorization(
+            ctx,
+            guild_id.get(),
+            component.channel_id.get(),
+            component.user.id,
         )
         .await
     }
 
-    async fn authorize(
+    fn check_access(
         &self,
-        ctx: &Context,
         guild_id: u64,
         response_channel_id: u64,
         user_id: UserId,
         role_ids: &[u64],
-    ) -> Result<Authorization> {
+    ) -> Result<()> {
         if !self.config.allows_guild(guild_id) {
             bail!("server {guild_id} is not allowlisted");
         }
@@ -1171,6 +1174,16 @@ impl BotRuntime {
                 );
             }
         }
+        Ok(())
+    }
+
+    async fn authorization(
+        &self,
+        ctx: &Context,
+        guild_id: u64,
+        response_channel_id: u64,
+        user_id: UserId,
+    ) -> Result<Authorization> {
         let session = self.session(guild_id, &ctx.http).await?;
         let voice_channel_id = requester_voice_channel(ctx, guild_id, user_id);
         Ok(Authorization {
@@ -1289,25 +1302,22 @@ impl BotRuntime {
             .player
             .enqueue(item, voice_channel_id)
             .await?;
-        if matches!(transition.directive, PlaybackDirective::Play(_)) {
-            return Ok(Announcement::card(track_embed(
-                "Now playing",
-                &track,
-                authorization.user_id,
-                None,
-            )));
-        }
         let position = transition
             .snapshot
             .pending
             .iter()
             .position(|queued| queued.queue_id == queue_id)
-            .map_or(1, |index| index + 2);
+            .map(|index| index + 1);
+        let heading = if position.is_some() {
+            "Added to the queue"
+        } else {
+            "Now playing"
+        };
         Ok(Announcement::card(track_embed(
-            "Added to the queue",
+            heading,
             &track,
             authorization.user_id,
-            Some(position),
+            position,
         )))
     }
 
@@ -1436,7 +1446,8 @@ impl BotRuntime {
         // Everything past this point came from a file somebody uploaded. Each
         // link is checked against what the source will accept before any of
         // them can become a subprocess argument later.
-        let mut tracks = Vec::with_capacity(export.tracks.len());
+        let offered = export.tracks.len();
+        let mut tracks = Vec::with_capacity(offered.min(self.config.playback.max_queue_length));
         for track in export
             .tracks
             .into_iter()
@@ -1467,11 +1478,12 @@ impl BotRuntime {
             mention(authorization.user_id),
             bulk.accepted
         );
-        if bulk.refused > 0 {
+        let refused = offered - bulk.accepted;
+        if refused > 0 {
             let _ = write!(
                 reply,
                 " {} did not fit the {}-track queue limit.",
-                bulk.refused, self.config.playback.max_queue_length
+                refused, self.config.playback.max_queue_length
             );
         }
         Ok(InteractionReply::message(reply))
@@ -2432,7 +2444,7 @@ async fn playback_worker(
                     {
                         StartTrackOutcome::Started | StartTrackOutcome::Stale => {}
                         StartTrackOutcome::Failed(failure) => {
-                            feedback.send_replace(Some(*failure));
+                            feedback.send_replace(Some(failure));
                         }
                         StartTrackOutcome::Superseded(next) => deferred = Some(*next),
                         StartTrackOutcome::Shutdown => break,
@@ -2441,6 +2453,7 @@ async fn playback_worker(
             }
         }
 
+        drop(transitions);
         drop(feedback);
         voice.leave().await;
     };
@@ -2504,7 +2517,7 @@ enum WorkerFailure {
 enum StartTrackOutcome {
     Started,
     Superseded(Box<PlayerTransition>),
-    Failed(Box<WorkerFailure>),
+    Failed(WorkerFailure),
     Stale,
     Shutdown,
 }
@@ -2526,28 +2539,38 @@ async fn start_track(
 ) -> StartTrackOutcome {
     // Preparing reaches the network and takes seconds, so a skip arriving in
     // the middle of it has to be able to supersede the track being prepared.
-    let prepared = {
-        let preparation = voice.prepare(&item.track);
-        tokio::pin!(preparation);
+    let preparation = voice.prepare(&item.track);
+    tokio::pin!(preparation);
+    let mut ready = None;
+    let mut paused = false;
+    let mut volume = volume;
+    let prepared = loop {
+        if !paused && let Some(input) = ready.take() {
+            break input;
+        }
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return StartTrackOutcome::Shutdown,
             next = transitions.recv() => {
-                return next.map_or(StartTrackOutcome::Shutdown, |transition| {
-                    StartTrackOutcome::Superseded(Box::new(transition))
-                });
+                let Some(next) = next else { return StartTrackOutcome::Shutdown };
+                match next.directive {
+                    PlaybackDirective::SetVolume => volume = volume_scale(next.snapshot.volume_percent),
+                    PlaybackDirective::Pause => paused = true,
+                    PlaybackDirective::Resume => paused = false,
+                    _ => return StartTrackOutcome::Superseded(Box::new(next)),
+                }
             }
-            result = &mut preparation => result,
-        }
-    };
-    observability.record_source_resolution(prepared.is_ok());
-    let prepared = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return StartTrackOutcome::Failed(Box::new(WorkerFailure::Track(
-                Box::new(item),
-                error.to_string(),
-            )));
+            result = &mut preparation, if ready.is_none() => {
+                observability.record_source_resolution(result.is_ok());
+                match result {
+                    Ok(input) => ready = Some(input),
+                    Err(error) => {
+                        return StartTrackOutcome::Failed(WorkerFailure::Track(
+                            Box::new(item.clone()), error.to_string(),
+                        ));
+                    }
+                }
+            }
         }
     };
     let (current, channel_id) = player.playback_target();
@@ -2581,16 +2604,16 @@ async fn start_track(
         // each, failing identically every time and saying nothing.
         if matches!(error, VoiceError::Join(_)) {
             tracing::warn!(%error, guild_id, channel_id, "failed to take a voice channel for a track");
-            return StartTrackOutcome::Failed(Box::new(WorkerFailure::Channel {
+            return StartTrackOutcome::Failed(WorkerFailure::Channel {
                 channel_id,
                 origin: Some(item.response_channel_id),
                 error: error.to_string(),
-            }));
+            });
         }
-        return StartTrackOutcome::Failed(Box::new(WorkerFailure::Track(
-            Box::new(item),
+        return StartTrackOutcome::Failed(WorkerFailure::Track(
+            Box::new(item.clone()),
             error.to_string(),
-        )));
+        ));
     }
     tracing::info!(
         guild_id,
@@ -2856,28 +2879,6 @@ fn followup_message(content: impl Into<String>) -> CreateInteractionResponseFoll
         .allowed_mentions(no_mentions())
 }
 
-#[cfg(unix)]
-async fn shutdown_signal() -> &'static str {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler is available");
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.expect("SIGINT handler is available");
-            "SIGINT"
-        }
-        _ = terminate.recv() => "SIGTERM",
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> &'static str {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("interrupt handler is available");
-    "interrupt"
-}
-
 /// End-to-end tests of a real player driving a real worker, with a fake voice
 /// channel on the far side.
 ///
@@ -3119,6 +3120,47 @@ idle_timeout_seconds = 900
     }
 
     #[tokio::test]
+    async fn controls_during_preparation_apply_to_the_track_being_started() {
+        let (player, mut transitions, _actor) =
+            spawn_guild_player(GUILD, 10, 8, 1, Duration::from_secs(60), 50);
+        let queued = item(1);
+        player.enqueue(queued.clone(), VOICE_CHANNEL).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.hold(Hold::Requested).await.unwrap();
+        player.set_volume(30).await.unwrap();
+        let voice = FakeVoice::new();
+        let announcer = Announcer {
+            http: Arc::new(super::build_http("test-token", None)),
+            config: config(),
+        };
+        let metrics = ObservabilityState::default();
+        let cancellation = CancellationToken::new();
+        let start = super::start_track(
+            GUILD,
+            VOICE_CHANNEL,
+            &player,
+            &mut transitions,
+            &voice,
+            &announcer,
+            &metrics,
+            &cancellation,
+            queued,
+            0.5,
+            true,
+        );
+        tokio::pin!(start);
+        assert!(
+            time::timeout(Duration::from_millis(20), &mut start)
+                .await
+                .is_err()
+        );
+        assert!(voice.actions().is_empty());
+        player.release(Release::Anything).await.unwrap();
+        assert!(matches!(start.await, super::StartTrackOutcome::Started));
+        assert_eq!(voice.actions(), [played(1, 30)]);
+    }
+
+    #[tokio::test]
     async fn holding_and_continuing_reach_the_track_that_is_playing() {
         let session = Session::start(Duration::from_secs(900)).await;
         session
@@ -3293,6 +3335,7 @@ idle_timeout_seconds = 900
             let snapshot = session.player.snapshot().await.unwrap();
             assert_eq!(snapshot.current.unwrap().queue_id, item(2).queue_id);
             assert!(snapshot.pending.is_empty());
+            session.discord.settle(1).await.unwrap();
             assert_eq!(session.discord.requests().len(), 1);
             session.finish().await;
         }

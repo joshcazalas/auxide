@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt as _, stream};
 use reqwest::{
     Client as HttpClient, StatusCode,
@@ -132,11 +132,8 @@ impl AudioPipeline {
                 let target = attempt.url();
                 if attempt.previous().len() >= 5 {
                     attempt.error("media redirect limit exceeded")
-                } else if target.scheme() != "https"
-                    || !target.username().is_empty()
-                    || target.password().is_some()
-                {
-                    attempt.error("media redirect was not credential-free HTTPS")
+                } else if !crate::source::media_url_allowed(target) {
+                    attempt.error("media redirect left the YouTube CDN")
                 } else {
                     attempt.follow()
                 }
@@ -426,9 +423,20 @@ enum Chunk {
     Range { bytes: Bytes, total: Option<u64> },
     /// The origin ignored the range and answered with the whole resource, so
     /// there is nothing left to ask for.
-    Whole(Bytes),
+    Whole(reqwest::Response),
     /// The range starts past the end of the resource.
     Exhausted,
+}
+
+enum BodyState {
+    Range {
+        position: u64,
+        total: Option<u64>,
+    },
+    Whole {
+        response: reqwest::Response,
+        skip: u64,
+    },
 }
 
 impl ChunkedHttpRequest {
@@ -439,51 +447,59 @@ impl ChunkedHttpRequest {
     fn body(&self, start: u64) -> impl Stream<Item = IoResult<Bytes>> + Send + Sync + use<> {
         let request = self.clone();
 
-        stream::try_unfold(Some((start, None::<u64>)), move |state| {
-            let request = request.clone();
-            async move {
-                let Some((position, total)) = state else {
-                    return Ok(None);
-                };
-                if total.is_some_and(|total| position >= total) {
-                    return Ok(None);
+        stream::try_unfold(
+            BodyState::Range {
+                position: start,
+                total: None,
+            },
+            move |mut state| {
+                let request = request.clone();
+                async move {
+                    loop {
+                        match &mut state {
+                            BodyState::Whole { response, skip } => {
+                                let Some(bytes) = response
+                                    .chunk()
+                                    .await
+                                    .map_err(|e| IoError::other(e.without_url()))?
+                                else {
+                                    return Ok(None);
+                                };
+                                let dropped = usize::try_from(*skip)
+                                    .unwrap_or(usize::MAX)
+                                    .min(bytes.len());
+                                *skip -= dropped as u64;
+                                if dropped < bytes.len() {
+                                    return Ok(Some((bytes.slice(dropped..), state)));
+                                }
+                            }
+                            BodyState::Range { position, total } => {
+                                if total.is_some_and(|end| *position >= end) {
+                                    return Ok(None);
+                                }
+                                match request.chunk(*position, *total).await? {
+                                    Chunk::Exhausted => return Ok(None),
+                                    Chunk::Whole(response) => {
+                                        state = BodyState::Whole {
+                                            response,
+                                            skip: *position,
+                                        }
+                                    }
+                                    Chunk::Range {
+                                        bytes,
+                                        total: stated,
+                                    } => {
+                                        *position += bytes.len() as u64;
+                                        *total = stated.or(*total);
+                                        return Ok(Some((bytes, state)));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
-
-                match request.chunk(position, total).await? {
-                    Chunk::Exhausted => Ok(None),
-                    // A 200 means the range was ignored and this one response
-                    // carries the resource from its very start, so whatever has
-                    // already played has to come off the front of it.
-                    Chunk::Whole(bytes) => {
-                        let played = usize::try_from(position).unwrap_or(usize::MAX);
-                        Ok((played < bytes.len()).then(|| (bytes.slice(played..), None)))
-                    }
-                    // The next request resumes from the bytes that actually
-                    // arrived, never from the length a response advertised. A
-                    // body cut short mid-chunk would otherwise leave a gap the
-                    // container never recovers from, which reads as audio that
-                    // simply stops.
-                    Chunk::Range {
-                        bytes,
-                        total: stated,
-                    } if !bytes.is_empty() => {
-                        let next = position.saturating_add(bytes.len() as u64);
-                        // A length, once stated, stays known even if a later
-                        // response omits it.
-                        Ok(Some((bytes, Some((next, stated.or(total))))))
-                    }
-                    // A response that delivered nothing would otherwise have
-                    // this ask for the same bytes forever.
-                    Chunk::Range { .. } => {
-                        tracing::warn!(
-                            position,
-                            "media request delivered no bytes; ending the stream"
-                        );
-                        Ok(None)
-                    }
-                }
-            }
-        })
+            },
+        )
         .take_until(self.cancellation.clone().cancelled_owned())
     }
 
@@ -543,7 +559,7 @@ impl ChunkedHttpRequest {
             .send();
 
         let chunk = async {
-            let response = sent
+            let mut response = sent
                 .await
                 .map_err(|error| IoError::other(error.without_url()))?;
             let status = response.status();
@@ -564,23 +580,44 @@ impl ChunkedHttpRequest {
                     ),
                 ));
             }
-            let total = content_range_total(response.headers());
-            let bytes = response
-                .bytes()
+            if status == StatusCode::OK {
+                return Ok(Chunk::Whole(response));
+            }
+            if status != StatusCode::PARTIAL_CONTENT {
+                return Err(IoError::new(
+                    IoErrorKind::InvalidData,
+                    "unexpected media response status",
+                ));
+            }
+            let (first, end, total) = content_range(response.headers())
+                .filter(|(first, end, _)| *first == position && *end <= last)
+                .ok_or_else(|| {
+                    IoError::new(IoErrorKind::InvalidData, "unexpected media byte range")
+                })?;
+            let expected = usize::try_from(end - first + 1).map_err(IoError::other)?;
+            let mut bytes = BytesMut::new();
+            while let Some(part) = response
+                .chunk()
                 .await
-                .map_err(|error| IoError::other(error.without_url()))?;
-            tracing::debug!(
-                position,
-                last,
-                status = status.as_u16(),
-                served = bytes.len(),
+                .map_err(|e| IoError::other(e.without_url()))?
+            {
+                if part.len() > expected - bytes.len() {
+                    return Err(IoError::new(
+                        IoErrorKind::InvalidData,
+                        "media body exceeds its byte range",
+                    ));
+                }
+                bytes.extend_from_slice(&part);
+            }
+            if bytes.len() != expected {
+                return Err(IoError::new(
+                    IoErrorKind::UnexpectedEof,
+                    "incomplete media byte range",
+                ));
+            }
+            Ok(Chunk::Range {
+                bytes: bytes.freeze(),
                 total,
-                "fetched a media chunk"
-            );
-            Ok(if status == StatusCode::OK {
-                Chunk::Whole(bytes)
-            } else {
-                Chunk::Range { bytes, total }
             })
         };
 
@@ -647,12 +684,24 @@ fn range_end(position: u64, total: Option<u64>) -> u64 {
 
 /// Reads the total resource length out of a `Content-Range: bytes A-B/TOTAL` header.
 fn content_range_total(headers: &HeaderMap) -> Option<u64> {
-    headers
+    content_range(headers)?.2
+}
+
+fn content_range(headers: &HeaderMap) -> Option<(u64, u64, Option<u64>)> {
+    let value = headers
         .get(CONTENT_RANGE)?
         .to_str()
         .ok()?
-        .rsplit_once('/')
-        .and_then(|(_, total)| total.trim().parse().ok())
+        .strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (first, end) = range.split_once('-')?;
+    let (first, end) = (first.parse().ok()?, end.parse().ok()?);
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse().ok()?)
+    };
+    (first <= end && total.is_none_or(|length| end < length)).then_some((first, end, total))
 }
 
 struct ChunkedHttpStream {
@@ -1097,6 +1146,33 @@ mod tests {
                 "no length probe or container seeks"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_full_response_delivers_the_first_bytes_before_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/media", listener.local_addr().unwrap());
+        let (release, finish) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0; 1024];
+            assert!(socket.read(&mut head).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nabc")
+                .await
+                .unwrap();
+            finish.await.unwrap();
+            socket.write_all(b"def").await.unwrap();
+        });
+        let mut stream = request(&url).open(0);
+        let mut first = [0; 3];
+        time::timeout(Duration::from_secs(3), stream.read_exact(&mut first))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&first, b"abc");
+        release.send(()).unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]
