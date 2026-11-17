@@ -1,3 +1,4 @@
+use crate::shutdown::shutdown_signal;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write as _,
@@ -1340,25 +1341,22 @@ impl BotRuntime {
             .player
             .enqueue(item, voice_channel_id)
             .await?;
-        if matches!(transition.directive, PlaybackDirective::Play(_)) {
-            return Ok(Announcement::card(track_embed(
-                "Now playing",
-                &track,
-                authorization.user_id,
-                None,
-            )));
-        }
         let position = transition
             .snapshot
             .pending
             .iter()
             .position(|queued| queued.queue_id == queue_id)
-            .map_or(1, |index| index + 2);
+            .map(|index| index + 1);
+        let heading = if position.is_some() {
+            "Added to the queue"
+        } else {
+            "Now playing"
+        };
         Ok(Announcement::card(track_embed(
-            "Added to the queue",
+            heading,
             &track,
             authorization.user_id,
-            Some(position),
+            position,
         )))
     }
 
@@ -1487,7 +1485,8 @@ impl BotRuntime {
         // Everything past this point came from a file somebody uploaded. Each
         // link is checked against what the source will accept before any of
         // them can become a subprocess argument later.
-        let mut tracks = Vec::with_capacity(export.tracks.len());
+        let offered = export.tracks.len();
+        let mut tracks = Vec::with_capacity(offered.min(self.config.playback.max_queue_length));
         for track in export
             .tracks
             .into_iter()
@@ -1518,11 +1517,12 @@ impl BotRuntime {
             mention(authorization.user_id),
             bulk.accepted
         );
-        if bulk.refused > 0 {
+        let refused = offered - bulk.accepted;
+        if refused > 0 {
             let _ = write!(
                 reply,
                 " {} did not fit the {}-track queue limit.",
-                bulk.refused, self.config.playback.max_queue_length
+                refused, self.config.playback.max_queue_length
             );
         }
         Ok(InteractionReply::message(reply))
@@ -2542,22 +2542,35 @@ async fn start_track(
     // the middle of it has to be able to supersede the track being prepared.
     let preparation = voice.prepare(&item.track);
     tokio::pin!(preparation);
-    let prepared = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return StartTrackOutcome::Shutdown,
-        next = transitions.recv() => {
-            return next.map_or(StartTrackOutcome::Shutdown, |transition| {
-                StartTrackOutcome::Superseded(Box::new(transition))
-            });
+    let mut ready = None;
+    let mut paused = false;
+    let mut volume = volume;
+    let prepared = loop {
+        if !paused && let Some(input) = ready.take() {
+            break input;
         }
-        result = &mut preparation => result,
-    };
-    observability.record_source_resolution(prepared.is_ok());
-    let prepared = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            fail_track(guild_id, player, announcer, &item, &error.to_string()).await;
-            return StartTrackOutcome::Failed;
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return StartTrackOutcome::Shutdown,
+            next = transitions.recv() => {
+                let Some(next) = next else { return StartTrackOutcome::Shutdown };
+                match next.directive {
+                    PlaybackDirective::SetVolume => volume = volume_scale(next.snapshot.volume_percent),
+                    PlaybackDirective::Pause => paused = true,
+                    PlaybackDirective::Resume => paused = false,
+                    _ => return StartTrackOutcome::Superseded(Box::new(next)),
+                }
+            }
+            result = &mut preparation, if ready.is_none() => {
+                observability.record_source_resolution(result.is_ok());
+                match result {
+                    Ok(input) => ready = Some(input),
+                    Err(error) => {
+                        fail_track(guild_id, player, announcer, &item, &error.to_string()).await;
+                        return StartTrackOutcome::Failed;
+                    }
+                }
+            }
         }
     };
     let current = match player.snapshot().await {
@@ -2862,28 +2875,6 @@ fn followup_message(content: impl Into<String>) -> CreateInteractionResponseFoll
         .allowed_mentions(no_mentions())
 }
 
-#[cfg(unix)]
-async fn shutdown_signal() -> &'static str {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler is available");
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.expect("SIGINT handler is available");
-            "SIGINT"
-        }
-        _ = terminate.recv() => "SIGTERM",
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> &'static str {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("interrupt handler is available");
-    "interrupt"
-}
-
 /// End-to-end tests of a real player driving a real worker, with a fake voice
 /// channel on the far side.
 ///
@@ -3122,6 +3113,47 @@ idle_timeout_seconds = 900
             [VoiceAction::Stopped, VoiceAction::Stopped, played(2, 50)]
         );
         session.finish().await;
+    }
+
+    #[tokio::test]
+    async fn controls_during_preparation_apply_to_the_track_being_started() {
+        let (player, mut transitions, _actor) =
+            spawn_guild_player(GUILD, 10, 8, 1, Duration::from_secs(60), 50);
+        let queued = item(1);
+        player.enqueue(queued.clone(), VOICE_CHANNEL).await.unwrap();
+        transitions.recv().await.unwrap();
+        player.hold(Hold::Requested).await.unwrap();
+        player.set_volume(30).await.unwrap();
+        let voice = FakeVoice::new();
+        let announcer = Announcer {
+            http: Arc::new(super::build_http("test-token", None)),
+            config: config(),
+        };
+        let metrics = ObservabilityState::default();
+        let cancellation = CancellationToken::new();
+        let start = super::start_track(
+            GUILD,
+            VOICE_CHANNEL,
+            &player,
+            &mut transitions,
+            &voice,
+            &announcer,
+            &metrics,
+            &cancellation,
+            queued,
+            0.5,
+            true,
+        );
+        tokio::pin!(start);
+        assert!(
+            time::timeout(Duration::from_millis(20), &mut start)
+                .await
+                .is_err()
+        );
+        assert!(voice.actions().is_empty());
+        player.release(Release::Anything).await.unwrap();
+        assert!(matches!(start.await, super::StartTrackOutcome::Started));
+        assert_eq!(voice.actions(), [played(1, 30)]);
     }
 
     #[tokio::test]

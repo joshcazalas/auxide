@@ -9,6 +9,7 @@ pub mod discord;
 pub mod observability;
 pub mod player;
 pub mod process;
+mod shutdown;
 pub mod source;
 pub mod spike;
 pub mod suggest;
