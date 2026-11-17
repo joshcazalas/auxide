@@ -1274,7 +1274,9 @@ impl GuildPlayer {
     }
 
     fn track_finished(&mut self, queue_id: Uuid, reason: Departure) -> PlayerTransition {
-        if self.current.as_ref().map(|item| item.queue_id) != Some(queue_id) {
+        if self.voice_channel_id.is_none()
+            || self.current.as_ref().map(|item| item.queue_id) != Some(queue_id)
+        {
             return self.transition(PlaybackDirective::None);
         }
         let finished = self.current.take();
