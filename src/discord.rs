@@ -30,7 +30,7 @@ use serenity::{
 };
 use songbird::{SerenityInit, Songbird};
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, mpsc, watch},
     task::JoinHandle,
     time,
 };
@@ -2316,109 +2316,135 @@ async fn playback_worker(
     observability: ObservabilityState,
     cancellation: CancellationToken,
 ) {
-    let mut deferred: Option<PlayerTransition> = None;
-
-    loop {
-        let transition = if let Some(transition) = deferred.take() {
-            Some(transition)
-        } else {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => None,
-                transition = transitions.recv() => transition,
-            }
-        };
-        let Some(transition) = transition else {
-            break;
-        };
-        // Every transition carries the session's level, so the worker never has
-        // to be told it separately — a track starting later reads it from here
-        // and a change to it while one plays arrives as its own directive.
-        let volume = volume_scale(transition.snapshot.volume_percent);
-
-        match transition.directive {
-            PlaybackDirective::None => {}
-            PlaybackDirective::Stop => voice.stop().await,
-            PlaybackDirective::Join(channel_id) => {
-                if let Err(error) = voice.join(channel_id).await {
-                    tracing::warn!(%error, guild_id, channel_id, "failed to take a voice channel");
-                    give_up_the_channel(
-                        guild_id,
-                        &player,
-                        &announcer,
-                        transition.snapshot.text_channel_id,
-                        &error,
-                    )
-                    .await;
-                }
-            }
-            PlaybackDirective::Pause => voice.pause().await,
-            PlaybackDirective::Resume => voice.resume().await,
-            PlaybackDirective::SetVolume => voice.set_volume(volume).await,
-            PlaybackDirective::StopAndDisconnect | PlaybackDirective::Disconnect => {
-                voice.leave().await;
-            }
-            PlaybackDirective::IdleExpired => {
-                // Nothing is done to a voice channel because a parked session
-                // holds none — this only closes out the promise `/leave` made
-                // to keep the queue, so that a queue quietly disappearing is
-                // not the first anybody hears of it.
-                announcer
-                    .announce(
-                        guild_id,
-                        transition.snapshot.text_channel_id,
-                        Announcement::text(format!(
-                            "The queue I kept when I left has expired after {}.",
-                            announcer.idle_hold()
-                        )),
-                    )
-                    .await;
-            }
-            PlaybackDirective::IdleDisconnect => {
-                voice.leave().await;
-                // The only departure nobody asked for, so the only one that has
-                // to explain itself.
-                announcer
-                    .announce(
-                        guild_id,
-                        transition.snapshot.text_channel_id,
-                        Announcement::text(format!(
-                            "Nothing has been queued for {}, so I have left the voice channel.",
-                            announcer.idle_hold()
-                        )),
-                    )
-                    .await;
-            }
-            PlaybackDirective::Play(item) | PlaybackDirective::Replace(item) => {
-                voice.stop().await;
-                let Some(channel_id) = transition.snapshot.voice_channel_id else {
-                    tracing::warn!(guild_id, queue_id = %item.queue_id, "play directive had no voice channel");
-                    continue;
-                };
-                match start_track(
-                    guild_id,
+    let (feedback, mut reports) = watch::channel(None::<WorkerFailure>);
+    // Feedback can wait for the actor while the voice worker keeps receiving.
+    // Only the latest pending failure can concern the current playback target.
+    let report = async {
+        while reports.changed().await.is_ok() {
+            let latest = reports.borrow_and_update().clone();
+            match latest {
+                Some(WorkerFailure::Channel {
                     channel_id,
-                    &player,
-                    &mut transitions,
-                    voice.as_ref(),
-                    &announcer,
-                    &observability,
-                    &cancellation,
-                    item,
-                    volume,
-                    transition.start_is_answered,
-                )
-                .await
-                {
-                    StartTrackOutcome::Started | StartTrackOutcome::Failed => {}
-                    StartTrackOutcome::Superseded(next) => deferred = Some(*next),
-                    StartTrackOutcome::Shutdown => break,
+                    origin,
+                    error,
+                }) => {
+                    give_up_the_channel(guild_id, &player, &announcer, channel_id, origin, &error)
+                        .await;
+                }
+                Some(WorkerFailure::Track(item, error)) => {
+                    fail_track(guild_id, &player, &announcer, &item, &error).await;
+                }
+                None => {}
+            }
+        }
+    };
+    let playback = async {
+        let mut deferred: Option<PlayerTransition> = None;
+
+        loop {
+            let transition = if let Some(transition) = deferred.take() {
+                Some(transition)
+            } else {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => None,
+                    transition = transitions.recv() => transition,
+                }
+            };
+            let Some(transition) = transition else {
+                break;
+            };
+            // Every transition carries the session's level, so the worker never has
+            // to be told it separately — a track starting later reads it from here
+            // and a change to it while one plays arrives as its own directive.
+            let volume = volume_scale(transition.snapshot.volume_percent);
+
+            match transition.directive {
+                PlaybackDirective::None => {}
+                PlaybackDirective::Stop => voice.stop().await,
+                PlaybackDirective::Join(channel_id) => {
+                    if let Err(error) = voice.join(channel_id).await {
+                        tracing::warn!(%error, guild_id, channel_id, "failed to take a voice channel");
+                        feedback.send_replace(Some(WorkerFailure::Channel {
+                            channel_id,
+                            origin: transition.snapshot.text_channel_id,
+                            error: error.to_string(),
+                        }));
+                    }
+                }
+                PlaybackDirective::Pause => voice.pause().await,
+                PlaybackDirective::Resume => voice.resume().await,
+                PlaybackDirective::SetVolume => voice.set_volume(volume).await,
+                PlaybackDirective::StopAndDisconnect | PlaybackDirective::Disconnect => {
+                    voice.leave().await;
+                }
+                PlaybackDirective::IdleExpired => {
+                    // Nothing is done to a voice channel because a parked session
+                    // holds none — this only closes out the promise `/leave` made
+                    // to keep the queue, so that a queue quietly disappearing is
+                    // not the first anybody hears of it.
+                    announcer
+                        .announce(
+                            guild_id,
+                            transition.snapshot.text_channel_id,
+                            Announcement::text(format!(
+                                "The queue I kept when I left has expired after {}.",
+                                announcer.idle_hold()
+                            )),
+                        )
+                        .await;
+                }
+                PlaybackDirective::IdleDisconnect => {
+                    voice.leave().await;
+                    // The only departure nobody asked for, so the only one that has
+                    // to explain itself.
+                    announcer
+                        .announce(
+                            guild_id,
+                            transition.snapshot.text_channel_id,
+                            Announcement::text(format!(
+                                "Nothing has been queued for {}, so I have left the voice channel.",
+                                announcer.idle_hold()
+                            )),
+                        )
+                        .await;
+                }
+                PlaybackDirective::Play(item) | PlaybackDirective::Replace(item) => {
+                    voice.stop().await;
+                    let Some(channel_id) = transition.snapshot.voice_channel_id else {
+                        tracing::warn!(guild_id, queue_id = %item.queue_id, "play directive had no voice channel");
+                        continue;
+                    };
+                    match start_track(
+                        guild_id,
+                        channel_id,
+                        &player,
+                        &mut transitions,
+                        voice.as_ref(),
+                        &announcer,
+                        &observability,
+                        &cancellation,
+                        item,
+                        volume,
+                        transition.start_is_answered,
+                    )
+                    .await
+                    {
+                        StartTrackOutcome::Started | StartTrackOutcome::Stale => {}
+                        StartTrackOutcome::Failed(failure) => {
+                            feedback.send_replace(Some(*failure));
+                        }
+                        StartTrackOutcome::Superseded(next) => deferred = Some(*next),
+                        StartTrackOutcome::Shutdown => break,
+                    }
                 }
             }
         }
-    }
 
-    voice.leave().await;
+        drop(feedback);
+        voice.leave().await;
+    };
+    tokio::join!(playback, report);
 }
 
 /// Stops pretending to hold a channel that could not be taken, and says so.
@@ -2443,11 +2469,13 @@ async fn give_up_the_channel(
     guild_id: u64,
     player: &GuildPlayerHandle,
     announcer: &Announcer,
+    channel_id: u64,
     text_channel_id: Option<u64>,
-    error: &VoiceError,
+    error: &str,
 ) {
-    if let Err(error) = player.park().await {
+    if let Err(error) = player.park_in(channel_id).await {
         tracing::debug!(%error, guild_id, "the session had already given the channel up");
+        return;
     }
     announcer
         .announce(
@@ -2456,17 +2484,28 @@ async fn give_up_the_channel(
             Announcement::text(format!(
                 "I could not join the voice channel — {}. Anything queued is kept for {}; \
                  `/play` or `/join` will try again.",
-                single_line(&error.to_string(), 200),
+                single_line(error, 200),
                 announcer.idle_hold()
             )),
         )
         .await;
 }
 
+#[derive(Clone)]
+enum WorkerFailure {
+    Channel {
+        channel_id: u64,
+        origin: Option<u64>,
+        error: String,
+    },
+    Track(Box<QueueItem>, String),
+}
+
 enum StartTrackOutcome {
     Started,
     Superseded(Box<PlayerTransition>),
-    Failed,
+    Failed(Box<WorkerFailure>),
+    Stale,
     Shutdown,
 }
 
@@ -2487,44 +2526,46 @@ async fn start_track(
 ) -> StartTrackOutcome {
     // Preparing reaches the network and takes seconds, so a skip arriving in
     // the middle of it has to be able to supersede the track being prepared.
-    let preparation = voice.prepare(&item.track);
-    tokio::pin!(preparation);
-    let prepared = tokio::select! {
-        biased;
-        () = cancellation.cancelled() => return StartTrackOutcome::Shutdown,
-        next = transitions.recv() => {
-            return next.map_or(StartTrackOutcome::Shutdown, |transition| {
-                StartTrackOutcome::Superseded(Box::new(transition))
-            });
+    let prepared = {
+        let preparation = voice.prepare(&item.track);
+        tokio::pin!(preparation);
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return StartTrackOutcome::Shutdown,
+            next = transitions.recv() => {
+                return next.map_or(StartTrackOutcome::Shutdown, |transition| {
+                    StartTrackOutcome::Superseded(Box::new(transition))
+                });
+            }
+            result = &mut preparation => result,
         }
-        result = &mut preparation => result,
     };
     observability.record_source_resolution(prepared.is_ok());
     let prepared = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
-            fail_track(guild_id, player, announcer, &item, &error.to_string()).await;
-            return StartTrackOutcome::Failed;
+            return StartTrackOutcome::Failed(Box::new(WorkerFailure::Track(
+                Box::new(item),
+                error.to_string(),
+            )));
         }
     };
-    let snapshot = match player.snapshot().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            tracing::warn!(%error, guild_id, "failed to verify queued track");
-            return StartTrackOutcome::Failed;
-        }
-    };
-    if snapshot.current.as_ref().map(|queued| queued.queue_id) != Some(item.queue_id) {
+    let (current, channel_id) = player.playback_target();
+    if current != Some(item.queue_id) {
         tracing::debug!(guild_id, queue_id = %item.queue_id, "discarding stale prepared source");
-        return StartTrackOutcome::Failed;
+        return StartTrackOutcome::Stale;
     }
-
-    let Some(channel_id) = snapshot.voice_channel_id else {
-        return StartTrackOutcome::Failed;
+    let Some(channel_id) = channel_id else {
+        return StartTrackOutcome::Stale;
     };
 
     if channel_id != requested_channel {
-        tracing::debug!(guild_id, requested_channel, channel_id, "voice channel moved during preparation");
+        tracing::debug!(
+            guild_id,
+            requested_channel,
+            channel_id,
+            "voice channel moved during preparation"
+        );
     }
 
     let ended = Arc::new(RuntimeTrackFinished {
@@ -2540,18 +2581,16 @@ async fn start_track(
         // each, failing identically every time and saying nothing.
         if matches!(error, VoiceError::Join(_)) {
             tracing::warn!(%error, guild_id, channel_id, "failed to take a voice channel for a track");
-            give_up_the_channel(
-                guild_id,
-                player,
-                announcer,
-                Some(item.response_channel_id),
-                &error,
-            )
-            .await;
-            return StartTrackOutcome::Failed;
+            return StartTrackOutcome::Failed(Box::new(WorkerFailure::Channel {
+                channel_id,
+                origin: Some(item.response_channel_id),
+                error: error.to_string(),
+            }));
         }
-        fail_track(guild_id, player, announcer, &item, &error.to_string()).await;
-        return StartTrackOutcome::Failed;
+        return StartTrackOutcome::Failed(Box::new(WorkerFailure::Track(
+            Box::new(item),
+            error.to_string(),
+        )));
     }
     tracing::info!(
         guild_id,
