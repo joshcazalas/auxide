@@ -6,7 +6,7 @@ use std::{
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use thiserror::Error;
 use tokio::{
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
     time::{self, Instant},
 };
@@ -278,6 +278,7 @@ pub struct SkipOutcome {
 
 #[derive(Clone, Debug)]
 pub struct GuildPlayerHandle {
+    target: watch::Receiver<(Option<Uuid>, Option<u64>)>,
     guild_id: u64,
     commands: mpsc::Sender<PlayerCommand>,
 }
@@ -460,7 +461,11 @@ impl GuildPlayerHandle {
     /// Returns [`PlayerError::NotConnected`] when there is no channel to give
     /// up, or a channel error if the actor has stopped.
     pub async fn park(&self) -> Result<PlayerTransition, PlayerError> {
-        self.request(|reply| PlayerCommand::Park { reply }).await?
+        self.request(|reply| PlayerCommand::Park {
+            expected: None,
+            reply,
+        })
+        .await?
     }
 
     /// Takes a voice channel, and picks a parked queue back up.
@@ -576,6 +581,18 @@ impl GuildPlayerHandle {
             .await
     }
 
+    pub(crate) fn playback_target(&self) -> (Option<Uuid>, Option<u64>) {
+        *self.target.borrow()
+    }
+
+    pub(crate) async fn park_in(&self, channel_id: u64) -> Result<PlayerTransition, PlayerError> {
+        self.request(|reply| PlayerCommand::Park {
+            expected: Some(channel_id),
+            reply,
+        })
+        .await?
+    }
+
     pub(crate) async fn voice_moved(&self, from: u64, to: Option<u64>) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::VoiceMoved { from, to, reply })
             .await
@@ -620,7 +637,9 @@ pub fn spawn_guild_player(
     assert!(!idle_timeout.is_zero(), "idle_timeout must be positive");
     let (commands, receiver) = mpsc::channel(mailbox_capacity);
     let (transitions, transition_receiver) = mpsc::channel(mailbox_capacity);
+    let (target, target_rx) = watch::channel((None, None));
     let actor = GuildPlayer {
+        target,
         max_tracks,
         current: None,
         pending: VecDeque::new(),
@@ -640,7 +659,11 @@ pub fn spawn_guild_player(
     };
     let task = tokio::spawn(actor.run());
     (
-        GuildPlayerHandle { guild_id, commands },
+        GuildPlayerHandle {
+            guild_id,
+            commands,
+            target: target_rx,
+        },
         transition_receiver,
         task,
     )
@@ -694,6 +717,7 @@ enum PlayerCommand {
         reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
     },
     Park {
+        expected: Option<u64>,
         reply: oneshot::Sender<Result<PlayerTransition, PlayerError>>,
     },
     Join {
@@ -735,6 +759,7 @@ enum PlayerCommand {
 
 #[derive(Debug)]
 struct GuildPlayer {
+    target: watch::Sender<(Option<Uuid>, Option<u64>)>,
     max_tracks: usize,
     current: Option<QueueItem>,
     pending: VecDeque<QueueItem>,
@@ -897,8 +922,12 @@ impl GuildPlayer {
                 }
                 let _ = reply.send(result);
             }
-            PlayerCommand::Park { reply } => {
-                let result = self.park();
+            PlayerCommand::Park { expected, reply } => {
+                let result = if expected.is_some() && expected != self.voice_channel_id {
+                    Err(PlayerError::NotConnected)
+                } else {
+                    self.park()
+                };
                 if let Ok(transition) = &result {
                     self.emit(transition.clone()).await;
                 }
@@ -946,6 +975,7 @@ impl GuildPlayer {
                 if self.voice_channel_id == Some(from) {
                     if let Some(channel) = to {
                         self.voice_channel_id = Some(channel);
+                        self.publish_target();
                     } else if let Ok(transition) = self.park() {
                         self.emit(transition).await;
                     }
@@ -963,7 +993,22 @@ impl GuildPlayer {
         true
     }
 
+    fn publish_target(&self) {
+        let current = (
+            self.current.as_ref().map(|item| item.queue_id),
+            self.voice_channel_id,
+        );
+        self.target.send_if_modified(|previous| {
+            if *previous == current {
+                return false;
+            }
+            *previous = current;
+            true
+        });
+    }
+
     async fn emit(&self, transition: PlayerTransition) -> bool {
+        self.publish_target();
         if transition.directive == PlaybackDirective::None {
             return true;
         }
@@ -1484,6 +1529,27 @@ mod tests {
             requested_by: 42,
             response_channel_id: 99,
         }
+    }
+
+    #[tokio::test]
+    async fn playback_target_is_readable_while_transition_delivery_waits() {
+        let (player, mut effects, _actor) =
+            spawn_guild_player(7, 8, 1, 1, Duration::from_secs(30), 50);
+        player
+            .enqueue_all(vec![item(1), item(2)], 10)
+            .await
+            .unwrap();
+        let control = player.clone();
+        let skip = tokio::spawn(async move { control.skip().await.unwrap() });
+        time::timeout(Duration::from_secs(2), async {
+            while player.playback_target() != (Some(item(2).queue_id), Some(10)) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        effects.recv().await.unwrap();
+        skip.await.unwrap();
     }
 
     #[tokio::test]
