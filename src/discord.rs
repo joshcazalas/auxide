@@ -2328,28 +2328,7 @@ async fn playback_worker(
     observability: ObservabilityState,
     cancellation: CancellationToken,
 ) {
-    let (feedback, mut reports) = watch::channel(None::<WorkerFailure>);
-    // Feedback can wait for the actor while the voice worker keeps receiving.
-    // Only the latest pending failure can concern the current playback target.
-    let report = async {
-        while reports.changed().await.is_ok() {
-            let latest = reports.borrow_and_update().clone();
-            match latest {
-                Some(WorkerFailure::Channel {
-                    channel_id,
-                    origin,
-                    error,
-                }) => {
-                    give_up_the_channel(guild_id, &player, &announcer, channel_id, origin, &error)
-                        .await;
-                }
-                Some(WorkerFailure::Track(item, error)) => {
-                    fail_track(guild_id, &player, &announcer, &item, &error).await;
-                }
-                None => {}
-            }
-        }
-    };
+    let (feedback, reports) = watch::channel(None::<WorkerFailure>);
     let playback = async {
         let mut deferred: Option<PlayerTransition> = None;
 
@@ -2423,13 +2402,12 @@ async fn playback_worker(
                 }
                 PlaybackDirective::Play(item) | PlaybackDirective::Replace(item) => {
                     voice.stop().await;
-                    let Some(channel_id) = transition.snapshot.voice_channel_id else {
+                    if transition.snapshot.voice_channel_id.is_none() {
                         tracing::warn!(guild_id, queue_id = %item.queue_id, "play directive had no voice channel");
                         continue;
-                    };
+                    }
                     match start_track(
                         guild_id,
-                        channel_id,
                         &player,
                         &mut transitions,
                         voice.as_ref(),
@@ -2457,7 +2435,36 @@ async fn playback_worker(
         drop(feedback);
         voice.leave().await;
     };
-    tokio::join!(playback, report);
+    tokio::join!(
+        playback,
+        report_failures(guild_id, &player, &announcer, reports)
+    );
+}
+
+/// Report failures while playback keeps draining the actor's bounded output.
+/// Only the latest pending failure can concern the current playback target.
+async fn report_failures(
+    guild_id: u64,
+    player: &GuildPlayerHandle,
+    announcer: &Announcer,
+    mut reports: watch::Receiver<Option<WorkerFailure>>,
+) {
+    while reports.changed().await.is_ok() {
+        let latest = reports.borrow_and_update().clone();
+        match latest {
+            Some(WorkerFailure::Channel {
+                channel_id,
+                origin,
+                error,
+            }) => {
+                give_up_the_channel(guild_id, player, announcer, channel_id, origin, &error).await;
+            }
+            Some(WorkerFailure::Track(item, error)) => {
+                fail_track(guild_id, player, announcer, &item, &error).await;
+            }
+            None => {}
+        }
+    }
 }
 
 /// Stops pretending to hold a channel that could not be taken, and says so.
@@ -2525,7 +2532,6 @@ enum StartTrackOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn start_track(
     guild_id: u64,
-    requested_channel: u64,
     player: &GuildPlayerHandle,
     transitions: &mut mpsc::Receiver<PlayerTransition>,
     voice: &dyn VoiceGateway,
@@ -2581,15 +2587,6 @@ async fn start_track(
     let Some(channel_id) = channel_id else {
         return StartTrackOutcome::Stale;
     };
-
-    if channel_id != requested_channel {
-        tracing::debug!(
-            guild_id,
-            requested_channel,
-            channel_id,
-            "voice channel moved during preparation"
-        );
-    }
 
     let ended = Arc::new(RuntimeTrackFinished {
         player: player.clone(),
@@ -3137,7 +3134,6 @@ idle_timeout_seconds = 900
         let cancellation = CancellationToken::new();
         let start = super::start_track(
             GUILD,
-            VOICE_CHANNEL,
             &player,
             &mut transitions,
             &voice,
