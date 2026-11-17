@@ -1,3 +1,4 @@
+use crate::shutdown::shutdown_signal;
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write as _,
@@ -2811,28 +2812,6 @@ fn followup_message(content: impl Into<String>) -> CreateInteractionResponseFoll
     CreateInteractionResponseFollowup::new()
         .content(bounded_message(content.into()))
         .allowed_mentions(no_mentions())
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() -> &'static str {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler is available");
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.expect("SIGINT handler is available");
-            "SIGINT"
-        }
-        _ = terminate.recv() => "SIGTERM",
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> &'static str {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("interrupt handler is available");
-    "interrupt"
 }
 
 /// End-to-end tests of a real player driving a real worker, with a fake voice

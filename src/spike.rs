@@ -1,3 +1,4 @@
+use crate::shutdown::shutdown_signal;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -90,7 +91,7 @@ pub async fn run_voice_spike(
     if guild_id == 0 || channel_id == 0 {
         bail!("guild and channel IDs must be non-zero Discord snowflakes");
     }
-    if config.guild(guild_id).is_none() {
+    if !config.allows_guild(guild_id) {
         bail!("guild {guild_id} is not in the configuration allowlist");
     }
 
@@ -261,26 +262,4 @@ async fn prepare_input(config: &Config, source: VoiceSpikeSource) -> Result<Inpu
                 .await
         }
     }
-}
-
-#[cfg(unix)]
-async fn shutdown_signal() -> &'static str {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler is available");
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => {
-            result.expect("SIGINT handler is available");
-            "SIGINT"
-        }
-        _ = terminate.recv() => "SIGTERM",
-    }
-}
-
-#[cfg(not(unix))]
-async fn shutdown_signal() -> &'static str {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("interrupt handler is available");
-    "interrupt"
 }
