@@ -560,6 +560,17 @@ impl EventHandler for DiscordHandler {
         );
     }
 
+    async fn guild_delete(
+        &self,
+        _ctx: Context,
+        guild: serenity::all::UnavailableGuild,
+        _full: Option<serenity::all::Guild>,
+    ) {
+        if !guild.unavailable {
+            self.runtime.retire_session(guild.id.get()).await;
+        }
+    }
+
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         self.runtime.handle_interaction(&ctx, interaction).await;
     }
@@ -586,9 +597,9 @@ struct BotRuntime {
     /// such a list there is nothing to enumerate at startup, and creating an
     /// actor, a worker, and a queue for every server the bot merely sits in
     /// would pay for servers that never issue a command.
-    sessions: Mutex<HashMap<u64, GuildSession>>,
+    // A vacant value reserves the guild while its old voice worker leaves.
+    sessions: Mutex<HashMap<u64, Option<RunningSession>>>,
     pending_searches: Mutex<HashMap<Uuid, PendingSearch>>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
     observability: ObservabilityState,
     cancellation: CancellationToken,
 }
@@ -596,6 +607,27 @@ struct BotRuntime {
 #[derive(Clone)]
 struct GuildSession {
     player: GuildPlayerHandle,
+}
+
+struct RunningSession {
+    handle: GuildSession,
+    cancellation: CancellationToken,
+    actor: JoinHandle<()>,
+    worker: JoinHandle<()>,
+}
+
+impl RunningSession {
+    async fn close(self) {
+        self.cancellation.cancel();
+        let deadline = time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let _ = time::timeout_at(deadline, self.handle.player.shutdown()).await;
+        for mut task in [self.actor, self.worker] {
+            if time::timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
 }
 
 /// The part of a message that is the same whichever route it takes to Discord.
@@ -770,7 +802,6 @@ impl BotRuntime {
             voice_factory,
             sessions: Mutex::new(HashMap::new()),
             pending_searches: Mutex::new(HashMap::new()),
-            tasks: Mutex::new(Vec::new()),
             observability,
             cancellation,
         }
@@ -785,8 +816,14 @@ impl BotRuntime {
     /// [`DiscordConfig::max_guilds`]: crate::config::DiscordConfig::max_guilds
     async fn session(&self, guild_id: u64, http: &Arc<Http>) -> Result<GuildSession> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(session) = sessions.get(&guild_id) {
-            return Ok(session.clone());
+        if self.cancellation.is_cancelled() {
+            bail!("Auxide is shutting down");
+        }
+        if let Some(slot) = sessions.get(&guild_id) {
+            return slot
+                .as_ref()
+                .map(|session| session.handle.clone())
+                .context("this server is disconnecting");
         }
         if sessions.len() >= self.config.discord.max_guilds {
             bail!("Auxide is already serving as many servers as it is configured to hold");
@@ -801,6 +838,7 @@ impl BotRuntime {
             self.config.playback.starting_volume_percent(),
         );
         let voice = self.voice_factory.create(guild_id);
+        let cancellation = self.cancellation.child_token();
         let worker_task = tokio::spawn(playback_worker(
             guild_id,
             player.clone(),
@@ -808,16 +846,18 @@ impl BotRuntime {
             Arc::clone(&voice),
             self.announcer(http),
             self.observability.clone(),
-            self.cancellation.child_token(),
+            cancellation.clone(),
         ));
-        {
-            let mut tasks = self.tasks.lock().await;
-            tasks.push(actor_task);
-            tasks.push(worker_task);
-        }
-
         let session = GuildSession { player };
-        sessions.insert(guild_id, session.clone());
+        sessions.insert(
+            guild_id,
+            Some(RunningSession {
+                handle: session.clone(),
+                cancellation,
+                actor: actor_task,
+                worker: worker_task,
+            }),
+        );
         self.observability
             .set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
         tracing::info!(guild_id, servers = sessions.len(), "started a guild player");
@@ -857,7 +897,12 @@ impl BotRuntime {
     /// that have never issued a command, so this deliberately cannot create a
     /// player the way [`BotRuntime::session`] does.
     async fn existing_session(&self, guild_id: u64) -> Option<GuildSession> {
-        self.sessions.lock().await.get(&guild_id).cloned()
+        self.sessions
+            .lock()
+            .await
+            .get(&guild_id)
+            .and_then(Option::as_ref)
+            .map(|session| session.handle.clone())
     }
 
     /// Ends the session once the last person leaves the channel Auxide is in.
@@ -1045,6 +1090,10 @@ impl BotRuntime {
                 command.data.name
             );
         }
+        if command.data.name == "help" {
+            self.check_command_access(command)?;
+            return Ok(Self::help());
+        }
         let authorization = self.authorize_command(ctx, command).await?;
         match command.data.name.as_str() {
             "play" => self.play(ctx, command, authorization).await,
@@ -1055,7 +1104,6 @@ impl BotRuntime {
             "import" => self.import(ctx, command, authorization).await,
             "remove" => self.remove(ctx, command, authorization).await,
             "skip" => self.skip(ctx, command, authorization).await,
-            "help" => Ok(Self::help()),
             "join" => self.join(authorization).await,
             "leave" => self.leave(ctx, authorization).await,
             "stop" => self.stop(ctx, authorization).await,
@@ -1945,27 +1993,27 @@ impl BotRuntime {
         )
     }
 
-    async fn shutdown(&self) {
-        // Take the map rather than holding its lock, so shutting a player down
-        // cannot deadlock against a request creating one.
-        let sessions = {
+    async fn retire_session(&self, guild_id: u64) {
+        let entry = self
+            .sessions
+            .lock()
+            .await
+            .get_mut(&guild_id)
+            .and_then(Option::take);
+        if let Some(entry) = entry {
+            entry.close().await;
             let mut sessions = self.sessions.lock().await;
-            std::mem::take(&mut *sessions)
-        };
-        for session in sessions.values() {
-            if let Err(error) = session.player.shutdown().await {
-                tracing::debug!(%error, guild_id = session.player.guild_id(), "guild actor already stopped");
-            }
+            sessions.remove(&guild_id);
+            self.observability
+                .set_guild_players(sessions.len().try_into().unwrap_or(u64::MAX));
         }
+    }
+
+    async fn shutdown(&self) {
         self.cancellation.cancel();
-        let mut tasks = self.tasks.lock().await;
-        let draining = std::mem::take(&mut *tasks);
-        drop(tasks);
-        for mut task in draining {
-            if time::timeout(SHUTDOWN_TIMEOUT, &mut task).await.is_err() {
-                task.abort();
-            }
-        }
+        let sessions = std::mem::take(&mut *self.sessions.lock().await);
+        futures_util::future::join_all(sessions.into_values().flatten().map(RunningSession::close))
+            .await;
         self.observability.set_guild_players(0);
     }
 }
