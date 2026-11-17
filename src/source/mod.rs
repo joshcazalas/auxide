@@ -8,6 +8,7 @@ use thiserror::Error;
 use url::Url;
 
 pub use youtube::YouTubeResolver;
+pub(crate) use youtube::media_url_allowed;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TrackMetadata {

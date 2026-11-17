@@ -132,11 +132,8 @@ impl AudioPipeline {
                 let target = attempt.url();
                 if attempt.previous().len() >= 5 {
                     attempt.error("media redirect limit exceeded")
-                } else if target.scheme() != "https"
-                    || !target.username().is_empty()
-                    || target.password().is_some()
-                {
-                    attempt.error("media redirect was not credential-free HTTPS")
+                } else if !crate::source::media_url_allowed(target) {
+                    attempt.error("media redirect left the YouTube CDN")
                 } else {
                     attempt.follow()
                 }
