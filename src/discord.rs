@@ -1427,7 +1427,8 @@ impl BotRuntime {
         // Everything past this point came from a file somebody uploaded. Each
         // link is checked against what the source will accept before any of
         // them can become a subprocess argument later.
-        let mut tracks = Vec::with_capacity(export.tracks.len());
+        let offered = export.tracks.len();
+        let mut tracks = Vec::with_capacity(offered.min(self.config.playback.max_queue_length));
         for track in export
             .tracks
             .into_iter()
@@ -1458,11 +1459,12 @@ impl BotRuntime {
             mention(authorization.user_id),
             bulk.accepted
         );
-        if bulk.refused > 0 {
+        let refused = offered - bulk.accepted;
+        if refused > 0 {
             let _ = write!(
                 reply,
                 " {} did not fit the {}-track queue limit.",
-                bulk.refused, self.config.playback.max_queue_length
+                refused, self.config.playback.max_queue_length
             );
         }
         Ok(InteractionReply::message(reply))
