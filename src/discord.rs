@@ -2435,10 +2435,8 @@ async fn playback_worker(
         drop(feedback);
         voice.leave().await;
     };
-    tokio::join!(
-        playback,
-        report_failures(guild_id, &player, &announcer, reports)
-    );
+    let report = report_failures(guild_id, &player, &announcer, reports);
+    tokio::join!(playback, report);
 }
 
 /// Report failures while playback keeps draining the actor's bounded output.
