@@ -9,7 +9,6 @@ use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::Command,
-    task::JoinHandle,
     time,
 };
 
@@ -68,10 +67,20 @@ impl CommandSpec {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        #[cfg(unix)]
+        command.process_group(0);
+
         let mut child = command.spawn().map_err(|source| ProcessError::Spawn {
             program: self.program.clone(),
             source,
         })?;
+        #[cfg(unix)]
+        let mut group = ProcessGroup(
+            child
+                .id()
+                .and_then(|id| i32::try_from(id).ok())
+                .and_then(rustix::process::Pid::from_raw),
+        );
         let stdout = child
             .stdout
             .take()
@@ -80,22 +89,27 @@ impl CommandSpec {
             .stderr
             .take()
             .ok_or(ProcessError::MissingPipe("stderr"))?;
-        let stdout_task = spawn_bounded_read(stdout, self.max_output_bytes);
-        let stderr_task = spawn_bounded_read(stderr, self.max_output_bytes);
-
-        let Ok(status) = time::timeout(self.timeout, child.wait()).await else {
-            let _ = child.kill().await;
-            let _ = join_reader(stdout_task).await;
-            let _ = join_reader(stderr_task).await;
-            return Err(ProcessError::Timeout {
-                program: self.program.clone(),
-                timeout: self.timeout,
-            });
+        let collect = async {
+            let (stdout, stderr) = tokio::try_join!(
+                bounded_read(stdout, self.max_output_bytes),
+                bounded_read(stderr, self.max_output_bytes)
+            )?;
+            // Keep the leader unreaped until both pipes close so its process
+            // group ID remains reserved during cancellation.
+            let status = child.wait().await.map_err(ProcessError::Wait)?;
+            Ok::<_, ProcessError>((status, stdout, stderr))
         };
-        let status = status.map_err(ProcessError::Wait)?;
-
-        let stdout = join_reader(stdout_task).await?;
-        let stderr = join_reader(stderr_task).await?;
+        let (status, stdout, stderr) =
+            time::timeout(self.timeout, collect)
+                .await
+                .map_err(|_| ProcessError::Timeout {
+                    program: self.program.clone(),
+                    timeout: self.timeout,
+                })??;
+        #[cfg(unix)]
+        {
+            group.0 = None;
+        }
 
         Ok(CommandOutput {
             status,
@@ -117,29 +131,33 @@ pub struct CommandOutput {
     pub stderr: Vec<u8>,
 }
 
-fn spawn_bounded_read<R>(reader: R, max_bytes: usize) -> JoinHandle<Result<Vec<u8>, ProcessError>>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-        let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
-        reader
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .await
-            .map_err(ProcessError::Read)?;
-        if bytes.len() > max_bytes {
-            return Err(ProcessError::OutputLimit { max_bytes });
+#[cfg(unix)]
+struct ProcessGroup(Option<rustix::process::Pid>);
+
+#[cfg(unix)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        if let Some(group) = self.0 {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
-        Ok(bytes)
-    })
+    }
 }
 
-async fn join_reader(
-    task: JoinHandle<Result<Vec<u8>, ProcessError>>,
+async fn bounded_read<R: AsyncRead + Unpin>(
+    reader: R,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, ProcessError> {
-    task.await.map_err(ProcessError::ReaderTask)?
+    let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(ProcessError::Read)?;
+    if bytes.len() > max_bytes {
+        return Err(ProcessError::OutputLimit { max_bytes });
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, Error)]
@@ -162,8 +180,6 @@ pub enum ProcessError {
     Read(#[source] std::io::Error),
     #[error("process emitted more than the configured {max_bytes} bytes")]
     OutputLimit { max_bytes: usize },
-    #[error("process output reader task failed: {0}")]
-    ReaderTask(#[source] tokio::task::JoinError),
 }
 
 #[cfg(test)]
@@ -179,6 +195,17 @@ mod tests {
             .unwrap();
         assert!(result.status.success());
         assert_eq!(result.stdout, b"hello");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_deadline_includes_readers_inherited_by_helpers() {
+        let command =
+            CommandSpec::new("sh", Duration::from_millis(100), 16).args(["-c", "sleep 4 &"]);
+        let result = time::timeout(Duration::from_secs(2), command.run())
+            .await
+            .unwrap();
+        assert!(matches!(result, Err(ProcessError::Timeout { .. })));
     }
 
     #[tokio::test]
