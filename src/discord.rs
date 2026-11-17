@@ -1280,25 +1280,22 @@ impl BotRuntime {
             .player
             .enqueue(item, voice_channel_id)
             .await?;
-        if matches!(transition.directive, PlaybackDirective::Play(_)) {
-            return Ok(Announcement::card(track_embed(
-                "Now playing",
-                &track,
-                authorization.user_id,
-                None,
-            )));
-        }
         let position = transition
             .snapshot
             .pending
             .iter()
             .position(|queued| queued.queue_id == queue_id)
-            .map_or(1, |index| index + 2);
+            .map(|index| index + 1);
+        let heading = if position.is_some() {
+            "Added to the queue"
+        } else {
+            "Now playing"
+        };
         Ok(Announcement::card(track_embed(
-            "Added to the queue",
+            heading,
             &track,
             authorization.user_id,
-            Some(position),
+            position,
         )))
     }
 
