@@ -824,18 +824,10 @@ impl BotRuntime {
         Ok(session)
     }
 
-    /// Offers what has already been searched for, and never waits.
-    ///
-    /// Deliberately unauthorized: a suggestion reveals only what `YouTube`
-    /// would return for words the person typed themselves, changes nothing, and
-    /// costs nothing beyond a cache lookup. Refusing here would mean answering
-    /// a keystroke with a permission check.
     async fn suggest(&self, ctx: &Context, autocomplete: &CommandInteraction) {
-        let choices = match autocomplete
-            .data
-            .autocomplete()
-            .filter(|option| option.name == "query")
-        {
+        let choices = match autocomplete.data.autocomplete().filter(|option| {
+            option.name == "query" && self.check_command_access(autocomplete).is_ok()
+        }) {
             Some(option) => self.suggestions.for_query(option.value).await,
             None => Vec::new(),
         };
@@ -1082,16 +1074,22 @@ impl BotRuntime {
         ctx: &Context,
         command: &CommandInteraction,
     ) -> Result<Authorization> {
+        let guild_id = self.check_command_access(command)?;
+        self.authorization(ctx, guild_id, command.channel_id.get(), command.user.id)
+            .await
+    }
+
+    fn check_command_access(&self, command: &CommandInteraction) -> Result<u64> {
         let guild_id = command
             .guild_id
-            .context("Auxide commands are available only in configured servers")?;
+            .context("Auxide commands are available only in configured servers")?
+            .get();
         let member = command
             .member
             .as_deref()
             .context("Discord did not supply server membership for this request")?;
-        self.authorize(
-            ctx,
-            guild_id.get(),
+        self.check_access(
+            guild_id,
             command.channel_id.get(),
             command.user.id,
             &member
@@ -1099,8 +1097,8 @@ impl BotRuntime {
                 .iter()
                 .map(|role| role.get())
                 .collect::<Vec<_>>(),
-        )
-        .await
+        )?;
+        Ok(guild_id)
     }
 
     async fn authorize_component(
@@ -1115,8 +1113,7 @@ impl BotRuntime {
             .member
             .as_ref()
             .context("Discord did not supply server membership for this request")?;
-        self.authorize(
-            ctx,
+        self.check_access(
             guild_id.get(),
             component.channel_id.get(),
             component.user.id,
@@ -1125,18 +1122,23 @@ impl BotRuntime {
                 .iter()
                 .map(|role| role.get())
                 .collect::<Vec<_>>(),
+        )?;
+        self.authorization(
+            ctx,
+            guild_id.get(),
+            component.channel_id.get(),
+            component.user.id,
         )
         .await
     }
 
-    async fn authorize(
+    fn check_access(
         &self,
-        ctx: &Context,
         guild_id: u64,
         response_channel_id: u64,
         user_id: UserId,
         role_ids: &[u64],
-    ) -> Result<Authorization> {
+    ) -> Result<()> {
         if !self.config.allows_guild(guild_id) {
             bail!("server {guild_id} is not allowlisted");
         }
@@ -1162,6 +1164,16 @@ impl BotRuntime {
                 );
             }
         }
+        Ok(())
+    }
+
+    async fn authorization(
+        &self,
+        ctx: &Context,
+        guild_id: u64,
+        response_channel_id: u64,
+        user_id: UserId,
+    ) -> Result<Authorization> {
         let session = self.session(guild_id, &ctx.http).await?;
         let voice_channel_id = requester_voice_channel(ctx, guild_id, user_id);
         Ok(Authorization {
